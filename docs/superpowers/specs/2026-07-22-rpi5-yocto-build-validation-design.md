@@ -276,29 +276,39 @@ GUI, Qt, OpenCV, TensorFlow Lite, GStreamer 스트리밍 스택은 초기 카메
 - x86_64와 지원 Ubuntu 버전
 - CPU, RAM, Swap, 디스크 공간
 - `en_US.UTF-8` locale
-- Git, Python, tar, make, gcc 최소 버전
+- Git, 시스템 Python 3.12, uv 0.11.31, tar, make, gcc 최소 버전
 - 필수 패키지와 `bmaptool`, QEMU, SSH 클라이언트
 - 현재 사용자의 빌드 디렉터리 쓰기 권한
 - BitBake를 root로 실행하지 않는지 여부
 - SSH 공개키 파일 존재와 올바른 공개키 형식
 
+Python 빌드 도구의 직접 의존성은 `pyproject.toml`, 전체 해석 결과는
+`uv.lock`이 관리한다. uv는 시스템 Python만 사용하며 각 checkout 또는
+worktree 루트에 독립적인 `.venv`를 만든다.
+
 기본 명령 흐름은 다음과 같다.
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install 'kas==5.4'
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+uv --version
+uv lock --check
+uv sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ./scripts/host-preflight.sh
 ```
 
 ### 8.2 소스와 메타데이터 검증
 
 ```bash
-kas checkout kas/qemuarm64-minimal.yml
-kas shell kas/qemuarm64-minimal.yml -c 'bitbake-layers show-layers'
-kas shell kas/qemuarm64-minimal.yml -c 'bitbake -p'
-kas shell kas/rpi5-minimal.yml -c 'bitbake-layers show-layers'
-kas shell kas/rpi5-minimal.yml -c 'bitbake -p'
+uv run --locked kas checkout kas/qemuarm64-minimal.yml
+uv run --locked kas shell kas/qemuarm64-minimal.yml -c 'bitbake-layers show-layers'
+uv run --locked kas shell kas/qemuarm64-minimal.yml -c 'bitbake -p'
+uv run --locked kas shell kas/rpi5-minimal.yml -c 'bitbake-layers show-layers'
+uv run --locked kas shell kas/rpi5-minimal.yml -c 'bitbake -p'
 ```
 
 이 단계의 합격 조건은 다음과 같다.
@@ -311,8 +321,8 @@ kas shell kas/rpi5-minimal.yml -c 'bitbake -p'
 ### 8.3 이미지 빌드
 
 ```bash
-kas build kas/qemuarm64-minimal.yml
-kas build kas/rpi5-minimal.yml
+uv run --locked kas build kas/qemuarm64-minimal.yml
+uv run --locked kas build kas/rpi5-minimal.yml
 ```
 
 QEMU 이미지를 먼저 빌드한다. 이 빌드가 실패하면 Raspberry Pi 이미지 빌드와 SSD 기록을 진행하지 않는다.
@@ -321,7 +331,7 @@ QEMU 이미지를 먼저 빌드한다. 이 빌드가 실패하면 Raspberry Pi �
 
 - 프로젝트 Git SHA
 - 모든 외부 레이어 SHA
-- BitBake와 kas 버전
+- BitBake, kas, uv 버전
 - 이미지 패키지 목록
 - 라이선스 매니페스트
 - 빌드 로그
@@ -332,7 +342,7 @@ QEMU 이미지를 먼저 빌드한다. 이 빌드가 실패하면 Raspberry Pi �
 QEMU는 root 권한이 필요하지 않은 user-mode 네트워크를 기본으로 한다.
 
 ```bash
-kas shell kas/qemuarm64-minimal.yml -c 'runqemu qemuarm64 nographic slirp'
+uv run --locked kas shell kas/qemuarm64-minimal.yml -c 'runqemu qemuarm64 nographic slirp'
 ```
 
 `test-qemu.sh`는 별도 프로세스로 QEMU를 시작하고 제한 시간 안에 다음을 자동 확인한다.
