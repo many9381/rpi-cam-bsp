@@ -70,7 +70,14 @@ uv의 기본 프로젝트 환경 위치를 사용한다. 따라서 `.venv`는 �
   `WORKTREE_ROOT/.venv`
 
 여러 worktree가 하나의 `.venv`를 공유하지 않는다. `.venv/`는 계속
-Git에서 제외한다.
+Git에서 제외한다. 이 위치 계약은 논리 경로가 아니라 physical checkout
+경로를 기준으로 검증한다.
+
+- `UV_PROJECT_ENVIRONMENT`가 비어 있지 않으면 즉시 실패한다.
+- `<physical repository root>/.venv`가 실제 디렉터리여야 하며 symlink를
+  허용하지 않는다.
+- `realpath .venv`는 `$(pwd -P)/.venv`와 정확히 같아야 한다.
+- 실행 중인 `sys.prefix`의 physical 경로도 같은 디렉터리여야 한다.
 
 ### uv 설치 정책
 
@@ -94,6 +101,39 @@ installer가 출력한 사용자 실행 경로가 현재 `PATH`에 없다면 해
 프로젝트의 `required-version` 검사는 잘못된 uv 버전으로 lockfile이나
 환경을 갱신하는 것을 차단한다. uv 자체 설치는 호스트 선행조건이며
 `.venv`의 내용에는 포함하지 않는다.
+
+### 권한 상승 flash의 uv 신뢰 경계
+
+root로 실행되는 flash 스크립트는 사용자 선택 실행 파일이나 `UV_BIN`을
+입력으로 받지 않는다. `--version`만 위조하는 spoofed executable은
+인증된 입력이 아니며 절대로 root로 실행하지 않는다. 대신 다음 공식
+GNU x86_64 release archive를 고정한다.
+
+- URL:
+  `https://releases.astral.sh/github/uv/releases/download/0.11.31/uv-x86_64-unknown-linux-gnu.tar.gz`
+- SHA-256:
+  `8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b`
+- Official release:
+  `https://github.com/astral-sh/uv/releases/tag/0.11.31`
+
+일반 사용자 runbook은 archive를 저장소의 ignored `.state/` 아래로
+다운로드하고 SHA-256을 먼저 확인한다. `sudo`에는 absolute archive
+경로인 `UV_ARCHIVE`만 전달한다. root 스크립트는 누락, 일반 파일이 아닌
+입력, symlink를 거부하고 다음 순서를 지킨다.
+
+1. root-owned private 임시 디렉터리를 만들고 archive bytes를 그 안으로
+   먼저 복사한다.
+2. 복사본의 exact SHA-256을 실행 없이 확인한다.
+3. ownership과 permission을 보존하지 않는 안전한 tar 옵션으로 인증된
+   복사본을 풀어 expected `uv-x86_64-unknown-linux-gnu/uv`만 선택한다.
+4. 선택한 파일이 symlink가 아닌 root-owned 일반 파일인지 확인하고
+   mode `0700`으로 제한한다.
+5. 그 뒤에만 `uv --version`을 보조 검사하고 모든 privileged
+   `uv run --locked` 호출에 같은 private executable을 사용한다.
+6. 정확히 생성한 private 임시 객체만 정리한다.
+
+root network download, `sudo -E`, 사용자 경로의 실행 파일 실행은
+허용하지 않는다.
 
 ## 파일 변경
 
@@ -158,9 +198,11 @@ install`을 사용하는 절차는 추가하지 않는다.
 ## 기존 환경 마이그레이션
 
 1. 삭제 대상이 프로젝트/worktree 루트의 `.venv`이고 내부에
-   `pyvenv.cfg`가 있는지 확인한다.
+   `pyvenv.cfg`가 있는지 확인한다. fixed literal 경로, non-symlink,
+   physical 경로, exact `pyvenv.cfg` provenance, 현재 사용자 ownership,
+   대상 이하 mount 부재를 모두 기계적으로 검증한다.
 2. 기존 `.venv`만 삭제한다. 외부 checkout, 다운로드 캐시,
-   sstate-cache에는 손대지 않는다.
+   sstate-cache에는 손대지 않으며 one-filesystem 삭제만 사용한다.
 3. 고정된 uv 0.11.31을 설치하거나 기존 실행 파일의 버전을 확인한다.
 4. `pyproject.toml`, `.python-version`, `uv.lock`을 준비한다.
 5. `uv sync --locked`로 해당 worktree의 새 `.venv`를 생성한다.
@@ -179,6 +221,8 @@ install`을 사용하는 절차는 추가하지 않는다.
   커밋하지 않는다.
 - `.venv`가 프로젝트 루트 밖을 가리키는 경우: 환경을 사용하지 않고
   잘못된 경로를 보고한다.
+- `.venv` symlink 또는 비어 있지 않은 `UV_PROJECT_ENVIRONMENT`: 환경을
+  만들거나 사용하기 전에 즉시 실패한다.
 
 ## 검증
 
@@ -193,19 +237,28 @@ Python 표준 라이브러리 `tomllib` 기반 테스트가 다음을 검증한�
 - uv 요구 버전이 `==0.11.31`이다.
 - 시스템 Python만 사용한다.
 - `uv.lock`이 추적되며 kas 5.4와 해석된 전이 의존성을 포함한다.
+- lock의 top-level Python 요구가 `==3.12.*`이고 virtual root metadata,
+  build group, unique package names가 정확하다.
+- kas에서 재귀적으로 도달 가능한 registry closure가 lock의 모든
+  registry package와 같고 각 sdist/wheel에 SHA-256이 있다.
 - `requirements-build.txt`가 존재하지 않는다.
 - `.venv/`가 Git에서 제외된다.
 
 ### uv 통합 검증
 
 ```bash
-uv --version
-uv lock --check
-uv sync --locked
-uv run --locked python -c \
-  'import pathlib, sys; assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(".venv").resolve()'
-uv run --locked kas --version
-uv run --locked python -m unittest discover -s tests/host -v
+UV=/home/many/.local/bin/uv
+test "$("$UV" --version | awk '{print $2}')" = "0.11.31"
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+"$UV" lock --check
+"$UV" sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+"$UV" run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
+"$UV" run --locked kas --version
+"$UV" run --locked python -m unittest discover -s tests/host -v
 git diff --check
 git status --short
 ```

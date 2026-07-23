@@ -137,12 +137,13 @@ git switch -c feature/repository-guardrails
 - [ ] **Step 2: Install or select the pinned uv prerequisite**
 
 ```bash
-if ! command -v uv >/dev/null 2>&1 || [[ "$(uv --version)" != "uv 0.11.31" ]]; then
+if ! command -v uv >/dev/null 2>&1 ||
+   [[ "$(uv --version | awk '{print $2}')" != "0.11.31" ]]; then
     curl -LsSf https://astral.sh/uv/0.11.31/install.sh |
         env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/home/many/.local/bin sh
     export PATH="/home/many/.local/bin:$PATH"
 fi
-test "$(uv --version)" = "uv 0.11.31"
+test "$(uv --version | awk '{print $2}')" = "0.11.31"
 ```
 
 Expected: uv is exactly 0.11.31 and no shell startup file is modified.
@@ -206,6 +207,12 @@ Run:
 uv lock
 uv lock --check
 uv sync --locked
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ```
 
 Expected: uv resolves `kas==5.4`, writes `uv.lock`, and creates `.venv`
@@ -292,11 +299,114 @@ if __name__ == "__main__":
 ```
 
 ```python
-# tests/host/test_uv_environment_contract.py
+import copy
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
 import tomllib
 import unittest
 
-from support import REPO_ROOT, read
+from support import REPO_ROOT, read, run
+
+
+SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def validate_lock(lock: dict) -> None:
+    if lock.get("requires-python") != "==3.12.*":
+        raise AssertionError("top-level requires-python must be ==3.12.*")
+
+    package_list = lock.get("package", [])
+    names = [package["name"] for package in package_list]
+    if len(names) != len(set(names)):
+        raise AssertionError("duplicate package names")
+    packages = {package["name"]: package for package in package_list}
+
+    expected_root = {
+        "name": "yocto-rpi5-cam-firmware",
+        "version": "0.0.0",
+        "source": {"virtual": "."},
+        "dev-dependencies": {"build": [{"name": "kas"}]},
+        "metadata": {
+            "requires-dev": {
+                "build": [{"name": "kas", "specifier": "==5.4"}],
+            },
+        },
+    }
+    root = packages.get("yocto-rpi5-cam-firmware")
+    if root != expected_root:
+        raise AssertionError("virtual root metadata must be exact")
+
+    kas = packages.get("kas")
+    if not kas or kas.get("version") != "5.4":
+        raise AssertionError("kas must be locked at 5.4")
+    if kas.get("source") != {"registry": "https://pypi.org/simple"}:
+        raise AssertionError("kas registry source must be exact")
+
+    reachable: set[str] = set()
+    pending = ["kas"]
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        package = packages.get(name)
+        if package is None:
+            raise AssertionError(f"missing dependency: {name}")
+        reachable.add(name)
+        pending.extend(
+            dependency["name"]
+            for dependency in package.get("dependencies", [])
+        )
+
+    locked_registry = {
+        name
+        for name, package in packages.items()
+        if "registry" in package["source"]
+    }
+    reachable_registry = {
+        name
+        for name in reachable
+        if "registry" in packages[name]["source"]
+    }
+    if reachable_registry != locked_registry:
+        raise AssertionError("registry closure mismatch")
+
+    for name in sorted(locked_registry):
+        package = packages[name]
+        sdist_hash = package.get("sdist", {}).get("hash", "")
+        if SHA256.fullmatch(sdist_hash) is None:
+            raise AssertionError(f"invalid sdist hash: {name}")
+        wheels = package.get("wheels", [])
+        if not wheels:
+            raise AssertionError(f"missing wheels: {name}")
+        for wheel in wheels:
+            if SHA256.fullmatch(wheel.get("hash", "")) is None:
+                raise AssertionError(f"invalid wheel hash: {name}")
+
+
+def assert_checkout_local_environment(
+    repo_root: Path,
+    prefix: Path,
+    environ: dict[str, str],
+) -> Path:
+    override = environ.get("UV_PROJECT_ENVIRONMENT", "")
+    if override:
+        raise AssertionError("UV_PROJECT_ENVIRONMENT must be unset or empty")
+
+    physical_root = Path(os.path.realpath(repo_root))
+    environment = repo_root / ".venv"
+    expected = physical_root / ".venv"
+    if environment.is_symlink():
+        raise AssertionError(".venv must not be a symlink")
+    if not environment.is_dir():
+        raise AssertionError(".venv must be a directory")
+    if Path(os.path.realpath(environment)) != expected:
+        raise AssertionError(".venv must be physically checkout-local")
+    if Path(prefix).resolve() != expected:
+        raise AssertionError("sys.prefix must be the checkout-local .venv")
+    return expected
 
 
 class UvEnvironmentContractTest(unittest.TestCase):
@@ -330,18 +440,143 @@ class UvEnvironmentContractTest(unittest.TestCase):
         self.assertFalse((REPO_ROOT / "requirements-build.txt").exists())
         self.assertIn(".venv/", set(read(".gitignore").splitlines()))
 
-    def test_lock_contains_kas_and_its_resolved_dependencies(self) -> None:
+    def test_lock_has_exact_root_and_python_metadata(self) -> None:
+        validate_lock(self.lock)
+        self.assertEqual(self.lock["requires-python"], "==3.12.*")
+        package_list = self.lock["package"]
+        names = [package["name"] for package in package_list]
+        self.assertEqual(len(names), len(set(names)), "duplicate package names")
+        packages = {package["name"]: package for package in package_list}
+        root = packages["yocto-rpi5-cam-firmware"]
+        self.assertEqual(root["version"], "0.0.0")
+        self.assertEqual(root["source"], {"virtual": "."})
+        self.assertEqual(
+            root["dev-dependencies"],
+            {"build": [{"name": "kas"}]},
+        )
+        self.assertEqual(
+            root["metadata"],
+            {
+                "requires-dev": {
+                    "build": [{"name": "kas", "specifier": "==5.4"}],
+                },
+            },
+        )
+
+    def test_lock_contains_complete_hashed_kas_registry_closure(self) -> None:
+        validate_lock(self.lock)
         packages = {
             package["name"]: package
             for package in self.lock["package"]
         }
-        self.assertEqual(packages["kas"]["version"], "5.4")
-        dependencies = {
-            dependency["name"]
-            for dependency in packages["kas"].get("dependencies", [])
+        kas = packages["kas"]
+        self.assertEqual(kas["version"], "5.4")
+        self.assertEqual(kas["source"], {"registry": "https://pypi.org/simple"})
+
+        reachable: set[str] = set()
+        pending = ["kas"]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            self.assertIn(name, packages)
+            reachable.add(name)
+            for dependency in packages[name].get("dependencies", []):
+                dependency_name = dependency["name"]
+                self.assertIn(dependency_name, packages)
+                pending.append(dependency_name)
+
+        locked_registry = {
+            name
+            for name, package in packages.items()
+            if "registry" in package["source"]
         }
-        self.assertTrue(dependencies)
-        self.assertTrue(dependencies.issubset(packages))
+        reachable_registry = {
+            name
+            for name in reachable
+            if "registry" in packages[name]["source"]
+        }
+        self.assertEqual(reachable_registry, locked_registry)
+
+        for name in sorted(locked_registry):
+            package = packages[name]
+            self.assertRegex(package["sdist"]["hash"], SHA256, name)
+            self.assertTrue(package["wheels"], name)
+            for wheel in package["wheels"]:
+                self.assertRegex(wheel["hash"], SHA256, name)
+
+    def test_running_environment_is_physical_checkout_local_venv(self) -> None:
+        expected = assert_checkout_local_environment(
+            REPO_ROOT,
+            Path(sys.prefix),
+            dict(os.environ),
+        )
+        self.assertEqual(expected, Path(os.path.realpath(REPO_ROOT)) / ".venv")
+        self.assertEqual(sys.version_info[:2], (3, 12))
+        result = run("uv", "--version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"^uv 0\.11\.31(?:\s|$)")
+
+    def test_environment_contract_rejects_external_override(self) -> None:
+        environ = dict(os.environ)
+        environ["UV_PROJECT_ENVIRONMENT"] = "/tmp/external-uv-environment"
+        with self.assertRaisesRegex(AssertionError, "UV_PROJECT_ENVIRONMENT"):
+            assert_checkout_local_environment(
+                REPO_ROOT,
+                Path(sys.prefix),
+                environ,
+            )
+
+    def test_environment_contract_rejects_symlinked_venv(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="uv-environment-contract-",
+        ) as temporary:
+            temporary_root = Path(temporary)
+            checkout = temporary_root / "checkout"
+            external = temporary_root / "external"
+            checkout.mkdir()
+            external.mkdir()
+            (checkout / ".venv").symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(AssertionError, "symlink"):
+                assert_checkout_local_environment(
+                    checkout,
+                    external,
+                    {},
+                )
+
+    def test_lock_validator_rejects_structural_corruption(self) -> None:
+        cases: list[tuple[str, dict, str]] = []
+
+        duplicate = copy.deepcopy(self.lock)
+        duplicate["package"].append(copy.deepcopy(duplicate["package"][0]))
+        cases.append(("duplicate", duplicate, "duplicate package"))
+
+        missing = copy.deepcopy(self.lock)
+        kas = next(
+            package for package in missing["package"]
+            if package["name"] == "kas"
+        )
+        kas["dependencies"].append({"name": "missing-package"})
+        cases.append(("missing", missing, "missing dependency"))
+
+        orphan = copy.deepcopy(self.lock)
+        orphan_package = copy.deepcopy(orphan["package"][0])
+        orphan_package["name"] = "orphan-package"
+        orphan["package"].append(orphan_package)
+        cases.append(("orphan", orphan, "registry closure"))
+
+        bad_sdist = copy.deepcopy(self.lock)
+        bad_sdist["package"][0]["sdist"]["hash"] = "sha256:not-a-digest"
+        cases.append(("sdist hash", bad_sdist, "sdist hash"))
+
+        bad_wheel = copy.deepcopy(self.lock)
+        bad_wheel["package"][0]["wheels"][0]["hash"] = "md5:bad"
+        cases.append(("wheel hash", bad_wheel, "wheel hash"))
+
+        for name, lock, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(AssertionError, message):
+                    validate_lock(lock)
 
 
 if __name__ == "__main__":
@@ -415,6 +650,12 @@ Run:
 ```bash
 uv lock --check
 uv sync --locked
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 uv run --locked python -m unittest discover -s tests/host -p 'test_repository_contract.py' -v
 uv run --locked python -m unittest discover -s tests/host -p 'test_uv_environment_contract.py' -v
 uv run --locked kas --version
@@ -1374,6 +1615,15 @@ version_ge "$gcc_version" "8.0" || rpi5_die "GCC is too old"
 uv_version="$(uv --version | awk '{print $2}')"
 [[ "$uv_version" == "0.11.31" ]] || rpi5_die "uv must be version 0.11.31"
 uv lock --check || rpi5_die "uv.lock is stale"
+test -z "${UV_PROJECT_ENVIRONMENT:-}" ||
+    rpi5_die "UV_PROJECT_ENVIRONMENT must be unset or empty"
+test -d .venv || rpi5_die ".venv must be a directory"
+test ! -L .venv || rpi5_die ".venv must not be a symlink"
+test "$(realpath .venv)" = "$(pwd -P)/.venv" ||
+    rpi5_die ".venv must be physically checkout-local"
+uv run --locked python -c \
+    'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)' ||
+    rpi5_die "uv must run physical checkout-local Python 3.12"
 python_version="$(uv run --locked python -c 'import platform; print(platform.python_version())')"
 version_ge "$python_version" "3.12" || rpi5_die "Python must be at least 3.12"
 version_ge "3.12.999" "$python_version" || rpi5_die "Python must be below 3.13"
@@ -2179,9 +2429,12 @@ if __name__ == "__main__":
 
 ```python
 # tests/host/test_flash_contract.py
+import os
+from pathlib import Path
+import tempfile
 import unittest
 
-from support import read, run
+from support import REPO_ROOT, read, run
 
 
 class FlashContractTest(unittest.TestCase):
@@ -2214,6 +2467,38 @@ class FlashContractTest(unittest.TestCase):
     def test_flash_script_is_valid_bash(self) -> None:
         result = run("bash", "-n", "scripts/flash-ssd.sh")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_spoofed_uv_executable_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spoof = root / "spoof-uv"
+            marker = root / "SPOOF_EXECUTED"
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            spoof.write_text(
+                "#!/usr/bin/env bash\n"
+                ': > "${SPOOF_MARKER:?}"\n'
+                "printf 'uv 0.11.31\\n'\n",
+                encoding="utf-8",
+            )
+            spoof.chmod(0o755)
+            command = (
+                'source "$1"\n'
+                'authenticate_uv_archive "$2" "$3"\n'
+            )
+            result = run(
+                "bash",
+                "-c",
+                command,
+                "bash",
+                str(REPO_ROOT / "scripts/flash-ssd.sh"),
+                str(spoof),
+                str(private),
+                env={"SPOOF_MARKER": os.fspath(marker)},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("authenticated uv archive checksum mismatch", result.stderr)
+            self.assertFalse(marker.exists(), "spoofed executable was run")
 
 
 if __name__ == "__main__":
@@ -2433,15 +2718,65 @@ Expected: `Ran 5 tests` followed by `OK`; no block device is opened or modified.
 
 - [ ] **Step 6: Implement the guarded bmaptool writer and read-only verifier**
 
+The privileged flow authenticates the official uv 0.11.31 GNU x86_64
+archive from
+`https://releases.astral.sh/github/uv/releases/download/0.11.31/uv-x86_64-unknown-linux-gnu.tar.gz`
+with SHA-256
+`8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b`.
+The release provenance is
+`https://github.com/astral-sh/uv/releases/tag/0.11.31`. The operator
+downloads and verifies it without privileges; root never downloads or
+executes a user-selected path.
+
 ```bash
 #!/usr/bin/env bash
 # scripts/flash-ssd.sh
 set -euo pipefail
 
-source "$(dirname "$0")/lib/common.sh"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$script_dir/lib/common.sh"
+
+readonly UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+
+authenticate_uv_archive() {
+    local uv_archive="$1"
+    local uv_private_dir="$2"
+    local uv_archive_copy="$uv_private_dir/uv-release.tar.gz"
+    local uv_extract_dir="$uv_private_dir/extract"
+    local uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"
+
+    [[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] || \
+        rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
+    install -m 0600 -- "$uv_archive" "$uv_archive_copy"
+    [[ -f "$uv_archive_copy" && ! -L "$uv_archive_copy" ]] || \
+        rpi5_die "private uv archive copy is not a regular file"
+    [[ "$(stat -c %u "$uv_archive_copy")" == "$EUID" ]] || \
+        rpi5_die "private uv archive copy ownership is invalid"
+    if ! (
+        cd "$uv_private_dir"
+        printf '%s  %s\n' "$UV_RELEASE_SHA256" "uv-release.tar.gz" |
+            sha256sum --check --strict --status
+    ); then
+        rpi5_die "authenticated uv archive checksum mismatch"
+    fi
+
+    install -d -m 0700 "$uv_extract_dir"
+    tar --extract --file "$uv_archive_copy" --directory "$uv_extract_dir" \
+        --gzip --no-same-owner --no-same-permissions
+    [[ -f "$uv_bin" && ! -L "$uv_bin" ]] || \
+        rpi5_die "authenticated archive is missing the expected uv executable"
+    chmod 0700 "$uv_bin"
+    [[ "$(stat -c %u "$uv_bin")" == "$EUID" && "$(stat -c %a "$uv_bin")" == "700" ]] || \
+        rpi5_die "authenticated uv executable ownership or mode is invalid"
+    printf '%s\n' "$uv_bin"
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 usage() {
-    printf 'Usage: sudo UV_BIN=/absolute/path/to/uv %s --build-id ID --profile {rpi5-minimal|rpi5-camera} --device /dev/DEVICE --confirm ERASE:/dev/DEVICE:ID\n' "$0"
+    printf 'Usage: sudo UV_ARCHIVE=/absolute/path/to/uv-release.tar.gz %s --build-id ID --profile {rpi5-minimal|rpi5-camera} --device /dev/DEVICE --confirm ERASE:/dev/DEVICE:ID\n' "$0"
 }
 
 build_id=""
@@ -2469,11 +2804,33 @@ rpi5_validate_build_id "$build_id" || rpi5_die "invalid build ID"
 
 repo_root="$(rpi5_repo_root)"
 cd "$repo_root"
-uv_bin="${UV_BIN:-}"
-[[ "$uv_bin" == /* && -x "$uv_bin" ]] || \
-    rpi5_die "UV_BIN must be an absolute executable path"
-[[ "$("$uv_bin" --version)" == "uv 0.11.31" ]] || \
-    rpi5_die "UV_BIN must be uv 0.11.31"
+uv_archive="${UV_ARCHIVE:-}"
+[[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] || \
+    rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
+umask 077
+uv_private_dir="$(mktemp -d /var/tmp/rpi5-flash-uv.XXXXXXXX)"
+chown root:root "$uv_private_dir"
+chmod 0700 "$uv_private_dir"
+[[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]] || \
+    rpi5_die "private uv directory is invalid"
+[[ "$(stat -c %u "$uv_private_dir")" == "0" ]] || \
+    rpi5_die "private uv directory is not root-owned"
+
+cleanup_uv() {
+    if [[ "${uv_private_dir:-}" =~ ^/var/tmp/rpi5-flash-uv\.[A-Za-z0-9]{8}$ ]] &&
+       [[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]] &&
+       [[ "$(stat -c %u "$uv_private_dir")" == "0" ]]; then
+        find "$uv_private_dir" -xdev -depth -delete
+    fi
+    uv_private_dir=""
+}
+trap cleanup_uv EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+uv_bin="$(authenticate_uv_archive "$uv_archive" "$uv_private_dir")"
+[[ "$("$uv_bin" --version | awk '{print $2}')" == "0.11.31" ]] || \
+    rpi5_die "authenticated uv executable must be version 0.11.31"
 profile_root="$repo_root/artifacts/$build_id/$profile"
 flash_root="$repo_root/artifacts/$build_id/flash"
 flash_marker="$flash_root/${profile}-PASS"
@@ -2509,8 +2866,9 @@ cleanup() {
     mountpoint -q "$boot_mount" && umount "$boot_mount" || true
     rm -f "$topology"
     rmdir "$root_mount" "$boot_mount" "$temporary" 2>/dev/null || true
+    cleanup_uv
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
 
 protected=()
 for protected_path in / /boot /home "$repo_root"; do
@@ -3609,13 +3967,20 @@ sudo apt-get install -y build-essential chrpath cpio debianutils diffstat file g
   tar texinfo unzip wget xz-utils zstd bmap-tools qemu-system-arm openssh-client \
   avahi-utils curl ffmpeg iproute2 parted util-linux udev
 sudo locale-gen en_US.UTF-8
-if ! command -v uv >/dev/null 2>&1 || [[ "$(uv --version)" != "uv 0.11.31" ]]; then
+if ! command -v uv >/dev/null 2>&1 ||
+   [[ "$(uv --version | awk '{print $2}')" != "0.11.31" ]]; then
     curl -LsSf https://astral.sh/uv/0.11.31/install.sh |
         env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/home/many/.local/bin sh
     export PATH="/home/many/.local/bin:$PATH"
 fi
 uv lock --check
 uv sync --locked
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 uv run --locked kas --version
 ssh-keygen -t ed25519 -f keys/rpi5_admin -C rpi5-admin
 chmod 600 keys/rpi5_admin
@@ -3655,9 +4020,20 @@ lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS
 read -r -p 'Exact whole USB SSD device (for example /dev/sdb or /dev/nvme1n1): ' TARGET_DEVICE
 lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS "$TARGET_DEVICE"
 read -r -p "Type ERASE:$TARGET_DEVICE:$BUILD_ID: " CONFIRMATION
-UV_BIN="$(command -v uv)"
-test "$("$UV_BIN" --version)" = "uv 0.11.31"
-sudo UV_BIN="$UV_BIN" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
+UV_RELEASE_URL="https://releases.astral.sh/github/uv/releases/download/0.11.31/uv-x86_64-unknown-linux-gnu.tar.gz"
+UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+UV_ARCHIVE="$(pwd -P)/.state/uv-release/uv-x86_64-unknown-linux-gnu.tar.gz"
+mkdir -p "$(dirname "$UV_ARCHIVE")"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "$UV_RELEASE_URL" --output "$UV_ARCHIVE.download"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE.download" |
+  sha256sum --check --strict
+mv -- "$UV_ARCHIVE.download" "$UV_ARCHIVE"
+test -f "$UV_ARCHIVE"
+test ! -L "$UV_ARCHIVE"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE" |
+  sha256sum --check --strict
+sudo UV_ARCHIVE="$UV_ARCHIVE" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
   --device "$TARGET_DEVICE" --confirm "$CONFIRMATION"
 test -f "artifacts/$BUILD_ID/flash/rpi5-minimal-PASS"
 ```
@@ -3855,7 +4231,7 @@ class CiContractTest(unittest.TestCase):
         script = read("ci/pipeline.sh")
         self.assertIn("https://astral.sh/uv/0.11.31/install.sh", script)
         self.assertIn("UV_NO_MODIFY_PATH=1", script)
-        self.assertIn('[[ "$(uv --version)" == "uv 0.11.31" ]]', script)
+        self.assertIn('[[ "$(uv --version | awk \'{print $2}\')" == "0.11.31" ]]', script)
         self.assertIn("uv lock --check", script)
         self.assertIn("uv sync --locked", script)
         self.assertIn("uv run --locked python", script)
@@ -3985,18 +4361,24 @@ usage() {
 stage="$1"
 repo_root="$(rpi5_repo_root)"
 ensure_uv() {
-    if ! command -v uv >/dev/null 2>&1 || [[ "$(uv --version)" != "uv 0.11.31" ]]; then
+    if ! command -v uv >/dev/null 2>&1 ||
+       [[ "$(uv --version | awk '{print $2}')" != "0.11.31" ]]; then
         mkdir -p "$repo_root/.state/uv-bin"
         curl -LsSf https://astral.sh/uv/0.11.31/install.sh |
             env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$repo_root/.state/uv-bin" sh
         export PATH="$repo_root/.state/uv-bin:$PATH"
     fi
-    [[ "$(uv --version)" == "uv 0.11.31" ]] ||
+    [[ "$(uv --version | awk '{print $2}')" == "0.11.31" ]] ||
         rpi5_die "uv must be version 0.11.31"
     cd "$repo_root"
     uv lock --check
     uv sync --locked
-    uv run --locked python -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+    test -z "${UV_PROJECT_ENVIRONMENT:-}"
+    test -d .venv
+    test ! -L .venv
+    test "$(realpath .venv)" = "$(pwd -P)/.venv"
+    uv run --locked python -c \
+        'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 }
 
 ensure_uv
@@ -4546,9 +4928,20 @@ test -b "$TARGET_DEVICE"
 lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS "$TARGET_DEVICE"
 read -r -p "Type ERASE:$TARGET_DEVICE:$BUILD_ID: " CONFIRMATION
 test "$CONFIRMATION" = "ERASE:$TARGET_DEVICE:$BUILD_ID"
-UV_BIN="$(command -v uv)"
-test "$("$UV_BIN" --version)" = "uv 0.11.31"
-sudo UV_BIN="$UV_BIN" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
+UV_RELEASE_URL="https://releases.astral.sh/github/uv/releases/download/0.11.31/uv-x86_64-unknown-linux-gnu.tar.gz"
+UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+UV_ARCHIVE="$(pwd -P)/.state/uv-release/uv-x86_64-unknown-linux-gnu.tar.gz"
+mkdir -p "$(dirname "$UV_ARCHIVE")"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "$UV_RELEASE_URL" --output "$UV_ARCHIVE.download"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE.download" |
+  sha256sum --check --strict
+mv -- "$UV_ARCHIVE.download" "$UV_ARCHIVE"
+test -f "$UV_ARCHIVE"
+test ! -L "$UV_ARCHIVE"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE" |
+  sha256sum --check --strict
+sudo UV_ARCHIVE="$UV_ARCHIVE" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
   --device "$TARGET_DEVICE" --confirm "$CONFIRMATION"
 test -f "artifacts/$BUILD_ID/flash/rpi5-minimal-PASS"
 ```
@@ -4622,9 +5015,20 @@ test -b "$TARGET_DEVICE"
 lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS "$TARGET_DEVICE"
 read -r -p "Type ERASE:$TARGET_DEVICE:$BUILD_ID: " CONFIRMATION
 test "$CONFIRMATION" = "ERASE:$TARGET_DEVICE:$BUILD_ID"
-UV_BIN="$(command -v uv)"
-test "$("$UV_BIN" --version)" = "uv 0.11.31"
-sudo UV_BIN="$UV_BIN" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-camera \
+UV_RELEASE_URL="https://releases.astral.sh/github/uv/releases/download/0.11.31/uv-x86_64-unknown-linux-gnu.tar.gz"
+UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+UV_ARCHIVE="$(pwd -P)/.state/uv-release/uv-x86_64-unknown-linux-gnu.tar.gz"
+mkdir -p "$(dirname "$UV_ARCHIVE")"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "$UV_RELEASE_URL" --output "$UV_ARCHIVE.download"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE.download" |
+  sha256sum --check --strict
+mv -- "$UV_ARCHIVE.download" "$UV_ARCHIVE"
+test -f "$UV_ARCHIVE"
+test ! -L "$UV_ARCHIVE"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE" |
+  sha256sum --check --strict
+sudo UV_ARCHIVE="$UV_ARCHIVE" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-camera \
   --device "$TARGET_DEVICE" --confirm "$CONFIRMATION"
 test -f "artifacts/$BUILD_ID/flash/rpi5-camera-PASS"
 ```

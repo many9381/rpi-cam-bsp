@@ -4,7 +4,7 @@
 
 **Goal:** Replace the repository's hand-built Python virtual environment and `requirements-build.txt` with a reproducible uv project whose Python 3.12 environment is created as `.venv` in each checkout or worktree.
 
-**Architecture:** `pyproject.toml` owns the direct build-tool contract, while the committed uv-generated `uv.lock` owns the complete resolved dependency graph. Repository tests validate the static contract with Python's standard library, and all documented Python and kas execution goes through `uv run --locked` without shell activation. The uv feature is reviewed on `feature/uv-python-environment`, merged into `develop`, and then incorporated into the in-progress `feature/image-recipes` worktree before that work resumes.
+**Architecture:** `pyproject.toml` owns the direct build-tool contract, while the committed uv-generated `uv.lock` owns the complete resolved dependency graph. Repository tests validate the static contract with Python's standard library, and all documented Python and kas execution goes through `uv run --locked` without shell activation. Every environment gate rejects `UV_PROJECT_ENVIRONMENT` and requires a physical checkout-local non-symlink `.venv`. Privileged flashing authenticates a pinned official uv release archive inside a root-owned private directory before executing it. The uv feature is reviewed on `feature/uv-python-environment`, merged into `develop`, and then incorporated into the in-progress `feature/image-recipes` worktree before that work resumes.
 
 **Tech Stack:** uv 0.11.31, system CPython 3.12, PEP 621 `pyproject.toml`, uv dependency groups and lockfile, kas 5.4, Python `tomllib` and `unittest`, Git feature branches and linked worktrees.
 
@@ -18,10 +18,11 @@
 - Keep `project.dependencies = []`; put exactly `kas==5.4` in `dependency-groups.build`.
 - Commit `uv.lock`, generate or update it only with uv, and never edit it manually.
 - Remove `requirements-build.txt`; do not keep a compatibility requirements file.
-- Keep `.venv/` ignored and use uv's default worktree-local `.venv` beside `pyproject.toml`.
+- Keep `.venv/` ignored; reject non-empty `UV_PROJECT_ENVIRONMENT`; require a physical, non-symlink `.venv` beside `pyproject.toml` whose realpath and running `sys.prefix` both equal `<physical checkout root>/.venv`.
 - Do not activate `.venv`, call `.venv/bin/*`, use pip, use `uv pip install`, or run documented Python/kas commands outside `uv run --locked`.
 - Before the uv project exists, only the migration plan's baseline and red-state checks may use the already-installed system `python3`; all steady-state repository workflows use uv.
 - Install uv itself as a host prerequisite; do not vendor the uv binary or add it to `.venv`.
+- For root flashing, pass only an absolute non-symlink `UV_ARCHIVE` authenticated as the official uv 0.11.31 GNU x86_64 archive with SHA-256 `8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b`; never pass or execute a user-selected executable path.
 - Do not let uv download Python; fail if a compatible system Python 3.12 is unavailable.
 - Change build dependencies only with `uv add --group build PACKAGE` or `uv remove --group build PACKAGE`, and commit `pyproject.toml` with the regenerated `uv.lock`.
 - Delete only the verified legacy environment at `/home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv`; do not delete external checkouts, downloads, sstate, build outputs, or any other worktree.
@@ -42,7 +43,9 @@
 | `tests/host/test_uv_environment_contract.py` | Create | Parse and validate `pyproject.toml`, `uv.lock`, `.python-version`, and the local-environment policy offline. |
 | `tests/host/test_uv_docs_contract.py` | Create | Reject legacy activation, pip setup, and direct Python/kas execution in canonical build documentation. |
 | `docs/superpowers/specs/2026-07-22-rpi5-yocto-build-validation-design.md` | Modify | Express host setup, checkout, parse, build, and QEMU commands using locked uv execution. |
+| `docs/superpowers/specs/2026-07-23-uv-python-environment-design.md` | Modify | Define physical environment locality and the authenticated privileged archive trust boundary. |
 | `docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md` | Modify | Make every planned host script, runbook, CI flow, test command, and kas invocation conform to the uv contract. |
+| `docs/superpowers/plans/2026-07-23-uv-python-environment-implementation.md` | Modify | Keep this execution plan aligned with the finalized helper set, archive handoff, locality gates, QEMU process-group command, and safe legacy deletion. |
 
 ### Task 1: Establish the uv Project and Offline Environment Contract
 
@@ -132,10 +135,114 @@ if __name__ == "__main__":
 Create `tests/host/test_uv_environment_contract.py` with:
 
 ```python
+import copy
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
 import tomllib
 import unittest
 
-from support import REPO_ROOT, read
+from support import REPO_ROOT, read, run
+
+
+SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def validate_lock(lock: dict) -> None:
+    if lock.get("requires-python") != "==3.12.*":
+        raise AssertionError("top-level requires-python must be ==3.12.*")
+
+    package_list = lock.get("package", [])
+    names = [package["name"] for package in package_list]
+    if len(names) != len(set(names)):
+        raise AssertionError("duplicate package names")
+    packages = {package["name"]: package for package in package_list}
+
+    expected_root = {
+        "name": "yocto-rpi5-cam-firmware",
+        "version": "0.0.0",
+        "source": {"virtual": "."},
+        "dev-dependencies": {"build": [{"name": "kas"}]},
+        "metadata": {
+            "requires-dev": {
+                "build": [{"name": "kas", "specifier": "==5.4"}],
+            },
+        },
+    }
+    root = packages.get("yocto-rpi5-cam-firmware")
+    if root != expected_root:
+        raise AssertionError("virtual root metadata must be exact")
+
+    kas = packages.get("kas")
+    if not kas or kas.get("version") != "5.4":
+        raise AssertionError("kas must be locked at 5.4")
+    if kas.get("source") != {"registry": "https://pypi.org/simple"}:
+        raise AssertionError("kas registry source must be exact")
+
+    reachable: set[str] = set()
+    pending = ["kas"]
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        package = packages.get(name)
+        if package is None:
+            raise AssertionError(f"missing dependency: {name}")
+        reachable.add(name)
+        pending.extend(
+            dependency["name"]
+            for dependency in package.get("dependencies", [])
+        )
+
+    locked_registry = {
+        name
+        for name, package in packages.items()
+        if "registry" in package["source"]
+    }
+    reachable_registry = {
+        name
+        for name in reachable
+        if "registry" in packages[name]["source"]
+    }
+    if reachable_registry != locked_registry:
+        raise AssertionError("registry closure mismatch")
+
+    for name in sorted(locked_registry):
+        package = packages[name]
+        sdist_hash = package.get("sdist", {}).get("hash", "")
+        if SHA256.fullmatch(sdist_hash) is None:
+            raise AssertionError(f"invalid sdist hash: {name}")
+        wheels = package.get("wheels", [])
+        if not wheels:
+            raise AssertionError(f"missing wheels: {name}")
+        for wheel in wheels:
+            if SHA256.fullmatch(wheel.get("hash", "")) is None:
+                raise AssertionError(f"invalid wheel hash: {name}")
+
+
+def assert_checkout_local_environment(
+    repo_root: Path,
+    prefix: Path,
+    environ: dict[str, str],
+) -> Path:
+    override = environ.get("UV_PROJECT_ENVIRONMENT", "")
+    if override:
+        raise AssertionError("UV_PROJECT_ENVIRONMENT must be unset or empty")
+
+    physical_root = Path(os.path.realpath(repo_root))
+    environment = repo_root / ".venv"
+    expected = physical_root / ".venv"
+    if environment.is_symlink():
+        raise AssertionError(".venv must not be a symlink")
+    if not environment.is_dir():
+        raise AssertionError(".venv must be a directory")
+    if Path(os.path.realpath(environment)) != expected:
+        raise AssertionError(".venv must be physically checkout-local")
+    if Path(prefix).resolve() != expected:
+        raise AssertionError("sys.prefix must be the checkout-local .venv")
+    return expected
 
 
 class UvEnvironmentContractTest(unittest.TestCase):
@@ -169,18 +276,143 @@ class UvEnvironmentContractTest(unittest.TestCase):
         self.assertFalse((REPO_ROOT / "requirements-build.txt").exists())
         self.assertIn(".venv/", set(read(".gitignore").splitlines()))
 
-    def test_lock_contains_kas_and_its_resolved_dependencies(self) -> None:
+    def test_lock_has_exact_root_and_python_metadata(self) -> None:
+        validate_lock(self.lock)
+        self.assertEqual(self.lock["requires-python"], "==3.12.*")
+        package_list = self.lock["package"]
+        names = [package["name"] for package in package_list]
+        self.assertEqual(len(names), len(set(names)), "duplicate package names")
+        packages = {package["name"]: package for package in package_list}
+        root = packages["yocto-rpi5-cam-firmware"]
+        self.assertEqual(root["version"], "0.0.0")
+        self.assertEqual(root["source"], {"virtual": "."})
+        self.assertEqual(
+            root["dev-dependencies"],
+            {"build": [{"name": "kas"}]},
+        )
+        self.assertEqual(
+            root["metadata"],
+            {
+                "requires-dev": {
+                    "build": [{"name": "kas", "specifier": "==5.4"}],
+                },
+            },
+        )
+
+    def test_lock_contains_complete_hashed_kas_registry_closure(self) -> None:
+        validate_lock(self.lock)
         packages = {
             package["name"]: package
             for package in self.lock["package"]
         }
-        self.assertEqual(packages["kas"]["version"], "5.4")
-        dependencies = {
-            dependency["name"]
-            for dependency in packages["kas"].get("dependencies", [])
+        kas = packages["kas"]
+        self.assertEqual(kas["version"], "5.4")
+        self.assertEqual(kas["source"], {"registry": "https://pypi.org/simple"})
+
+        reachable: set[str] = set()
+        pending = ["kas"]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            self.assertIn(name, packages)
+            reachable.add(name)
+            for dependency in packages[name].get("dependencies", []):
+                dependency_name = dependency["name"]
+                self.assertIn(dependency_name, packages)
+                pending.append(dependency_name)
+
+        locked_registry = {
+            name
+            for name, package in packages.items()
+            if "registry" in package["source"]
         }
-        self.assertTrue(dependencies)
-        self.assertTrue(dependencies.issubset(packages))
+        reachable_registry = {
+            name
+            for name in reachable
+            if "registry" in packages[name]["source"]
+        }
+        self.assertEqual(reachable_registry, locked_registry)
+
+        for name in sorted(locked_registry):
+            package = packages[name]
+            self.assertRegex(package["sdist"]["hash"], SHA256, name)
+            self.assertTrue(package["wheels"], name)
+            for wheel in package["wheels"]:
+                self.assertRegex(wheel["hash"], SHA256, name)
+
+    def test_running_environment_is_physical_checkout_local_venv(self) -> None:
+        expected = assert_checkout_local_environment(
+            REPO_ROOT,
+            Path(sys.prefix),
+            dict(os.environ),
+        )
+        self.assertEqual(expected, Path(os.path.realpath(REPO_ROOT)) / ".venv")
+        self.assertEqual(sys.version_info[:2], (3, 12))
+        result = run("uv", "--version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"^uv 0\.11\.31(?:\s|$)")
+
+    def test_environment_contract_rejects_external_override(self) -> None:
+        environ = dict(os.environ)
+        environ["UV_PROJECT_ENVIRONMENT"] = "/tmp/external-uv-environment"
+        with self.assertRaisesRegex(AssertionError, "UV_PROJECT_ENVIRONMENT"):
+            assert_checkout_local_environment(
+                REPO_ROOT,
+                Path(sys.prefix),
+                environ,
+            )
+
+    def test_environment_contract_rejects_symlinked_venv(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="uv-environment-contract-",
+        ) as temporary:
+            temporary_root = Path(temporary)
+            checkout = temporary_root / "checkout"
+            external = temporary_root / "external"
+            checkout.mkdir()
+            external.mkdir()
+            (checkout / ".venv").symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(AssertionError, "symlink"):
+                assert_checkout_local_environment(
+                    checkout,
+                    external,
+                    {},
+                )
+
+    def test_lock_validator_rejects_structural_corruption(self) -> None:
+        cases: list[tuple[str, dict, str]] = []
+
+        duplicate = copy.deepcopy(self.lock)
+        duplicate["package"].append(copy.deepcopy(duplicate["package"][0]))
+        cases.append(("duplicate", duplicate, "duplicate package"))
+
+        missing = copy.deepcopy(self.lock)
+        kas = next(
+            package for package in missing["package"]
+            if package["name"] == "kas"
+        )
+        kas["dependencies"].append({"name": "missing-package"})
+        cases.append(("missing", missing, "missing dependency"))
+
+        orphan = copy.deepcopy(self.lock)
+        orphan_package = copy.deepcopy(orphan["package"][0])
+        orphan_package["name"] = "orphan-package"
+        orphan["package"].append(orphan_package)
+        cases.append(("orphan", orphan, "registry closure"))
+
+        bad_sdist = copy.deepcopy(self.lock)
+        bad_sdist["package"][0]["sdist"]["hash"] = "sha256:not-a-digest"
+        cases.append(("sdist hash", bad_sdist, "sdist hash"))
+
+        bad_wheel = copy.deepcopy(self.lock)
+        bad_wheel["package"][0]["wheels"][0]["hash"] = "md5:bad"
+        cases.append(("wheel hash", bad_wheel, "wheel hash"))
+
+        for name, lock, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(AssertionError, message):
+                    validate_lock(lock)
 
 
 if __name__ == "__main__":
@@ -207,13 +439,14 @@ Expected:
 Run:
 
 ```bash
-if ! command -v uv >/dev/null 2>&1 || [[ "$(uv --version)" != "uv 0.11.31" ]]; then
+if [[ ! -x /home/many/.local/bin/uv ]] ||
+   [[ "$(/home/many/.local/bin/uv --version | awk '{print $2}')" != "0.11.31" ]]; then
     curl -LsSf https://astral.sh/uv/0.11.31/install.sh |
         env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/home/many/.local/bin sh
     export PATH="/home/many/.local/bin:$PATH"
 fi
-command -v uv
-uv --version
+test -x /home/many/.local/bin/uv
+/home/many/.local/bin/uv --version
 ```
 
 Expected:
@@ -298,9 +531,9 @@ Expected: both commands report `uv.lock` as the only missing project-contract fi
 Run:
 
 ```bash
-uv lock
-uv lock --check
-uv sync --locked
+/home/many/.local/bin/uv lock
+/home/many/.local/bin/uv lock --check
+/home/many/.local/bin/uv sync --locked
 ```
 
 Expected:
@@ -316,10 +549,15 @@ Expected:
 Run:
 
 ```bash
-uv run --locked python -c 'import pathlib, sys; assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(".venv").resolve()'
-uv run --locked python -c 'import importlib.metadata as metadata; assert metadata.version("kas") == "5.4"'
-uv run --locked kas --version
-uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+/home/many/.local/bin/uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
+/home/many/.local/bin/uv run --locked python -c 'import importlib.metadata as metadata; assert metadata.version("kas") == "5.4"'
+/home/many/.local/bin/uv run --locked kas --version
+/home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
 ```
 
 Expected:
@@ -336,7 +574,7 @@ Run:
 ```bash
 test ! -e requirements-build.txt
 git check-ignore -v .venv
-uv lock --check
+/home/many/.local/bin/uv lock --check
 git diff --check
 git status --short
 ```
@@ -397,7 +635,19 @@ LEGACY_FRAGMENTS = (
     "uv pip install",
 )
 DIRECT_TOOL = re.compile(
-    r"(^\s*|(?:&&|\|\||;|\||\$\()\s*)(?:python3?|kas)(?=\s)"
+    r"(^\s*|(?:&&|\|\||;|\||\$\(|`)\s*)"
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*="
+    r"(?:[^\s;&|]+|'[^']*'|\"[^\"]*\"))\s+|"
+    r"(?:(?:sudo|env|exec|time|setsid)\s+))*"
+    r"(?:python3?|kas)(?=\s|$)"
+)
+DIRECT_TOOL_NEGATIVE_FIXTURES = (
+    "sudo python scripts/check.py",
+    "env kas dump kas/rpi5-minimal.yml",
+    "exec python -m unittest",
+    "time kas --version",
+    "FOO=bar python scripts/check.py",
+    "setsid kas shell kas/qemuarm64-minimal.yml",
 )
 
 
@@ -420,6 +670,19 @@ def shell_lines(markdown: str) -> list[tuple[int, str]]:
 
 
 class UvDocsContractTest(unittest.TestCase):
+    def test_direct_tool_detector_rejects_wrappers_and_assignments(self) -> None:
+        for command in DIRECT_TOOL_NEGATIVE_FIXTURES:
+            with self.subTest(command=command):
+                self.assertIsNotNone(DIRECT_TOOL.search(command))
+
+    def test_direct_tool_detector_allows_locked_uv_under_setsid(self) -> None:
+        self.assertIsNone(
+            DIRECT_TOOL.search(
+                "setsid uv run --locked kas shell "
+                "kas/qemuarm64-minimal.yml -c runqemu"
+            )
+        )
+
     def test_build_design_uses_locked_uv_commands(self) -> None:
         text = read(DESIGN_DOCUMENT)
         for fragment in LEGACY_FRAGMENTS:
@@ -444,7 +707,7 @@ if __name__ == "__main__":
 Run:
 
 ```bash
-uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
+/home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
 ```
 
 Expected: the test fails and identifies the legacy venv creation, activation, pip installation, and direct kas command examples in the design.
@@ -546,8 +809,8 @@ QEMU 시작 제한 시간은 180초로 한다. 실패 시 콘솔 로그, systemd
 Run:
 
 ```bash
-uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
-uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
+/home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
+/home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
 git diff --check
 ```
 
@@ -603,7 +866,19 @@ LEGACY_FRAGMENTS = (
     "uv pip install",
 )
 DIRECT_TOOL = re.compile(
-    r"(^\s*|(?:&&|\|\||;|\||\$\()\s*)(?:python3?|kas)(?=\s)"
+    r"(^\s*|(?:&&|\|\||;|\||\$\(|`)\s*)"
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*="
+    r"(?:[^\s;&|]+|'[^']*'|\"[^\"]*\"))\s+|"
+    r"(?:(?:sudo|env|exec|time|setsid)\s+))*"
+    r"(?:python3?|kas)(?=\s|$)"
+)
+DIRECT_TOOL_NEGATIVE_FIXTURES = (
+    "sudo python scripts/check.py",
+    "env kas dump kas/rpi5-minimal.yml",
+    "exec python -m unittest",
+    "time kas --version",
+    "FOO=bar python scripts/check.py",
+    "setsid kas shell kas/qemuarm64-minimal.yml",
 )
 INDIRECT_KAS_FRAGMENTS = (
     "run_logged kas ",
@@ -632,6 +907,19 @@ def shell_lines(markdown: str) -> list[tuple[int, str]]:
 
 
 class UvDocsContractTest(unittest.TestCase):
+    def test_direct_tool_detector_rejects_wrappers_and_assignments(self) -> None:
+        for command in DIRECT_TOOL_NEGATIVE_FIXTURES:
+            with self.subTest(command=command):
+                self.assertIsNotNone(DIRECT_TOOL.search(command))
+
+    def test_direct_tool_detector_allows_locked_uv_under_setsid(self) -> None:
+        self.assertIsNone(
+            DIRECT_TOOL.search(
+                "setsid uv run --locked kas shell "
+                "kas/qemuarm64-minimal.yml -c runqemu"
+            )
+        )
+
     def assert_locked_uv_document(self, relative: str) -> str:
         text = read(relative)
         for fragment in LEGACY_FRAGMENTS:
@@ -683,7 +971,7 @@ if __name__ == "__main__":
 Run:
 
 ```bash
-uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
+/home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
 ```
 
 Expected: the design test remains green; the firmware-plan test fails on the legacy requirements file, activation commands, direct test commands, direct kas calls, and planned shell-script invocations.
@@ -760,12 +1048,13 @@ git switch -c feature/repository-guardrails
 - [ ] **Step 2: Install or select the pinned uv prerequisite**
 
 ```bash
-if ! command -v uv >/dev/null 2>&1 || [[ "$(uv --version)" != "uv 0.11.31" ]]; then
+if [[ ! -x /home/many/.local/bin/uv ]] ||
+   [[ "$(/home/many/.local/bin/uv --version | awk '{print $2}')" != "0.11.31" ]]; then
     curl -LsSf https://astral.sh/uv/0.11.31/install.sh |
         env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/home/many/.local/bin sh
     export PATH="/home/many/.local/bin:$PATH"
 fi
-test "$(uv --version)" = "uv 0.11.31"
+test "$(/home/many/.local/bin/uv --version | awk '{print $2}')" = "0.11.31"
 ```
 
 Expected: uv is exactly 0.11.31 and no shell startup file is modified.
@@ -915,11 +1204,114 @@ if __name__ == "__main__":
 ```
 
 ```python
-# tests/host/test_uv_environment_contract.py
+import copy
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
 import tomllib
 import unittest
 
-from support import REPO_ROOT, read
+from support import REPO_ROOT, read, run
+
+
+SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def validate_lock(lock: dict) -> None:
+    if lock.get("requires-python") != "==3.12.*":
+        raise AssertionError("top-level requires-python must be ==3.12.*")
+
+    package_list = lock.get("package", [])
+    names = [package["name"] for package in package_list]
+    if len(names) != len(set(names)):
+        raise AssertionError("duplicate package names")
+    packages = {package["name"]: package for package in package_list}
+
+    expected_root = {
+        "name": "yocto-rpi5-cam-firmware",
+        "version": "0.0.0",
+        "source": {"virtual": "."},
+        "dev-dependencies": {"build": [{"name": "kas"}]},
+        "metadata": {
+            "requires-dev": {
+                "build": [{"name": "kas", "specifier": "==5.4"}],
+            },
+        },
+    }
+    root = packages.get("yocto-rpi5-cam-firmware")
+    if root != expected_root:
+        raise AssertionError("virtual root metadata must be exact")
+
+    kas = packages.get("kas")
+    if not kas or kas.get("version") != "5.4":
+        raise AssertionError("kas must be locked at 5.4")
+    if kas.get("source") != {"registry": "https://pypi.org/simple"}:
+        raise AssertionError("kas registry source must be exact")
+
+    reachable: set[str] = set()
+    pending = ["kas"]
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        package = packages.get(name)
+        if package is None:
+            raise AssertionError(f"missing dependency: {name}")
+        reachable.add(name)
+        pending.extend(
+            dependency["name"]
+            for dependency in package.get("dependencies", [])
+        )
+
+    locked_registry = {
+        name
+        for name, package in packages.items()
+        if "registry" in package["source"]
+    }
+    reachable_registry = {
+        name
+        for name in reachable
+        if "registry" in packages[name]["source"]
+    }
+    if reachable_registry != locked_registry:
+        raise AssertionError("registry closure mismatch")
+
+    for name in sorted(locked_registry):
+        package = packages[name]
+        sdist_hash = package.get("sdist", {}).get("hash", "")
+        if SHA256.fullmatch(sdist_hash) is None:
+            raise AssertionError(f"invalid sdist hash: {name}")
+        wheels = package.get("wheels", [])
+        if not wheels:
+            raise AssertionError(f"missing wheels: {name}")
+        for wheel in wheels:
+            if SHA256.fullmatch(wheel.get("hash", "")) is None:
+                raise AssertionError(f"invalid wheel hash: {name}")
+
+
+def assert_checkout_local_environment(
+    repo_root: Path,
+    prefix: Path,
+    environ: dict[str, str],
+) -> Path:
+    override = environ.get("UV_PROJECT_ENVIRONMENT", "")
+    if override:
+        raise AssertionError("UV_PROJECT_ENVIRONMENT must be unset or empty")
+
+    physical_root = Path(os.path.realpath(repo_root))
+    environment = repo_root / ".venv"
+    expected = physical_root / ".venv"
+    if environment.is_symlink():
+        raise AssertionError(".venv must not be a symlink")
+    if not environment.is_dir():
+        raise AssertionError(".venv must be a directory")
+    if Path(os.path.realpath(environment)) != expected:
+        raise AssertionError(".venv must be physically checkout-local")
+    if Path(prefix).resolve() != expected:
+        raise AssertionError("sys.prefix must be the checkout-local .venv")
+    return expected
 
 
 class UvEnvironmentContractTest(unittest.TestCase):
@@ -953,18 +1345,143 @@ class UvEnvironmentContractTest(unittest.TestCase):
         self.assertFalse((REPO_ROOT / "requirements-build.txt").exists())
         self.assertIn(".venv/", set(read(".gitignore").splitlines()))
 
-    def test_lock_contains_kas_and_its_resolved_dependencies(self) -> None:
+    def test_lock_has_exact_root_and_python_metadata(self) -> None:
+        validate_lock(self.lock)
+        self.assertEqual(self.lock["requires-python"], "==3.12.*")
+        package_list = self.lock["package"]
+        names = [package["name"] for package in package_list]
+        self.assertEqual(len(names), len(set(names)), "duplicate package names")
+        packages = {package["name"]: package for package in package_list}
+        root = packages["yocto-rpi5-cam-firmware"]
+        self.assertEqual(root["version"], "0.0.0")
+        self.assertEqual(root["source"], {"virtual": "."})
+        self.assertEqual(
+            root["dev-dependencies"],
+            {"build": [{"name": "kas"}]},
+        )
+        self.assertEqual(
+            root["metadata"],
+            {
+                "requires-dev": {
+                    "build": [{"name": "kas", "specifier": "==5.4"}],
+                },
+            },
+        )
+
+    def test_lock_contains_complete_hashed_kas_registry_closure(self) -> None:
+        validate_lock(self.lock)
         packages = {
             package["name"]: package
             for package in self.lock["package"]
         }
-        self.assertEqual(packages["kas"]["version"], "5.4")
-        dependencies = {
-            dependency["name"]
-            for dependency in packages["kas"].get("dependencies", [])
+        kas = packages["kas"]
+        self.assertEqual(kas["version"], "5.4")
+        self.assertEqual(kas["source"], {"registry": "https://pypi.org/simple"})
+
+        reachable: set[str] = set()
+        pending = ["kas"]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            self.assertIn(name, packages)
+            reachable.add(name)
+            for dependency in packages[name].get("dependencies", []):
+                dependency_name = dependency["name"]
+                self.assertIn(dependency_name, packages)
+                pending.append(dependency_name)
+
+        locked_registry = {
+            name
+            for name, package in packages.items()
+            if "registry" in package["source"]
         }
-        self.assertTrue(dependencies)
-        self.assertTrue(dependencies.issubset(packages))
+        reachable_registry = {
+            name
+            for name in reachable
+            if "registry" in packages[name]["source"]
+        }
+        self.assertEqual(reachable_registry, locked_registry)
+
+        for name in sorted(locked_registry):
+            package = packages[name]
+            self.assertRegex(package["sdist"]["hash"], SHA256, name)
+            self.assertTrue(package["wheels"], name)
+            for wheel in package["wheels"]:
+                self.assertRegex(wheel["hash"], SHA256, name)
+
+    def test_running_environment_is_physical_checkout_local_venv(self) -> None:
+        expected = assert_checkout_local_environment(
+            REPO_ROOT,
+            Path(sys.prefix),
+            dict(os.environ),
+        )
+        self.assertEqual(expected, Path(os.path.realpath(REPO_ROOT)) / ".venv")
+        self.assertEqual(sys.version_info[:2], (3, 12))
+        result = run("uv", "--version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"^uv 0\.11\.31(?:\s|$)")
+
+    def test_environment_contract_rejects_external_override(self) -> None:
+        environ = dict(os.environ)
+        environ["UV_PROJECT_ENVIRONMENT"] = "/tmp/external-uv-environment"
+        with self.assertRaisesRegex(AssertionError, "UV_PROJECT_ENVIRONMENT"):
+            assert_checkout_local_environment(
+                REPO_ROOT,
+                Path(sys.prefix),
+                environ,
+            )
+
+    def test_environment_contract_rejects_symlinked_venv(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="uv-environment-contract-",
+        ) as temporary:
+            temporary_root = Path(temporary)
+            checkout = temporary_root / "checkout"
+            external = temporary_root / "external"
+            checkout.mkdir()
+            external.mkdir()
+            (checkout / ".venv").symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(AssertionError, "symlink"):
+                assert_checkout_local_environment(
+                    checkout,
+                    external,
+                    {},
+                )
+
+    def test_lock_validator_rejects_structural_corruption(self) -> None:
+        cases: list[tuple[str, dict, str]] = []
+
+        duplicate = copy.deepcopy(self.lock)
+        duplicate["package"].append(copy.deepcopy(duplicate["package"][0]))
+        cases.append(("duplicate", duplicate, "duplicate package"))
+
+        missing = copy.deepcopy(self.lock)
+        kas = next(
+            package for package in missing["package"]
+            if package["name"] == "kas"
+        )
+        kas["dependencies"].append({"name": "missing-package"})
+        cases.append(("missing", missing, "missing dependency"))
+
+        orphan = copy.deepcopy(self.lock)
+        orphan_package = copy.deepcopy(orphan["package"][0])
+        orphan_package["name"] = "orphan-package"
+        orphan["package"].append(orphan_package)
+        cases.append(("orphan", orphan, "registry closure"))
+
+        bad_sdist = copy.deepcopy(self.lock)
+        bad_sdist["package"][0]["sdist"]["hash"] = "sha256:not-a-digest"
+        cases.append(("sdist hash", bad_sdist, "sdist hash"))
+
+        bad_wheel = copy.deepcopy(self.lock)
+        bad_wheel["package"][0]["wheels"][0]["hash"] = "md5:bad"
+        cases.append(("wheel hash", bad_wheel, "wheel hash"))
+
+        for name, lock, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(AssertionError, message):
+                    validate_lock(lock)
 
 
 if __name__ == "__main__":
@@ -1117,6 +1634,15 @@ cd "$repo_root"
 uv_version="$(uv --version | awk '{print $2}')"
 [[ "$uv_version" == "0.11.31" ]] || rpi5_die "uv must be version 0.11.31"
 uv lock --check || rpi5_die "uv.lock is stale"
+test -z "${UV_PROJECT_ENVIRONMENT:-}" ||
+    rpi5_die "UV_PROJECT_ENVIRONMENT must be unset or empty"
+test -d .venv || rpi5_die ".venv must be a directory"
+test ! -L .venv || rpi5_die ".venv must not be a symlink"
+test "$(realpath .venv)" = "$(pwd -P)/.venv" ||
+    rpi5_die ".venv must be physically checkout-local"
+uv run --locked python -c \
+    'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)' ||
+    rpi5_die "uv must run physical checkout-local Python 3.12"
 python_version="$(uv run --locked python -c 'import platform; print(platform.python_version())')"
 version_ge "$python_version" "3.12" || rpi5_die "Python must be at least 3.12"
 version_ge "3.12.999" "$python_version" || rpi5_die "Python must be below 3.13"
@@ -1128,6 +1654,8 @@ uv run --locked kas --version |
 In Task 6's `scripts/build.sh`, replace the entire action case with:
 
 ```bash
+repo_root="$(rpi5_repo_root)"
+cd "$repo_root"
 case "$action" in
     checkout) run_logged uv run --locked kas checkout "$config" ;;
     layers) run_logged uv run --locked kas shell "$config" -c 'bitbake-layers show-layers' ;;
@@ -1153,16 +1681,147 @@ project_revision="$(git -C "$repo_root" rev-parse HEAD)"
 kas_version="$(uv run --locked kas --version | tr '\n' ' ')"
 ```
 
-In Task 8's `scripts/flash-ssd.sh`, replace the block-device helper call with:
+In Task 7's QEMU launcher, preserve process-group cleanup by using and
+contract-testing this exact invocation:
 
 ```bash
-uv run --locked python "$helper" validate --topology "$topology" \
-    --device "$target_device" --image-bytes "$image_bytes"
+repo_root="$(rpi5_repo_root)"
+cd "$repo_root"
+setsid uv run --locked kas shell kas/qemuarm64-minimal.yml \
+    -c 'runqemu qemuarm64 rpi5-minimal-image nographic slirp'
+```
+
+Add the corresponding embedded contract:
+
+```python
+self.assertIn("setsid uv run --locked kas shell", script)
+```
+
+In Task 8, replace every privileged executable handoff with an authenticated
+archive flow. Pin:
+
+- archive:
+  `https://releases.astral.sh/github/uv/releases/download/0.11.31/uv-x86_64-unknown-linux-gnu.tar.gz`
+- SHA-256:
+  `8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b`
+- release:
+  `https://github.com/astral-sh/uv/releases/tag/0.11.31`
+
+The future root script must contain this complete trust-boundary core before
+any block-device query or operation:
+
+```bash
+readonly UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+
+authenticate_uv_archive() {
+    local uv_archive="$1"
+    local uv_private_dir="$2"
+    local uv_archive_copy="$uv_private_dir/uv-release.tar.gz"
+    local uv_extract_dir="$uv_private_dir/extract"
+    local uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"
+
+    [[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] ||
+        rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
+    install -m 0600 -- "$uv_archive" "$uv_archive_copy"
+    [[ -f "$uv_archive_copy" && ! -L "$uv_archive_copy" ]] ||
+        rpi5_die "private uv archive copy is not a regular file"
+    [[ "$(stat -c %u "$uv_archive_copy")" == "$EUID" ]] ||
+        rpi5_die "private uv archive copy ownership is invalid"
+    if ! (
+        cd "$uv_private_dir"
+        printf '%s  %s\n' "$UV_RELEASE_SHA256" "uv-release.tar.gz" |
+            sha256sum --check --strict --status
+    ); then
+        rpi5_die "authenticated uv archive checksum mismatch"
+    fi
+    install -d -m 0700 "$uv_extract_dir"
+    tar --extract --file "$uv_archive_copy" --directory "$uv_extract_dir" \
+        --gzip --no-same-owner --no-same-permissions
+    [[ -f "$uv_bin" && ! -L "$uv_bin" ]] ||
+        rpi5_die "authenticated archive is missing the expected uv executable"
+    chmod 0700 "$uv_bin"
+    [[ "$(stat -c %u "$uv_bin")" == "$EUID" &&
+       "$(stat -c %a "$uv_bin")" == "700" ]] ||
+        rpi5_die "authenticated uv executable ownership or mode is invalid"
+    printf '%s\n' "$uv_bin"
+}
+
+[[ "$EUID" -eq 0 ]] || rpi5_die "flash requires root for the selected device only"
+repo_root="$(rpi5_repo_root)"
+cd "$repo_root"
+uv_archive="${UV_ARCHIVE:-}"
+[[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] ||
+    rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
+umask 077
+uv_private_dir="$(mktemp -d /var/tmp/rpi5-flash-uv.XXXXXXXX)"
+chown root:root "$uv_private_dir"
+chmod 0700 "$uv_private_dir"
+[[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]]
+[[ "$(stat -c %u "$uv_private_dir")" == "0" ]]
+cleanup_uv() {
+    if [[ "${uv_private_dir:-}" =~ ^/var/tmp/rpi5-flash-uv\.[A-Za-z0-9]{8}$ ]] &&
+       [[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]] &&
+       [[ "$(stat -c %u "$uv_private_dir")" == "0" ]]; then
+        find "$uv_private_dir" -xdev -depth -delete
+    fi
+    uv_private_dir=""
+}
+trap cleanup_uv EXIT
+uv_bin="$(authenticate_uv_archive "$uv_archive" "$uv_private_dir")"
+[[ "$("$uv_bin" --version | awk '{print $2}')" == "0.11.31" ]] ||
+    rpi5_die "authenticated uv executable must be version 0.11.31"
+```
+
+Use that single authenticated private executable for the finalized complete
+helper set:
+
+```bash
+image_bytes="$("$uv_bin" run --locked python "$helper" bmap-size --bmap "$bmap")"
+metadata="$("$uv_bin" run --locked python "$helper" validate \
+    --topology "$topology" --target "$device" --image-bytes "$image_bytes" \
+    "${protected[@]}" --allow-mounted)"
+mapfile -t mounted < <("$uv_bin" run --locked python "$helper" mounts \
+    --topology "$topology" --target "$device")
+"$uv_bin" run --locked python "$helper" validate \
+    --topology "$topology" --target "$device" --image-bytes "$image_bytes" \
+    "${protected[@]}" >/dev/null
+boot_partition="$("$uv_bin" run --locked python "$helper" partition \
+    --device "$device" --number 1)"
+root_partition="$("$uv_bin" run --locked python "$helper" partition \
+    --device "$device" --number 2)"
+```
+
+The flash cleanup function must invoke `cleanup_uv`; the root script must
+contain no download command, `sudo -E`, or network access.
+
+Add the future executable negative test `test_spoofed_uv_executable_is_rejected`.
+Its actual executable fixture must print `uv 0.11.31` and write a marker if
+executed:
+
+```python
+marker = root / "SPOOF_EXECUTED"
+spoof.write_text(
+    "#!/usr/bin/env bash\n"
+    ': > "${SPOOF_MARKER:?}"\n'
+    "printf 'uv 0.11.31\\n'\n",
+    encoding="utf-8",
+)
+result = run(
+    "bash", "-c",
+    'source "$1"\nauthenticate_uv_archive "$2" "$3"\n',
+    "bash", str(REPO_ROOT / "scripts/flash-ssd.sh"),
+    str(spoof), str(private),
+    env={"SPOOF_MARKER": os.fspath(marker)},
+)
+self.assertNotEqual(result.returncode, 0)
+self.assertFalse(marker.exists(), "spoofed executable was run")
 ```
 
 In Task 9's `scripts/discover-rpi5.sh`, replace its inline Python call with:
 
 ```bash
+repo_root="$(rpi5_repo_root)"
+cd "$repo_root"
     uv run --locked python - "$1" <<'PY'
 ```
 
@@ -1204,13 +1863,20 @@ library venv provisioning package are no longer repository setup tools.
 Replace the Task 12 one-time Python setup block with:
 
 ```bash
-if ! command -v uv >/dev/null 2>&1 || [[ "$(uv --version)" != "uv 0.11.31" ]]; then
+if ! command -v uv >/dev/null 2>&1 ||
+   [[ "$(uv --version | awk '{print $2}')" != "0.11.31" ]]; then
     curl -LsSf https://astral.sh/uv/0.11.31/install.sh |
         env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/home/many/.local/bin sh
     export PATH="/home/many/.local/bin:$PATH"
 fi
 uv lock --check
 uv sync --locked
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 uv run --locked kas --version
 ```
 
@@ -1231,6 +1897,32 @@ remote Raspberry Pi, and camera runbook blocks. Keep their repository shell
 scripts directly executable because Task 6 makes Python/kas calls inside
 those scripts use uv.
 
+Before every minimal or camera flash, download and verify the pinned archive
+as the normal user into ignored repository state, then pass only its
+absolute path:
+
+```bash
+UV_RELEASE_URL="https://releases.astral.sh/github/uv/releases/download/0.11.31/uv-x86_64-unknown-linux-gnu.tar.gz"
+UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+UV_ARCHIVE="$(pwd -P)/.state/uv-release/uv-x86_64-unknown-linux-gnu.tar.gz"
+mkdir -p "$(dirname "$UV_ARCHIVE")"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  "$UV_RELEASE_URL" --output "$UV_ARCHIVE.download"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE.download" |
+  sha256sum --check --strict
+mv -- "$UV_ARCHIVE.download" "$UV_ARCHIVE"
+test -f "$UV_ARCHIVE"
+test ! -L "$UV_ARCHIVE"
+printf '%s  %s\n' "$UV_RELEASE_SHA256" "$UV_ARCHIVE" |
+  sha256sum --check --strict
+sudo UV_ARCHIVE="$UV_ARCHIVE" ./scripts/flash-ssd.sh \
+  --build-id "$BUILD_ID" --profile "$PROFILE" \
+  --device "$TARGET_DEVICE" --confirm "$CONFIRMATION"
+```
+
+Do not use `sudo -E`, a root download, or any user-selected executable
+handoff.
+
 Replace every remaining runbook Python command with its locked form:
 
 ```bash
@@ -1249,18 +1941,24 @@ bootstrap function and invocation:
 
 ```bash
 ensure_uv() {
-    if ! command -v uv >/dev/null 2>&1 || [[ "$(uv --version)" != "uv 0.11.31" ]]; then
+    if ! command -v uv >/dev/null 2>&1 ||
+       [[ "$(uv --version | awk '{print $2}')" != "0.11.31" ]]; then
         mkdir -p "$repo_root/.state/uv-bin"
         curl -LsSf https://astral.sh/uv/0.11.31/install.sh |
             env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$repo_root/.state/uv-bin" sh
         export PATH="$repo_root/.state/uv-bin:$PATH"
     fi
-    [[ "$(uv --version)" == "uv 0.11.31" ]] ||
+    [[ "$(uv --version | awk '{print $2}')" == "0.11.31" ]] ||
         rpi5_die "uv must be version 0.11.31"
     cd "$repo_root"
     uv lock --check
     uv sync --locked
-    uv run --locked python -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+    test -z "${UV_PROJECT_ENVIRONMENT:-}"
+    test -d .venv
+    test ! -L .venv
+    test "$(realpath .venv)" = "$(pwd -P)/.venv"
+    uv run --locked python -c \
+        'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 }
 
 ensure_uv
@@ -1301,7 +1999,7 @@ Add this method to the embedded `CiContractTest`:
         script = read("ci/pipeline.sh")
         self.assertIn("https://astral.sh/uv/0.11.31/install.sh", script)
         self.assertIn("UV_NO_MODIFY_PATH=1", script)
-        self.assertIn('[[ "$(uv --version)" == "uv 0.11.31" ]]', script)
+        self.assertIn('[[ "$(uv --version | awk \'{print $2}\')" == "0.11.31" ]]', script)
         self.assertIn("uv lock --check", script)
         self.assertIn("uv sync --locked", script)
         self.assertIn("uv run --locked python", script)
@@ -1329,10 +2027,12 @@ the uv project supplies the exact Python/kas command environment.
 Run:
 
 ```bash
-uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
-uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
+/home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
+/home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
 rg -n 'python3 -m venv|\.venv/bin/activate|pip install|uv pip install' docs/superpowers/specs/2026-07-22-rpi5-yocto-build-validation-design.md docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md
 rg -n 'Create: `requirements-build\.txt`|# requirements-build\.txt|git add .*requirements-build\.txt' docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md
+rg -n 'U[V]_BIN' docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md docs/superpowers/plans/2026-07-23-uv-python-environment-implementation.md
+rg -n -U 'validate --topology "\$topology" \\\n[[:space:]]+--device' docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md docs/superpowers/plans/2026-07-23-uv-python-environment-implementation.md
 git diff --check
 ```
 
@@ -1340,7 +2040,10 @@ Expected:
 
 - both documentation tests pass;
 - the complete host suite passes;
-- both `rg` commands exit `1` with no matches;
+- all four `rg` commands exit `1` with no matches;
+- the documentation contract allows direct system `python3` only in the six
+  explicitly enumerated pre-project baseline/red-state commands and rejects
+  every direct steady-state Python/kas command, including wrapper forms;
 - `git diff --check` reports no errors.
 
 - [ ] **Step 10: Review the large plan diff by semantic area**
@@ -1355,8 +2058,9 @@ git status --short
 
 Expected:
 
-- only the uv documentation test and canonical firmware plan are changed in
-  this task;
+- only the live uv environment/documentation contracts, canonical firmware
+  plan, active uv plan, and uv design specification are changed in this
+  review-fix wave;
 - no Yocto pin, image recipe, device policy, evidence gate, hardware flow,
   OCI digest, or wrapper checksum changes;
 - every deleted activation/direct invocation has an equivalent locked uv
@@ -1395,12 +2099,18 @@ Run from `/home/many/yocto-rpi5-cam-firmware/.worktrees/uv-python-environment`:
 ```bash
 test "$(git branch --show-current)" = "feature/uv-python-environment"
 test -z "$(git status --porcelain)"
-test "$(uv --version)" = "uv 0.11.31"
-uv lock --check
-uv sync --locked
-uv run --locked python -c 'import pathlib, sys; assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(".venv").resolve()'
-uv run --locked kas --version
-uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
+UV=/home/many/.local/bin/uv
+test "$("$UV" --version | awk '{print $2}')" = "0.11.31"
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+"$UV" lock --check
+"$UV" sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+"$UV" run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
+"$UV" run --locked kas --version
+"$UV" run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
 git diff --exit-code
 git log --oneline --decorate -5
 ```
@@ -1447,11 +2157,18 @@ Run from
 `/home/many/yocto-rpi5-cam-firmware/.worktrees/uv-develop-integration`:
 
 ```bash
-uv lock --check
-uv sync --locked
-uv run --locked python -c 'import pathlib, sys; assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(".venv").resolve()'
-uv run --locked kas --version
-uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
+UV=/home/many/.local/bin/uv
+test "$("$UV" --version | awk '{print $2}')" = "0.11.31"
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+"$UV" lock --check
+"$UV" sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+"$UV" run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
+"$UV" run --locked kas --version
+"$UV" run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
 test -z "$(git status --porcelain)"
 ```
 
@@ -1474,31 +2191,75 @@ changing its reviewed image recipes or Yocto pins.
 Run:
 
 ```bash
-test -d /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv
-test -f /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv/pyvenv.cfg
-realpath /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv
-sed -n '1,120p' /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv/pyvenv.cfg
-test "$(realpath /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv)" = "/home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv"
+readonly legacy_venv="/home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv"
+readonly legacy_cfg="$legacy_venv/pyvenv.cfg"
+[[ -d "$legacy_venv" && ! -L "$legacy_venv" ]]
+test "$(realpath -- "$legacy_venv")" = "$legacy_venv"
+test -f "$legacy_cfg"
+test ! -L "$legacy_cfg"
+grep -Fqx 'home = /usr/bin' "$legacy_cfg"
+grep -Fqx 'include-system-site-packages = false' "$legacy_cfg"
+grep -Fqx 'version = 3.12.3' "$legacy_cfg"
+grep -Fqx 'executable = /usr/bin/python3.12' "$legacy_cfg"
+grep -Fqx 'command = /usr/bin/python3 -m venv --without-pip /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv' "$legacy_cfg"
+if find "$legacy_venv" -xdev ! -user "$(id -un)" -print -quit | grep -q .; then
+    printf 'legacy environment contains an entry not owned by %s\n' "$(id -un)" >&2
+    exit 1
+fi
+while IFS= read -r mount_target; do
+    if [[ "$mount_target" == "$legacy_venv" || "$mount_target" == "$legacy_venv/"* ]]; then
+        printf 'mount exists at or below legacy environment: %s\n' "$mount_target" >&2
+        exit 1
+    fi
+done < <(findmnt -rn -o TARGET)
 ```
 
 Expected:
 
 - `realpath` is exactly the fixed `.venv` path above;
-- `pyvenv.cfg` identifies a Python 3.12 environment created by the legacy
+- every `pyvenv.cfg` provenance line exactly matches the approved legacy
   `/usr/bin/python3 -m venv --without-pip` flow;
-- the target is neither a symlink to another worktree nor a parent
-  directory.
+- the target and all entries are owned by the current intended user;
+- the target is neither a symlink nor a mount point, and no descendant is a
+  mount point.
 
 - [ ] **Step 7: Delete only the verified legacy environment and recreate it with uv**
 
 Run exactly:
 
 ```bash
-rm -r -- /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv
-test ! -e /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv
+readonly legacy_venv="/home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv"
+readonly legacy_cfg="$legacy_venv/pyvenv.cfg"
+[[ -d "$legacy_venv" && ! -L "$legacy_venv" ]]
+test "$(realpath -- "$legacy_venv")" = "$legacy_venv"
+test -f "$legacy_cfg"
+test ! -L "$legacy_cfg"
+grep -Fqx 'home = /usr/bin' "$legacy_cfg"
+grep -Fqx 'include-system-site-packages = false' "$legacy_cfg"
+grep -Fqx 'version = 3.12.3' "$legacy_cfg"
+grep -Fqx 'executable = /usr/bin/python3.12' "$legacy_cfg"
+grep -Fqx 'command = /usr/bin/python3 -m venv --without-pip /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation/.venv' "$legacy_cfg"
+if find "$legacy_venv" -xdev ! -user "$(id -un)" -print -quit | grep -q .; then
+    exit 1
+fi
+while IFS= read -r mount_target; do
+    if [[ "$mount_target" == "$legacy_venv" || "$mount_target" == "$legacy_venv/"* ]]; then
+        exit 1
+    fi
+done < <(findmnt -rn -o TARGET)
+rm -r --one-file-system -- "$legacy_venv"
+test ! -e "$legacy_venv"
 cd /home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation
-uv lock --check
-uv sync --locked
+UV=/home/many/.local/bin/uv
+test "$("$UV" --version | awk '{print $2}')" = "0.11.31"
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+"$UV" lock --check
+"$UV" sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+"$UV" run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ```
 
 Expected:
@@ -1516,14 +2277,20 @@ Run from
 `/home/many/yocto-rpi5-cam-firmware/.worktrees/yocto-implementation`:
 
 ```bash
-test "$(uv --version)" = "uv 0.11.31"
-uv lock --check
-uv run --locked python -c 'import pathlib, sys; assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(".venv").resolve()'
-uv run --locked python -c 'import importlib.metadata as metadata; assert metadata.version("kas") == "5.4"'
-uv run --locked kas dump kas/qemuarm64-minimal.yml
-uv run --locked kas dump kas/rpi5-minimal.yml
-uv run --locked kas dump kas/rpi5-camera.yml
-uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
+UV=/home/many/.local/bin/uv
+test "$("$UV" --version | awk '{print $2}')" = "0.11.31"
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
+"$UV" lock --check
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+"$UV" run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
+"$UV" run --locked python -c 'import importlib.metadata as metadata; assert metadata.version("kas") == "5.4"'
+"$UV" run --locked kas dump kas/qemuarm64-minimal.yml
+"$UV" run --locked kas dump kas/rpi5-minimal.yml
+"$UV" run --locked kas dump kas/rpi5-camera.yml
+"$UV" run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
 git diff --check
 git status --short --branch
 ```
@@ -1561,6 +2328,14 @@ AppArmor change; do not modify AppArmor or sysctl as part of this plan.
 - The verified legacy implementation-worktree environment has been deleted
   and recreated by `uv sync --locked`.
 - Static repository, lockfile, and documentation contracts pass.
+- Every active environment gate rejects `UV_PROJECT_ENVIRONMENT`, symlinked
+  `.venv`, and a physical path or `sys.prefix` outside the checkout.
+- Privileged flashing accepts only the pinned official uv archive, verifies
+  a root-private copy before safe extraction, and never executes a
+  user-selected path; the spoofed-executable negative test remains enforced.
+- Legacy-environment deletion is limited to the fixed literal target after
+  exact provenance, ownership, realpath, symlink, and mount checks, and uses
+  one-filesystem removal.
 - Canonical design, implementation plan, future scripts, runbooks, and CI
   contain no activation, pip setup, use of the legacy requirements file, or
   direct documented Python/kas execution; contract tests may name the file
