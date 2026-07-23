@@ -3,6 +3,12 @@
 __pycache__/
 *.py[cod]
 
+bitbake/
+openembedded-core/
+meta-yocto/
+meta-openembedded/
+meta-raspberrypi/
+
 build/
 downloads/
 sstate-cache/

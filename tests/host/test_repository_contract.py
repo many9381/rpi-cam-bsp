@@ -22,6 +22,11 @@ class RepositoryContractTest(unittest.TestCase):
             "artifacts/releases/*",
             "!artifacts/releases/*.json",
             ".state/",
+            "bitbake/",
+            "openembedded-core/",
+            "meta-yocto/",
+            "meta-openembedded/",
+            "meta-raspberrypi/",
         }
         self.assertTrue(required.issubset(ignored))
 
