@@ -20,22 +20,26 @@ USERADD_PARAM:${PN} = "--uid 1000 --home-dir /home/rpiadmin \
 
 RPI5_ADMIN_SSH_PUBKEY ??= ""
 RPI5_BUILD_ID ??= "unversioned"
+export RPI5_ADMIN_SSH_PUBKEY
+export RPI5_BUILD_ID
+
+python do_validate_device_config() {
+    from rpi5cam.device_config_validation import (
+        validate_build_id,
+        validate_ssh_public_key,
+    )
+
+    try:
+        validate_ssh_public_key(d.getVar("RPI5_ADMIN_SSH_PUBKEY"))
+        validate_build_id(d.getVar("RPI5_BUILD_ID"))
+    except ValueError as error:
+        bb.fatal(str(error))
+}
+addtask validate_device_config after do_prepare_recipe_sysroot before do_install
 
 do_install() {
-    key_lines="$(printf '%s\n' "${RPI5_ADMIN_SSH_PUBKEY}" | wc -l)"
-    if [ "$key_lines" -ne 1 ] || \
-       ! printf '%s\n' "${RPI5_ADMIN_SSH_PUBKEY}" | \
-         grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+( .*)?$'; then
-        bbfatal "RPI5_ADMIN_SSH_PUBKEY must contain one valid OpenSSH public key"
-    fi
-
-    if ! printf '%s\n' "${RPI5_BUILD_ID}" | \
-         grep -Eq '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}$'; then
-        bbfatal "RPI5_BUILD_ID must be UTC timestamp plus Git SHA"
-    fi
-
     install -d -m 0700 ${D}/home/rpiadmin/.ssh
-    printf '%s\n' "${RPI5_ADMIN_SSH_PUBKEY}" \
+    printf '%s\n' "$RPI5_ADMIN_SSH_PUBKEY" \
         > ${D}/home/rpiadmin/.ssh/authorized_keys
     chmod 0600 ${D}/home/rpiadmin/.ssh/authorized_keys
     chown -R rpiadmin:rpiadmin ${D}/home/rpiadmin
@@ -57,7 +61,7 @@ do_install() {
     install -m 0440 ${UNPACKDIR}/rpi5-admin-sudoers \
         ${D}${sysconfdir}/sudoers.d/rpi5-admin
 
-    printf '%s\n' "${RPI5_BUILD_ID}" > ${D}${sysconfdir}/rpi5-build-id
+    printf '%s\n' "$RPI5_BUILD_ID" > ${D}${sysconfdir}/rpi5-build-id
     chmod 0644 ${D}${sysconfdir}/rpi5-build-id
 }
 
@@ -78,4 +82,4 @@ CONFFILES:${PN} = " \
     ${sysconfdir}/systemd/network/20-wired.network \
 "
 
-RDEPENDS:${PN} = "openssh-sshd sudo systemd-networkd"
+RDEPENDS:${PN} = "avahi-daemon openssh-sshd sudo systemd-networkd"
