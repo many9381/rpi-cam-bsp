@@ -59,7 +59,7 @@ git switch develop
 git switch -c feature/repository-guardrails
 # Task 1: implement and verify the repository guardrail unit
 git add .gitignore .python-version pyproject.toml uv.lock keys/README.md artifacts/README.md tests
-git commit -m "chore: add Yocto workspace guardrails"
+git commit -m "chore: add uv-managed Yocto workspace guardrails"
 git switch develop
 git merge --no-ff feature/repository-guardrails
 ```
@@ -2441,7 +2441,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib/common.sh"
 
 usage() {
-    printf 'Usage: sudo %s --build-id ID --profile {rpi5-minimal|rpi5-camera} --device /dev/DEVICE --confirm ERASE:/dev/DEVICE:ID\n' "$0"
+    printf 'Usage: sudo UV_BIN=/absolute/path/to/uv %s --build-id ID --profile {rpi5-minimal|rpi5-camera} --device /dev/DEVICE --confirm ERASE:/dev/DEVICE:ID\n' "$0"
 }
 
 build_id=""
@@ -2468,6 +2468,12 @@ rpi5_validate_build_id "$build_id" || rpi5_die "invalid build ID"
     rpi5_die "confirmation must exactly match ERASE:$device:$build_id"
 
 repo_root="$(rpi5_repo_root)"
+cd "$repo_root"
+uv_bin="${UV_BIN:-}"
+[[ "$uv_bin" == /* && -x "$uv_bin" ]] || \
+    rpi5_die "UV_BIN must be an absolute executable path"
+[[ "$("$uv_bin" --version)" == "uv 0.11.31" ]] || \
+    rpi5_die "UV_BIN must be uv 0.11.31"
 profile_root="$repo_root/artifacts/$build_id/$profile"
 flash_root="$repo_root/artifacts/$build_id/flash"
 flash_marker="$flash_root/${profile}-PASS"
@@ -2491,7 +2497,7 @@ bmap="${image%.bz2}.bmap"
 )
 
 helper="$repo_root/scripts/lib/block_device.py"
-image_bytes="$(uv run --locked python "$helper" bmap-size --bmap "$bmap")"
+image_bytes="$("$uv_bin" run --locked python "$helper" bmap-size --bmap "$bmap")"
 temporary="$(mktemp -d /tmp/rpi5-flash.XXXXXX)"
 topology="$temporary/lsblk.json"
 boot_mount="$temporary/boot"
@@ -2517,7 +2523,7 @@ done
 lsblk --json --bytes --paths \
     -o NAME,KNAME,PATH,PKNAME,TYPE,TRAN,SIZE,VENDOR,MODEL,SERIAL,MOUNTPOINTS \
     > "$topology"
-metadata="$(uv run --locked python "$helper" validate --topology "$topology" \
+metadata="$("$uv_bin" run --locked python "$helper" validate --topology "$topology" \
     --target "$device" --image-bytes "$image_bytes" \
     "${protected[@]}" --allow-mounted)"
 fingerprint_before="$(LC_ALL=C lsblk -dn -b -P -o PATH,TYPE,TRAN,SIZE,VENDOR,MODEL,SERIAL "$device")"
@@ -2527,7 +2533,7 @@ fingerprint_before="$(LC_ALL=C lsblk -dn -b -P -o PATH,TYPE,TRAN,SIZE,VENDOR,MOD
     lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,VENDOR,MODEL,SERIAL,MOUNTPOINTS "$device"
 } | tee "$flash_root/${profile}-selected-device.log"
 
-mapfile -t mounted < <(uv run --locked python "$helper" mounts --topology "$topology" --target "$device")
+mapfile -t mounted < <("$uv_bin" run --locked python "$helper" mounts --topology "$topology" --target "$device")
 for mounted_device in "${mounted[@]}"; do
     umount "$mounted_device"
 done
@@ -2537,7 +2543,7 @@ lsblk --json --bytes --paths \
     > "$topology"
 fingerprint_after="$(LC_ALL=C lsblk -dn -b -P -o PATH,TYPE,TRAN,SIZE,VENDOR,MODEL,SERIAL "$device")"
 [[ "$fingerprint_after" == "$fingerprint_before" ]] || rpi5_die "target identity changed before write"
-uv run --locked python "$helper" validate --topology "$topology" \
+"$uv_bin" run --locked python "$helper" validate --topology "$topology" \
     --target "$device" --image-bytes "$image_bytes" "${protected[@]}" >/dev/null
 
 bmaptool copy --bmap "$bmap" "$image" "$device"
@@ -2545,8 +2551,8 @@ sync
 blockdev --rereadpt "$device"
 udevadm settle --timeout=30
 
-boot_partition="$(uv run --locked python "$helper" partition --device "$device" --number 1)"
-root_partition="$(uv run --locked python "$helper" partition --device "$device" --number 2)"
+boot_partition="$("$uv_bin" run --locked python "$helper" partition --device "$device" --number 1)"
+root_partition="$("$uv_bin" run --locked python "$helper" partition --device "$device" --number 2)"
 [[ -b "$boot_partition" && -b "$root_partition" ]] || \
     rpi5_die "expected two partitions after flashing"
 [[ "$(lsblk -n -o FSTYPE "$root_partition")" == "ext4" ]] || \
@@ -2764,6 +2770,7 @@ usage() {
 }
 
 repo_root="$(rpi5_repo_root)"
+cd "$repo_root"
 hostname="rpi5-minimal"
 timeout_seconds="300"
 previous_ip=""
@@ -3648,7 +3655,9 @@ lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS
 read -r -p 'Exact whole USB SSD device (for example /dev/sdb or /dev/nvme1n1): ' TARGET_DEVICE
 lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS "$TARGET_DEVICE"
 read -r -p "Type ERASE:$TARGET_DEVICE:$BUILD_ID: " CONFIRMATION
-sudo ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
+UV_BIN="$(command -v uv)"
+test "$("$UV_BIN" --version)" = "uv 0.11.31"
+sudo UV_BIN="$UV_BIN" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
   --device "$TARGET_DEVICE" --confirm "$CONFIRMATION"
 test -f "artifacts/$BUILD_ID/flash/rpi5-minimal-PASS"
 ```
@@ -4537,7 +4546,9 @@ test -b "$TARGET_DEVICE"
 lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS "$TARGET_DEVICE"
 read -r -p "Type ERASE:$TARGET_DEVICE:$BUILD_ID: " CONFIRMATION
 test "$CONFIRMATION" = "ERASE:$TARGET_DEVICE:$BUILD_ID"
-sudo ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
+UV_BIN="$(command -v uv)"
+test "$("$UV_BIN" --version)" = "uv 0.11.31"
+sudo UV_BIN="$UV_BIN" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-minimal \
   --device "$TARGET_DEVICE" --confirm "$CONFIRMATION"
 test -f "artifacts/$BUILD_ID/flash/rpi5-minimal-PASS"
 ```
@@ -4611,7 +4622,9 @@ test -b "$TARGET_DEVICE"
 lsblk --bytes --paths -o NAME,TYPE,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINTS "$TARGET_DEVICE"
 read -r -p "Type ERASE:$TARGET_DEVICE:$BUILD_ID: " CONFIRMATION
 test "$CONFIRMATION" = "ERASE:$TARGET_DEVICE:$BUILD_ID"
-sudo ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-camera \
+UV_BIN="$(command -v uv)"
+test "$("$UV_BIN" --version)" = "uv 0.11.31"
+sudo UV_BIN="$UV_BIN" ./scripts/flash-ssd.sh --build-id "$BUILD_ID" --profile rpi5-camera \
   --device "$TARGET_DEVICE" --confirm "$CONFIRMATION"
 test -f "artifacts/$BUILD_ID/flash/rpi5-camera-PASS"
 ```

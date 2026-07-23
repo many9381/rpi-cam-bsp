@@ -23,6 +23,7 @@ DIRECT_TOOL = re.compile(
 )
 INDIRECT_KAS_FRAGMENTS = (
     "run_logged kas ",
+    "setsid kas ",
     "rpi5_require_cmd kas",
     'rpi5_require_cmd "kas"',
     "command -v kas",
@@ -86,8 +87,34 @@ class UvDocsContractTest(unittest.TestCase):
         self.assertGreaterEqual(text.count("uv run --locked python"), 25)
         self.assertGreaterEqual(text.count("uv run --locked kas"), 15)
         self.assertIn("run_logged uv run --locked kas", text)
+        self.assertIn("setsid uv run --locked kas shell", text)
         self.assertIn("uv run --locked kas for-all-repos", text)
-        self.assertIn("uv run --locked python \"$helper\" validate", text)
+        self.assertIn(
+            '"$uv_bin" run --locked python "$helper" validate',
+            text,
+        )
+        self.assertNotIn("sudo ./scripts/flash-ssd.sh", text)
+        self.assertIn('UV_BIN="$(command -v uv)"', text)
+        self.assertIn('sudo UV_BIN="$UV_BIN" ./scripts/flash-ssd.sh', text)
+        self.assertIn('uv_bin="${UV_BIN:-}"', text)
+        self.assertIn(
+            '[[ "$("$uv_bin" --version)" == "uv 0.11.31" ]]',
+            text,
+        )
+        self.assertIn(
+            'repo_root="$(rpi5_repo_root)"\ncd "$repo_root"\nuv_bin=',
+            text,
+        )
+        self.assertIn(
+            'repo_root="$(rpi5_repo_root)"\ncd "$repo_root"\nhostname=',
+            text,
+        )
+        self.assertGreaterEqual(
+            text.count(
+                'git commit -m "chore: add uv-managed Yocto workspace guardrails"'
+            ),
+            2,
+        )
 
 
 if __name__ == "__main__":
