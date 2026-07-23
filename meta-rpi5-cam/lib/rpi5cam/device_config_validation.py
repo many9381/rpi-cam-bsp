@@ -12,11 +12,43 @@ _BUILD_ID_PATTERN = re.compile(
     r"^(?P<timestamp>[0-9]{8}T[0-9]{6}Z)-(?P<sha>[0-9a-f]{7,40})$"
 )
 _ECDSA_KEYS = {
-    "ecdsa-sha2-nistp256": ("nistp256", 65),
-    "ecdsa-sha2-nistp384": ("nistp384", 97),
-    "ecdsa-sha2-nistp521": ("nistp521", 133),
+    "ecdsa-sha2-nistp256": "nistp256",
+    "ecdsa-sha2-nistp384": "nistp384",
+    "ecdsa-sha2-nistp521": "nistp521",
 }
 _SUPPORTED_ALGORITHMS = {"ssh-ed25519", "ssh-rsa", *_ECDSA_KEYS}
+_NIST_CURVES = {
+    "nistp256": (
+        32,
+        (1 << 256) - (1 << 224) + (1 << 192) + (1 << 96) - 1,
+        int(
+            "5ac635d8aa3a93e7b3ebbd55769886bc"
+            "651d06b0cc53b0f63bce3c3e27d2604b",
+            16,
+        ),
+    ),
+    "nistp384": (
+        48,
+        (1 << 384) - (1 << 128) - (1 << 96) + (1 << 32) - 1,
+        int(
+            "b3312fa7e23ee7e4988e056be3f82d19"
+            "181d9c6efe8141120314088f5013875a"
+            "c656398d8a2ed19d2a85c8edd3ec2aef",
+            16,
+        ),
+    ),
+    "nistp521": (
+        66,
+        (1 << 521) - 1,
+        int(
+            "0051953eb9618e1c9a1f929a21a0b68540ee"
+            "a2da725b99b315f3b8b489918ef109e156193951"
+            "ec7e937b1652c0bd3bb1bf073573df883d2c34f1"
+            "ef451fd46b503f00",
+            16,
+        ),
+    ),
+}
 
 
 def _read_ssh_string(
@@ -70,7 +102,9 @@ def _validate_rsa(blob: bytes, offset: int) -> None:
 
 
 def _validate_ecdsa(algorithm: str, blob: bytes, offset: int) -> None:
-    expected_curve, expected_point_length = _ECDSA_KEYS[algorithm]
+    expected_curve = _ECDSA_KEYS[algorithm]
+    coordinate_size, prime, curve_b = _NIST_CURVES[expected_curve]
+    expected_point_length = 1 + 2 * coordinate_size
     curve_bytes, offset = _read_ssh_string(blob, offset, "curve")
     point, offset = _read_ssh_string(blob, offset, "public point")
     try:
@@ -81,6 +115,17 @@ def _validate_ecdsa(algorithm: str, blob: bytes, offset: int) -> None:
         raise ValueError("OpenSSH ECDSA curve does not match algorithm")
     if len(point) != expected_point_length or point[:1] != b"\x04":
         raise ValueError("OpenSSH ECDSA public point is malformed")
+
+    x = int.from_bytes(point[1 : 1 + coordinate_size], "big")
+    y = int.from_bytes(point[1 + coordinate_size :], "big")
+    if not (0 <= x < prime and 0 <= y < prime):
+        raise ValueError("OpenSSH ECDSA coordinates are outside curve field")
+    if pow(y, 2, prime) != (
+        pow(x, 3, prime) - 3 * x + curve_b
+    ) % prime:
+        raise ValueError(
+            "OpenSSH ECDSA public point is not on the named curve"
+        )
     _require_blob_end(blob, offset)
 
 

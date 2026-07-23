@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 from pathlib import Path
 import shutil
@@ -56,6 +57,52 @@ class DeviceConfigValidationTest(unittest.TestCase):
                 encoding="utf-8"
             ).rstrip("\n")
 
+    def generate_ecdsa_public_key(self, bits: int) -> str:
+        ssh_keygen = shutil.which("ssh-keygen")
+        self.assertIsNotNone(ssh_keygen, "host ssh-keygen is required")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            key_path = Path(temporary_directory) / f"id_ecdsa_{bits}"
+            result = subprocess.run(
+                [
+                    ssh_keygen,
+                    "-q",
+                    "-t",
+                    "ecdsa",
+                    "-b",
+                    str(bits),
+                    "-N",
+                    "",
+                    "-C",
+                    "validation-test",
+                    "-f",
+                    str(key_path),
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return key_path.with_suffix(".pub").read_text(
+                encoding="utf-8"
+            ).rstrip("\n")
+
+    def replace_ecdsa_point_with_zeroes(self, public_key: str) -> str:
+        algorithm, encoded_blob, comment = public_key.split(" ", maxsplit=2)
+        blob = bytearray(base64.b64decode(encoded_blob, validate=True))
+        offset = 0
+        for _field in ("algorithm", "curve"):
+            field_length = int.from_bytes(blob[offset : offset + 4], "big")
+            offset += 4 + field_length
+        point_length = int.from_bytes(blob[offset : offset + 4], "big")
+        point_start = offset + 4
+        blob[point_start : point_start + point_length] = (
+            b"\x04" + bytes(point_length - 1)
+        )
+        return (
+            f"{algorithm} {base64.b64encode(blob).decode('ascii')} {comment}"
+        )
+
     def test_accepts_real_openssh_public_key(self) -> None:
         validation = load_validation_module()
 
@@ -95,6 +142,27 @@ class DeviceConfigValidationTest(unittest.TestCase):
             validation.validate_ssh_public_key(
                 f"ssh-rsa {blob} {comment}"
             )
+
+    def test_accepts_real_supported_ecdsa_points(self) -> None:
+        validation = load_validation_module()
+
+        for bits in (256, 384, 521):
+            with self.subTest(bits=bits):
+                validation.validate_ssh_public_key(
+                    self.generate_ecdsa_public_key(bits)
+                )
+
+    def test_rejects_correctly_sized_off_curve_ecdsa_points(self) -> None:
+        validation = load_validation_module()
+
+        for bits in (256, 384, 521):
+            with self.subTest(bits=bits):
+                public_key = self.generate_ecdsa_public_key(bits)
+                off_curve_key = self.replace_ecdsa_point_with_zeroes(
+                    public_key
+                )
+                with self.assertRaisesRegex(ValueError, "curve"):
+                    validation.validate_ssh_public_key(off_curve_key)
 
     def test_accepts_real_utc_timestamp_and_lowercase_sha(self) -> None:
         validation = load_validation_module()

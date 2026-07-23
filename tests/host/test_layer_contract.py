@@ -37,10 +37,22 @@ class LayerContractTest(unittest.TestCase):
         install = recipe.split("do_install() {", maxsplit=1)[1].split(
             "\n}", maxsplit=1
         )[0]
-        self.assertNotIn("${RPI5_ADMIN_SSH_PUBKEY}", install)
-        self.assertNotIn("${RPI5_BUILD_ID}", install)
-        self.assertIn('"$RPI5_ADMIN_SSH_PUBKEY"', install)
-        self.assertIn('"$RPI5_BUILD_ID"', install)
+        self.assertNotRegex(
+            recipe,
+            r"\$\{RPI5_(?:ADMIN_SSH_PUBKEY|BUILD_ID)\}",
+        )
+        without_safe_references = recipe
+        for variable in ("RPI5_ADMIN_SSH_PUBKEY", "RPI5_BUILD_ID"):
+            safe_reference = f'"${variable}"'
+            self.assertIn(safe_reference, install)
+            without_safe_references = without_safe_references.replace(
+                safe_reference,
+                "",
+            )
+        self.assertNotRegex(
+            without_safe_references,
+            r"\$(?:\{)?RPI5_(?:ADMIN_SSH_PUBKEY|BUILD_ID)",
+        )
 
     def test_recipe_uses_restrictive_install_modes(self) -> None:
         recipe = read(
