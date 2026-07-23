@@ -55,6 +55,17 @@ class HostToolsTest(unittest.TestCase):
         )
         self.assertLess(override_check, first_uv_command)
 
+    def test_preflight_requires_uv_interpreter_to_use_system_python(self) -> None:
+        script = read("scripts/host-preflight.sh")
+        check_start = script.index("uv run --locked python -c")
+        check_end = script.index("python_version=", check_start)
+        interpreter_check = script[check_start:check_end]
+        self.assertIn("sys._base_executable", interpreter_check)
+        self.assertIn(
+            'pathlib.Path("/usr/bin/python3.12").resolve()',
+            interpreter_check,
+        )
+
     def test_scripts_are_valid_bash(self) -> None:
         for path in (
             "scripts/lib/common.sh",

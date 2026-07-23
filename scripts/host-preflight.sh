@@ -78,8 +78,8 @@ test ! -L .venv || rpi5_die ".venv must not be a symlink"
 test "$(realpath .venv)" = "$(pwd -P)/.venv" || \
     rpi5_die ".venv must be physically checkout-local"
 uv run --locked python -c \
-    'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)' ||
-    rpi5_die "uv must run physical checkout-local Python 3.12"
+    'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; system = pathlib.Path("/usr/bin/python3.12").resolve(); assert pathlib.Path(sys.prefix).resolve() == expected; assert pathlib.Path(sys._base_executable).resolve() == system; assert sys.version_info[:2] == (3, 12)' ||
+    rpi5_die "uv must run physical checkout-local system Python 3.12"
 python_version="$(uv run --locked python -c 'import platform; print(platform.python_version())')"
 version_ge "$python_version" "3.12" || rpi5_die "Python must be at least 3.12"
 version_ge "3.12.999" "$python_version" || rpi5_die "Python must be below 3.13"
