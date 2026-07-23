@@ -1,0 +1,13 @@
+header:
+  version: 19
+  includes:
+    - kas/base.yml
+    - kas/lock.yml
+
+machine: qemuarm64
+target: rpi5-minimal-image
+
+local_conf_header:
+  qemu: |
+    IMAGE_FSTYPES = "ext4"
+    QB_SLIRP_OPT = "-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22"

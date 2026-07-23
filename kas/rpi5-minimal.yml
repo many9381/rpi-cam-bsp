@@ -1,0 +1,21 @@
+header:
+  version: 19
+  includes:
+    - kas/base.yml
+    - kas/lock.yml
+
+machine: raspberrypi5
+target: rpi5-minimal-image
+
+repos:
+  meta-raspberrypi:
+    layers:
+      .:
+
+local_conf_header:
+  rpi5-minimal: |
+    IMAGE_FSTYPES = "wic.bz2 wic.bmap"
+    WKS_FILE = "sdimage-raspberrypi.wks"
+    BOOT_MEDIA = "usb"
+    CMDLINE_ROOT_PARTITION = "/dev/sda2"
+    hostname:pn-base-files = "rpi5-minimal"
