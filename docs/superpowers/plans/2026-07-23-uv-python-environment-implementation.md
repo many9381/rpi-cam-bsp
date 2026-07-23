@@ -41,7 +41,7 @@
 | `requirements-build.txt` | Delete | Remove the superseded second dependency source. |
 | `tests/host/test_repository_contract.py` | Modify | Require the three uv project files and forbid the legacy requirements file. |
 | `tests/host/test_uv_environment_contract.py` | Create | Parse and validate `pyproject.toml`, `uv.lock`, `.python-version`, and the local-environment policy offline. |
-| `tests/host/test_uv_docs_contract.py` | Create | Reject legacy activation, pip setup, and direct Python/kas execution in canonical build documentation. |
+| `tests/host/test_uv_docs_contract.py` | Create | Reject legacy/direct and wrapped commands; enforce authenticated archive ordering and fail-closed negative coverage, physical-environment gate ordering, finalized helper/QEMU/deletion flow, and exact embedded environment-contract fidelity. |
 | `docs/superpowers/specs/2026-07-22-rpi5-yocto-build-validation-design.md` | Modify | Express host setup, checkout, parse, build, and QEMU commands using locked uv execution. |
 | `docs/superpowers/specs/2026-07-23-uv-python-environment-design.md` | Modify | Define physical environment locality and the authenticated privileged archive trust boundary. |
 | `docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md` | Modify | Make every planned host script, runbook, CI flow, test command, and kas invocation conform to the uv contract. |
@@ -531,9 +531,15 @@ Expected: both commands report `uv.lock` as the only missing project-contract fi
 Run:
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 /home/many/.local/bin/uv lock
 /home/many/.local/bin/uv lock --check
 /home/many/.local/bin/uv sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+/home/many/.local/bin/uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ```
 
 Expected:
@@ -737,9 +743,15 @@ worktree 루트에 독립적인 `.venv`를 만든다.
 기본 명령 흐름은 다음과 같다.
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv --version
 uv lock --check
 uv sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ./scripts/host-preflight.sh
 ```
 
@@ -1115,9 +1127,15 @@ artifacts/releases/*
 Run:
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv lock
 uv lock --check
 uv sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ```
 
 Expected: uv resolves `kas==5.4`, writes `uv.lock`, and creates `.venv`
@@ -1553,8 +1571,14 @@ QEMU 런타임 합격 판정은 localhost SLIRP SSH를 사용하는
 Run:
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv lock --check
 uv sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 uv run --locked python -m unittest discover -s tests/host -p 'test_repository_contract.py' -v
 uv run --locked python -m unittest discover -s tests/host -p 'test_uv_environment_contract.py' -v
 uv run --locked kas --version
@@ -1712,52 +1736,77 @@ any block-device query or operation:
 
 ```bash
 readonly UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+authenticated_uv_bin=""
 
 authenticate_uv_archive() {
     local uv_archive="$1"
     local uv_private_dir="$2"
     local uv_archive_copy="$uv_private_dir/uv-release.tar.gz"
     local uv_extract_dir="$uv_private_dir/extract"
-    local uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"
+    local candidate_uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"
 
-    [[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] ||
-        rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
-    install -m 0600 -- "$uv_archive" "$uv_archive_copy"
-    [[ -f "$uv_archive_copy" && ! -L "$uv_archive_copy" ]] ||
-        rpi5_die "private uv archive copy is not a regular file"
-    [[ "$(stat -c %u "$uv_archive_copy")" == "$EUID" ]] ||
-        rpi5_die "private uv archive copy ownership is invalid"
-    if ! (
-        cd "$uv_private_dir"
-        printf '%s  %s\n' "$UV_RELEASE_SHA256" "uv-release.tar.gz" |
-            sha256sum --check --strict --status
-    ); then
-        rpi5_die "authenticated uv archive checksum mismatch"
+    authenticated_uv_bin=""
+    if [[ "$uv_archive" != /* || ! -f "$uv_archive" || -L "$uv_archive" ]]; then
+        rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path" || true
+        return 1
     fi
-    install -d -m 0700 "$uv_extract_dir"
-    tar --extract --file "$uv_archive_copy" --directory "$uv_extract_dir" \
-        --gzip --no-same-owner --no-same-permissions
-    [[ -f "$uv_bin" && ! -L "$uv_bin" ]] ||
-        rpi5_die "authenticated archive is missing the expected uv executable"
-    chmod 0700 "$uv_bin"
-    [[ "$(stat -c %u "$uv_bin")" == "$EUID" &&
-       "$(stat -c %a "$uv_bin")" == "700" ]] ||
-        rpi5_die "authenticated uv executable ownership or mode is invalid"
-    printf '%s\n' "$uv_bin"
+    if ! install -m 0600 -- "$uv_archive" "$uv_archive_copy"; then
+        rpi5_die "failed to copy uv archive into private storage" || true
+        return 1
+    fi
+    if [[ ! -f "$uv_archive_copy" || -L "$uv_archive_copy" ]]; then
+        rpi5_die "private uv archive copy is not a regular file" || true
+        return 1
+    fi
+    if [[ "$(stat -c %u "$uv_archive_copy")" != "$EUID" ]]; then
+        rpi5_die "private uv archive copy ownership is invalid" || true
+        return 1
+    fi
+    if ! printf '%s  %s\n' "$UV_RELEASE_SHA256" "$uv_archive_copy" |
+        sha256sum --check --strict --status; then
+        rpi5_die "authenticated uv archive checksum mismatch" || true
+        return 1
+    fi
+
+    if ! install -d -m 0700 "$uv_extract_dir"; then
+        rpi5_die "failed to create private uv extraction directory" || true
+        return 1
+    fi
+    if ! tar --extract --file "$uv_archive_copy" --directory "$uv_extract_dir" \
+        --gzip --no-same-owner --no-same-permissions; then
+        rpi5_die "failed to extract authenticated uv archive" || true
+        return 1
+    fi
+    if [[ ! -f "$candidate_uv_bin" || -L "$candidate_uv_bin" ]]; then
+        rpi5_die "authenticated archive is missing the expected uv executable" || true
+        return 1
+    fi
+    if ! chmod 0700 "$candidate_uv_bin"; then
+        rpi5_die "failed to restrict authenticated uv executable mode" || true
+        return 1
+    fi
+    if [[ "$(stat -c %u "$candidate_uv_bin")" != "$EUID" ||
+          "$(stat -c %a "$candidate_uv_bin")" != "700" ]]; then
+        rpi5_die "authenticated uv executable ownership or mode is invalid" || true
+        return 1
+    fi
+    authenticated_uv_bin="$candidate_uv_bin"
 }
 
 [[ "$EUID" -eq 0 ]] || rpi5_die "flash requires root for the selected device only"
+[[ -z "${UV_PROJECT_ENVIRONMENT:-}" ]] ||
+    rpi5_die "UV_PROJECT_ENVIRONMENT must be unset for privileged flashing"
 repo_root="$(rpi5_repo_root)"
 cd "$repo_root"
+[[ -d .venv && ! -L .venv ]] ||
+    rpi5_die "privileged uv requires a physical checkout-local .venv"
+[[ "$(realpath .venv)" == "$repo_root/.venv" ]] ||
+    rpi5_die "privileged uv environment resolves outside the checkout"
 uv_archive="${UV_ARCHIVE:-}"
 [[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] ||
     rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
 umask 077
-uv_private_dir="$(mktemp -d /var/tmp/rpi5-flash-uv.XXXXXXXX)"
-chown root:root "$uv_private_dir"
-chmod 0700 "$uv_private_dir"
-[[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]]
-[[ "$(stat -c %u "$uv_private_dir")" == "0" ]]
+uv_private_dir=""
 cleanup_uv() {
     if [[ "${uv_private_dir:-}" =~ ^/var/tmp/rpi5-flash-uv\.[A-Za-z0-9]{8}$ ]] &&
        [[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]] &&
@@ -1766,10 +1815,18 @@ cleanup_uv() {
     fi
     uv_private_dir=""
 }
+uv_private_dir="$(mktemp -d /var/tmp/rpi5-flash-uv.XXXXXXXX)"
 trap cleanup_uv EXIT
-uv_bin="$(authenticate_uv_archive "$uv_archive" "$uv_private_dir")"
+chown root:root "$uv_private_dir"
+chmod 0700 "$uv_private_dir"
+[[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]]
+[[ "$(stat -c %u "$uv_private_dir")" == "0" ]]
+authenticate_uv_archive "$uv_archive" "$uv_private_dir" || exit 1
+uv_bin="$authenticated_uv_bin"
 [[ "$("$uv_bin" --version | awk '{print $2}')" == "0.11.31" ]] ||
     rpi5_die "authenticated uv executable must be version 0.11.31"
+"$uv_bin" run --locked python -c \
+    'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ```
 
 Use that single authenticated private executable for the finalized complete
@@ -1795,25 +1852,45 @@ The flash cleanup function must invoke `cleanup_uv`; the root script must
 contain no download command, `sudo -E`, or network access.
 
 Add the future executable negative test `test_spoofed_uv_executable_is_rejected`.
-Its actual executable fixture must print `uv 0.11.31` and write a marker if
-executed:
+It must put a real executable that prints `uv 0.11.31` and writes a marker
+inside a wrong-hash archive at the expected release path, then exercise the
+exact fail-closed production authentication sequence:
 
 ```python
+archive_root = root / "archive-root"
+payload = archive_root / "uv-x86_64-unknown-linux-gnu"
+payload.mkdir(parents=True)
+spoof = payload / "uv"
+archive = root / "spoof.tar.gz"
 marker = root / "SPOOF_EXECUTED"
+private = root / "private"
+private.mkdir(mode=0o700)
 spoof.write_text(
     "#!/usr/bin/env bash\n"
     ': > "${SPOOF_MARKER:?}"\n'
     "printf 'uv 0.11.31\\n'\n",
     encoding="utf-8",
 )
+spoof.chmod(0o755)
+tar_result = run(
+    "tar", "--create", "--gzip",
+    "--file", os.fspath(archive),
+    "--directory", os.fspath(archive_root),
+    "uv-x86_64-unknown-linux-gnu",
+)
+self.assertEqual(tar_result.returncode, 0, tar_result.stderr)
 result = run(
     "bash", "-c",
-    'source "$1"\nauthenticate_uv_archive "$2" "$3"\n',
+    'source "$1"\n'
+    'authenticate_uv_archive "$2" "$3" || exit 1\n'
+    'uv_bin="$authenticated_uv_bin"\n'
+    '"$uv_bin" --version\n',
     "bash", str(REPO_ROOT / "scripts/flash-ssd.sh"),
-    str(spoof), str(private),
+    str(archive), str(private),
     env={"SPOOF_MARKER": os.fspath(marker)},
 )
 self.assertNotEqual(result.returncode, 0)
+self.assertIn("authenticated uv archive checksum mismatch", result.stderr)
 self.assertFalse(marker.exists(), "spoofed executable was run")
 ```
 
@@ -1869,9 +1946,9 @@ if ! command -v uv >/dev/null 2>&1 ||
         env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/home/many/.local/bin sh
     export PATH="/home/many/.local/bin:$PATH"
 fi
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv lock --check
 uv sync --locked
-test -z "${UV_PROJECT_ENVIRONMENT:-}"
 test -d .venv
 test ! -L .venv
 test "$(realpath .venv)" = "$(pwd -P)/.venv"
@@ -1951,9 +2028,9 @@ ensure_uv() {
     [[ "$(uv --version | awk '{print $2}')" == "0.11.31" ]] ||
         rpi5_die "uv must be version 0.11.31"
     cd "$repo_root"
+    test -z "${UV_PROJECT_ENVIRONMENT:-}"
     uv lock --check
     uv sync --locked
-    test -z "${UV_PROJECT_ENVIRONMENT:-}"
     test -d .venv
     test ! -L .venv
     test "$(realpath .venv)" = "$(pwd -P)/.venv"
@@ -2022,6 +2099,39 @@ Keep the OCI digest, official kas-container wrapper checksum, and kas source
 commit unchanged. The container still supplies the Yocto host toolchain;
 the uv project supplies the exact Python/kas command environment.
 
+**Final consolidated documentation contract**
+
+Before the final verification step, extend the staged
+`tests/host/test_uv_docs_contract.py` into the six-test final contract. Keep
+the earlier build-design and firmware-plan coverage, and add these named
+helpers and final-plan test:
+
+- `assert_authenticated_privileged_uv_flow` must require the exact archive
+  URL/SHA/release, a private copied archive, explicit failure returns for
+  copy/hash/extract/mode errors, no authenticator command substitution, early
+  cleanup arming, the wrong-hash tar fixture containing the spoof executable,
+  and no marker execution.
+- `assert_secure_flash_script_order` must prove archive copy, copied-byte
+  checksum, safe extraction, validated-path publication, version/locality
+  gate, and locked execution all precede the first block-device operation.
+- `assert_override_rejected_before_sync` must inspect every embedded bash
+  block containing `sync --locked` and prove
+  `UV_PROJECT_ENVIRONMENT` is rejected before its first lock/sync/run.
+- `assert_physical_venv_gates` must enforce the non-symlink directory,
+  physical realpath, `sys.prefix`, and Python 3.12 checks at every future
+  feature/integration/image/CI gate and in privileged flashing.
+- `assert_exact_embedded_environment_contracts` must compare the firmware
+  plan's one and this plan's two environment-test blocks byte-for-byte with
+  the live final environment contract.
+- `test_uv_migration_plan_matches_final_secure_flow` must enforce the complete
+  helper set, `validate --target`, repository anchors, QEMU `setsid` contract,
+  exact safe-deletion guards, wrapper fixtures, and the final contract
+  requirements above.
+
+The two earlier embedded documentation-test blocks remain intentionally
+stage-specific TDD snapshots; this final upgrade supersedes them rather than
+rewriting their historical RED expectations.
+
 - [ ] **Step 9: Run the documentation contract and inspect every remaining direct command**
 
 Run:
@@ -2029,7 +2139,7 @@ Run:
 ```bash
 /home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_uv_docs_contract.py' -v
 /home/many/.local/bin/uv run --locked python -m unittest discover -s tests/host -p 'test_*.py' -v
-rg -n 'python3 -m venv|\.venv/bin/activate|pip install|uv pip install' docs/superpowers/specs/2026-07-22-rpi5-yocto-build-validation-design.md docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md
+rg -n 'python3 -m venv|\.[v]env/bin/activate|pip install|uv pip install' docs/superpowers/specs/2026-07-22-rpi5-yocto-build-validation-design.md docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md
 rg -n 'Create: `requirements-build\.txt`|# requirements-build\.txt|git add .*requirements-build\.txt' docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md
 rg -n 'U[V]_BIN' docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md docs/superpowers/plans/2026-07-23-uv-python-environment-implementation.md
 rg -n -U 'validate --topology "\$topology" \\\n[[:space:]]+--device' docs/superpowers/plans/2026-07-22-rpi5-yocto-firmware-implementation.md docs/superpowers/plans/2026-07-23-uv-python-environment-implementation.md
@@ -2038,7 +2148,7 @@ git diff --check
 
 Expected:
 
-- both documentation tests pass;
+- all six focused documentation-contract tests pass;
 - the complete host suite passes;
 - all four `rg` commands exit `1` with no matches;
 - the documentation contract allows direct system `python3` only in the six

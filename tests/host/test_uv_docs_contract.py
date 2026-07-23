@@ -1,7 +1,11 @@
+import os
+from pathlib import Path
 import re
+import tarfile
+import tempfile
 import unittest
 
-from support import read
+from support import read, run
 
 
 DESIGN_DOCUMENT = (
@@ -97,6 +101,108 @@ def embedded_shell(markdown: str, marker: str) -> str:
 
 
 class UvDocsContractTest(unittest.TestCase):
+    def assert_embedded_auth_rejects_wrong_hash_spoof(
+        self,
+        text: str,
+    ) -> None:
+        script = embedded_shell(text, "# scripts/flash-ssd.sh\n")
+        auth_source = script.partition(
+            'readonly UV_RELEASE_SHA256="'
+        )[2]
+        self.assertTrue(auth_source)
+        auth_source = (
+            'readonly UV_RELEASE_SHA256="'
+            + auth_source.partition(
+                '\n\nif [[ "${BASH_SOURCE[0]}" != "$0" ]]'
+            )[0]
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="uv-auth-contract-",
+        ) as temporary:
+            root = Path(temporary)
+            archive_root = root / "archive-root"
+            payload = archive_root / "uv-x86_64-unknown-linux-gnu"
+            payload.mkdir(parents=True)
+            spoof = payload / "uv"
+            marker = root / "SPOOF_EXECUTED"
+            private = root / "private"
+            archive = root / "spoof.tar.gz"
+            private.mkdir(mode=0o700)
+            spoof.write_text(
+                "#!/usr/bin/env bash\n"
+                ': > "${SPOOF_MARKER:?}"\n'
+                "printf 'uv 0.11.31\\n'\n",
+                encoding="utf-8",
+            )
+            spoof.chmod(0o755)
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(
+                    payload,
+                    arcname="uv-x86_64-unknown-linux-gnu",
+                )
+            command = (
+                "set -euo pipefail\n"
+                "rpi5_die() {\n"
+                "    printf 'ERROR: %s\\n' \"$*\" >&2\n"
+                "    return 1\n"
+                "}\n"
+                f"{auth_source}\n"
+                'authenticate_uv_archive "$1" "$2" || exit 1\n'
+                'uv_bin="$authenticated_uv_bin"\n'
+                '"$uv_bin" --version\n'
+            )
+            result = run(
+                "bash",
+                "-c",
+                command,
+                "bash",
+                os.fspath(archive),
+                os.fspath(private),
+                env={"SPOOF_MARKER": os.fspath(marker)},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "authenticated uv archive checksum mismatch",
+                result.stderr,
+            )
+            self.assertFalse(
+                marker.exists(),
+                "wrong-hash spoofed executable was run",
+            )
+
+    def assert_override_rejected_before_sync(self, text: str) -> None:
+        sync_blocks = [
+            block
+            for block in re.findall(r"```bash\n(.*?)\n```", text, re.S)
+            if "sync --locked" in block
+        ]
+        self.assertTrue(sync_blocks)
+        for block in sync_blocks:
+            with self.subTest(first_line=block.splitlines()[0]):
+                check = 'test -z "${UV_PROJECT_ENVIRONMENT:-}"'
+                self.assertIn(check, block)
+                first_environment_use = min(
+                    block.index(fragment)
+                    for fragment in (
+                        "uv lock",
+                        '"$UV" lock',
+                        "uv sync",
+                        '"$UV" sync',
+                        "uv run",
+                        '"$UV" run',
+                    )
+                    if fragment in block
+                )
+                self.assertLess(block.index(check), first_environment_use)
+                for physical_gate in (
+                    "test -d .venv",
+                    "test ! -L .venv",
+                    'test "$(realpath .venv)" = "$(pwd -P)/.venv"',
+                    "assert pathlib.Path(sys.prefix).resolve() == expected",
+                    "assert sys.version_info[:2] == (3, 12)",
+                ):
+                    self.assertIn(physical_gate, block)
+
     def assert_exact_embedded_environment_contracts(
         self,
         text: str,
@@ -125,24 +231,35 @@ class UvDocsContractTest(unittest.TestCase):
             '[[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]]',
             '[[ "$(stat -c %u "$uv_private_dir")" == "0" ]]',
             'install -m 0600 -- "$uv_archive" "$uv_archive_copy"',
-            '[[ -f "$uv_archive_copy" && ! -L "$uv_archive_copy" ]]',
-            '[[ "$(stat -c %u "$uv_archive_copy")" == "$EUID" ]]',
+            '[[ ! -f "$uv_archive_copy" || -L "$uv_archive_copy" ]]',
+            '[[ "$(stat -c %u "$uv_archive_copy")" != "$EUID" ]]',
             "sha256sum --check --strict",
             "--gzip",
             "--no-same-owner",
             "--no-same-permissions",
-            'uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"',
-            '[[ -f "$uv_bin" && ! -L "$uv_bin" ]]',
-            'chmod 0700 "$uv_bin"',
-            '[[ "$(stat -c %u "$uv_bin")" == "$EUID"',
+            'candidate_uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"',
+            '[[ ! -f "$candidate_uv_bin" || -L "$candidate_uv_bin" ]]',
+            'if ! chmod 0700 "$candidate_uv_bin"',
+            '[[ "$(stat -c %u "$candidate_uv_bin")" != "$EUID"',
+            'authenticated_uv_bin="$candidate_uv_bin"',
+            'authenticate_uv_archive "$uv_archive" "$uv_private_dir"',
+            'uv_bin="$authenticated_uv_bin"',
             'find "$uv_private_dir" -xdev -depth -delete',
             'sudo UV_ARCHIVE="$UV_ARCHIVE" ./scripts/flash-ssd.sh',
             "test_spoofed_uv_executable_is_rejected",
             "SPOOF_EXECUTED",
             "printf 'uv 0.11.31",
+            "spoof.chmod(0o755)",
+            '"tar", "--create", "--gzip"',
+            'authenticated_uv_bin=""',
+            '[[ -d .venv && ! -L .venv ]]',
+            '[[ "$(realpath .venv)" == "$repo_root/.venv" ]]',
+            'uv_private_dir="$(mktemp -d /var/tmp/rpi5-flash-uv.XXXXXXXX)"\n'
+            "trap cleanup_uv EXIT",
             'self.assertFalse(marker.exists(), "spoofed executable was run")',
         ):
             self.assertIn(fragment, text)
+        self.assertNotIn('uv_bin="$(authenticate_uv_archive', text)
 
     def assert_physical_venv_gates(self, text: str) -> None:
         for fragment in (
@@ -194,6 +311,12 @@ class UvDocsContractTest(unittest.TestCase):
             if DIRECT_TOOL.search(line)
         ]
         self.assertEqual(offenders, [], relative)
+        venv_bin_offenders = [
+            f"{line_number}: {line}"
+            for line_number, line in shell_lines(text)
+            if ".venv/bin/" in line
+        ]
+        self.assertEqual(venv_bin_offenders, [], relative)
         return text
 
     def assert_secure_flash_script_order(self, text: str) -> None:
@@ -204,6 +327,8 @@ class UvDocsContractTest(unittest.TestCase):
             'install -m 0600 -- "$uv_archive" "$uv_archive_copy"',
             "sha256sum --check --strict",
             "tar --extract",
+            'authenticated_uv_bin="$candidate_uv_bin"',
+            'uv_bin="$authenticated_uv_bin"',
             '"$uv_bin" --version',
             '"$uv_bin" run --locked',
         )
@@ -212,6 +337,46 @@ class UvDocsContractTest(unittest.TestCase):
         first_block_operation = min(
             script.index(fragment)
             for fragment in ("findmnt ", "lsblk ", "bmaptool ")
+        )
+        override_check = '[[ -z "${UV_PROJECT_ENVIRONMENT:-}" ]]'
+        authentication_call = (
+            'authenticate_uv_archive "$uv_archive" "$uv_private_dir" || exit 1\n'
+            'uv_bin="$authenticated_uv_bin"'
+        )
+        self.assertIn(override_check, script)
+        self.assertIn(authentication_call, script)
+        authentication_body = script.partition(
+            "authenticate_uv_archive() {"
+        )[2].partition("\n}\n")[0]
+        self.assertGreaterEqual(authentication_body.count("return 1"), 8)
+        for guarded_operation in (
+            "if ! install -m 0600",
+            "if ! install -d -m 0700",
+            "if ! tar --extract",
+            "if ! chmod 0700",
+        ):
+            self.assertIn(guarded_operation, authentication_body)
+        self.assertLess(
+            script.index("trap cleanup_uv EXIT"),
+            script.index('chown root:root "$uv_private_dir"'),
+        )
+        self.assertLess(
+            script.index(override_check),
+            script.index(authentication_call),
+        )
+        for locality_check in (
+            '[[ -d .venv && ! -L .venv ]]',
+            '[[ "$(realpath .venv)" == "$repo_root/.venv" ]]',
+        ):
+            self.assertLess(
+                script.index(locality_check),
+                script.index(authentication_call),
+            )
+        prefix_gate = '"$uv_bin" run --locked python -c'
+        self.assertIn(prefix_gate, script)
+        self.assertLess(
+            script.index(prefix_gate),
+            first_block_operation,
         )
         self.assertLess(script.index('"$uv_bin" --version'), first_block_operation)
 
@@ -229,6 +394,7 @@ class UvDocsContractTest(unittest.TestCase):
 
     def test_build_design_uses_locked_uv_commands(self) -> None:
         text = self.assert_locked_uv_document(DESIGN_DOCUMENT)
+        self.assert_override_rejected_before_sync(text)
         self.assertNotIn("requirements-build.txt", text)
         self.assertIn("uv lock --check", text)
         self.assertIn("uv sync --locked", text)
@@ -254,6 +420,10 @@ class UvDocsContractTest(unittest.TestCase):
         self.assertGreaterEqual(text.count("uv run --locked kas"), 15)
         self.assertIn("run_logged uv run --locked kas", text)
         self.assertIn("setsid uv run --locked kas shell", text)
+        self.assertIn(
+            'self.assertIn("setsid uv run --locked kas shell", script)',
+            text,
+        )
         self.assertIn("uv run --locked kas for-all-repos", text)
         self.assertIn(
             '"$uv_bin" run --locked python "$helper" validate',
@@ -262,11 +432,15 @@ class UvDocsContractTest(unittest.TestCase):
         self.assertNotIn("sudo ./scripts/flash-ssd.sh", text)
         self.assert_authenticated_privileged_uv_flow(text)
         self.assert_secure_flash_script_order(text)
+        self.assert_embedded_auth_rejects_wrong_hash_spoof(text)
+        self.assert_override_rejected_before_sync(text)
         self.assert_physical_venv_gates(text)
         self.assert_strengthened_environment_plan(text)
         self.assert_exact_embedded_environment_contracts(text, 1)
         self.assertIn(
-            'repo_root="$(rpi5_repo_root)"\ncd "$repo_root"\nuv_archive=',
+            'repo_root="$(rpi5_repo_root)"\n'
+            'cd "$repo_root"\n'
+            '[[ -d .venv && ! -L .venv ]]',
             text,
         )
         self.assertIn(
@@ -291,7 +465,16 @@ class UvDocsContractTest(unittest.TestCase):
             direct_tools,
             list(UV_PLAN_BOOTSTRAP_DIRECT_TOOL_FIXTURES),
         )
+        self.assertEqual(
+            [
+                f"{line_number}: {line}"
+                for line_number, line in shell_lines(text)
+                if ".venv/bin/" in line
+            ],
+            [],
+        )
         self.assert_authenticated_privileged_uv_flow(text)
+        self.assert_override_rejected_before_sync(text)
         self.assert_physical_venv_gates(text)
         self.assertNotIn(
             'validate --topology "$topology" \\\n    --device "$target_device"',
@@ -312,6 +495,17 @@ class UvDocsContractTest(unittest.TestCase):
         )
         self.assert_strengthened_environment_plan(text, expected_copies=2)
         self.assert_exact_embedded_environment_contracts(text, 2)
+        for final_contract in (
+            "Final consolidated documentation contract",
+            "assert_authenticated_privileged_uv_flow",
+            "assert_secure_flash_script_order",
+            "assert_override_rejected_before_sync",
+            "assert_physical_venv_gates",
+            "assert_exact_embedded_environment_contracts",
+            "test_uv_migration_plan_matches_final_secure_flow",
+            "six focused documentation-contract tests",
+        ):
+            self.assertIn(final_contract, text)
         self.assertGreaterEqual(
             text.count('repo_root="$(rpi5_repo_root)"\ncd "$repo_root"'),
             4,
@@ -336,6 +530,7 @@ class UvDocsContractTest(unittest.TestCase):
 
     def test_uv_design_defines_authenticated_archive_trust_boundary(self) -> None:
         text = read(UV_DESIGN)
+        self.assert_override_rejected_before_sync(text)
         for fragment in (
             UV_RELEASE_URL,
             UV_RELEASE_SHA256,
@@ -344,6 +539,9 @@ class UvDocsContractTest(unittest.TestCase):
             "root-owned",
             "spoofed executable",
             "UV_PROJECT_ENVIRONMENT",
+            "command substitution",
+            "validated executable",
+            "sys.prefix",
         ):
             self.assertIn(fragment, text)
 

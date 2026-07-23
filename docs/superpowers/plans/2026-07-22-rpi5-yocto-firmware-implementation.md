@@ -204,10 +204,10 @@ artifacts/releases/*
 Run:
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv lock
 uv lock --check
 uv sync --locked
-test -z "${UV_PROJECT_ENVIRONMENT:-}"
 test -d .venv
 test ! -L .venv
 test "$(realpath .venv)" = "$(pwd -P)/.venv"
@@ -648,9 +648,9 @@ QEMU 런타임 합격 판정은 localhost SLIRP SSH를 사용하는
 Run:
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv lock --check
 uv sync --locked
-test -z "${UV_PROJECT_ENVIRONMENT:-}"
 test -d .venv
 test ! -L .venv
 test "$(realpath .venv)" = "$(pwd -P)/.venv"
@@ -1982,6 +1982,7 @@ class QemuContractTest(unittest.TestCase):
 
     def test_launcher_uses_local_slirp_and_cleans_process_group(self) -> None:
         script = read("scripts/test-qemu.sh")
+        self.assertIn("setsid uv run --locked kas shell", script)
         self.assertIn("runqemu qemuarm64 rpi5-minimal-image nographic slirp", script)
         self.assertIn("127.0.0.1", script)
         self.assertIn("2222", script)
@@ -2471,7 +2472,11 @@ class FlashContractTest(unittest.TestCase):
     def test_spoofed_uv_executable_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            spoof = root / "spoof-uv"
+            archive_root = root / "archive-root"
+            payload = archive_root / "uv-x86_64-unknown-linux-gnu"
+            payload.mkdir(parents=True)
+            spoof = payload / "uv"
+            archive = root / "spoof.tar.gz"
             marker = root / "SPOOF_EXECUTED"
             private = root / "private"
             private.mkdir(mode=0o700)
@@ -2482,9 +2487,18 @@ class FlashContractTest(unittest.TestCase):
                 encoding="utf-8",
             )
             spoof.chmod(0o755)
+            tar_result = run(
+                "tar", "--create", "--gzip",
+                "--file", os.fspath(archive),
+                "--directory", os.fspath(archive_root),
+                "uv-x86_64-unknown-linux-gnu",
+            )
+            self.assertEqual(tar_result.returncode, 0, tar_result.stderr)
             command = (
                 'source "$1"\n'
-                'authenticate_uv_archive "$2" "$3"\n'
+                'authenticate_uv_archive "$2" "$3" || exit 1\n'
+                'uv_bin="$authenticated_uv_bin"\n'
+                '"$uv_bin" --version\n'
             )
             result = run(
                 "bash",
@@ -2492,7 +2506,7 @@ class FlashContractTest(unittest.TestCase):
                 command,
                 "bash",
                 str(REPO_ROOT / "scripts/flash-ssd.sh"),
-                str(spoof),
+                str(archive),
                 str(private),
                 env={"SPOOF_MARKER": os.fspath(marker)},
             )
@@ -2737,38 +2751,61 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$script_dir/lib/common.sh"
 
 readonly UV_RELEASE_SHA256="8cc1cd82d434ec565376f98bd938d4b715b5791a80ff2d3aa78821cf85091b4b"
+authenticated_uv_bin=""
 
 authenticate_uv_archive() {
     local uv_archive="$1"
     local uv_private_dir="$2"
     local uv_archive_copy="$uv_private_dir/uv-release.tar.gz"
     local uv_extract_dir="$uv_private_dir/extract"
-    local uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"
+    local candidate_uv_bin="$uv_extract_dir/uv-x86_64-unknown-linux-gnu/uv"
 
-    [[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] || \
-        rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
-    install -m 0600 -- "$uv_archive" "$uv_archive_copy"
-    [[ -f "$uv_archive_copy" && ! -L "$uv_archive_copy" ]] || \
-        rpi5_die "private uv archive copy is not a regular file"
-    [[ "$(stat -c %u "$uv_archive_copy")" == "$EUID" ]] || \
-        rpi5_die "private uv archive copy ownership is invalid"
-    if ! (
-        cd "$uv_private_dir"
-        printf '%s  %s\n' "$UV_RELEASE_SHA256" "uv-release.tar.gz" |
-            sha256sum --check --strict --status
-    ); then
-        rpi5_die "authenticated uv archive checksum mismatch"
+    authenticated_uv_bin=""
+    if [[ "$uv_archive" != /* || ! -f "$uv_archive" || -L "$uv_archive" ]]; then
+        rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path" || true
+        return 1
+    fi
+    if ! install -m 0600 -- "$uv_archive" "$uv_archive_copy"; then
+        rpi5_die "failed to copy uv archive into private storage" || true
+        return 1
+    fi
+    if [[ ! -f "$uv_archive_copy" || -L "$uv_archive_copy" ]]; then
+        rpi5_die "private uv archive copy is not a regular file" || true
+        return 1
+    fi
+    if [[ "$(stat -c %u "$uv_archive_copy")" != "$EUID" ]]; then
+        rpi5_die "private uv archive copy ownership is invalid" || true
+        return 1
+    fi
+    if ! printf '%s  %s\n' "$UV_RELEASE_SHA256" "$uv_archive_copy" |
+        sha256sum --check --strict --status; then
+        rpi5_die "authenticated uv archive checksum mismatch" || true
+        return 1
     fi
 
-    install -d -m 0700 "$uv_extract_dir"
-    tar --extract --file "$uv_archive_copy" --directory "$uv_extract_dir" \
-        --gzip --no-same-owner --no-same-permissions
-    [[ -f "$uv_bin" && ! -L "$uv_bin" ]] || \
-        rpi5_die "authenticated archive is missing the expected uv executable"
-    chmod 0700 "$uv_bin"
-    [[ "$(stat -c %u "$uv_bin")" == "$EUID" && "$(stat -c %a "$uv_bin")" == "700" ]] || \
-        rpi5_die "authenticated uv executable ownership or mode is invalid"
-    printf '%s\n' "$uv_bin"
+    if ! install -d -m 0700 "$uv_extract_dir"; then
+        rpi5_die "failed to create private uv extraction directory" || true
+        return 1
+    fi
+    if ! tar --extract --file "$uv_archive_copy" --directory "$uv_extract_dir" \
+        --gzip --no-same-owner --no-same-permissions; then
+        rpi5_die "failed to extract authenticated uv archive" || true
+        return 1
+    fi
+    if [[ ! -f "$candidate_uv_bin" || -L "$candidate_uv_bin" ]]; then
+        rpi5_die "authenticated archive is missing the expected uv executable" || true
+        return 1
+    fi
+    if ! chmod 0700 "$candidate_uv_bin"; then
+        rpi5_die "failed to restrict authenticated uv executable mode" || true
+        return 1
+    fi
+    if [[ "$(stat -c %u "$candidate_uv_bin")" != "$EUID" ||
+          "$(stat -c %a "$candidate_uv_bin")" != "700" ]]; then
+        rpi5_die "authenticated uv executable ownership or mode is invalid" || true
+        return 1
+    fi
+    authenticated_uv_bin="$candidate_uv_bin"
 }
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -2795,6 +2832,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$EUID" -eq 0 ]] || rpi5_die "flash requires root for the selected device only"
+[[ -z "${UV_PROJECT_ENVIRONMENT:-}" ]] || \
+    rpi5_die "UV_PROJECT_ENVIRONMENT must be unset for privileged flashing"
 rpi5_validate_build_id "$build_id" || rpi5_die "invalid build ID"
 [[ "$profile" == "rpi5-minimal" || "$profile" == "rpi5-camera" ]] || \
     rpi5_die "invalid profile"
@@ -2804,18 +2843,15 @@ rpi5_validate_build_id "$build_id" || rpi5_die "invalid build ID"
 
 repo_root="$(rpi5_repo_root)"
 cd "$repo_root"
+[[ -d .venv && ! -L .venv ]] || \
+    rpi5_die "privileged uv requires a physical checkout-local .venv"
+[[ "$(realpath .venv)" == "$repo_root/.venv" ]] || \
+    rpi5_die "privileged uv environment resolves outside the checkout"
 uv_archive="${UV_ARCHIVE:-}"
 [[ "$uv_archive" = /* && -f "$uv_archive" && ! -L "$uv_archive" ]] || \
     rpi5_die "UV_ARCHIVE must be an absolute regular non-symlink archive path"
 umask 077
-uv_private_dir="$(mktemp -d /var/tmp/rpi5-flash-uv.XXXXXXXX)"
-chown root:root "$uv_private_dir"
-chmod 0700 "$uv_private_dir"
-[[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]] || \
-    rpi5_die "private uv directory is invalid"
-[[ "$(stat -c %u "$uv_private_dir")" == "0" ]] || \
-    rpi5_die "private uv directory is not root-owned"
-
+uv_private_dir=""
 cleanup_uv() {
     if [[ "${uv_private_dir:-}" =~ ^/var/tmp/rpi5-flash-uv\.[A-Za-z0-9]{8}$ ]] &&
        [[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]] &&
@@ -2824,13 +2860,23 @@ cleanup_uv() {
     fi
     uv_private_dir=""
 }
+uv_private_dir="$(mktemp -d /var/tmp/rpi5-flash-uv.XXXXXXXX)"
 trap cleanup_uv EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+chown root:root "$uv_private_dir"
+chmod 0700 "$uv_private_dir"
+[[ -d "$uv_private_dir" && ! -L "$uv_private_dir" ]] || \
+    rpi5_die "private uv directory is invalid"
+[[ "$(stat -c %u "$uv_private_dir")" == "0" ]] || \
+    rpi5_die "private uv directory is not root-owned"
 
-uv_bin="$(authenticate_uv_archive "$uv_archive" "$uv_private_dir")"
+authenticate_uv_archive "$uv_archive" "$uv_private_dir" || exit 1
+uv_bin="$authenticated_uv_bin"
 [[ "$("$uv_bin" --version | awk '{print $2}')" == "0.11.31" ]] || \
     rpi5_die "authenticated uv executable must be version 0.11.31"
+"$uv_bin" run --locked python -c \
+    'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 profile_root="$repo_root/artifacts/$build_id/$profile"
 flash_root="$repo_root/artifacts/$build_id/flash"
 flash_marker="$flash_root/${profile}-PASS"
@@ -3973,9 +4019,9 @@ if ! command -v uv >/dev/null 2>&1 ||
         env UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/home/many/.local/bin sh
     export PATH="/home/many/.local/bin:$PATH"
 fi
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv lock --check
 uv sync --locked
-test -z "${UV_PROJECT_ENVIRONMENT:-}"
 test -d .venv
 test ! -L .venv
 test "$(realpath .venv)" = "$(pwd -P)/.venv"
@@ -4371,9 +4417,9 @@ ensure_uv() {
     [[ "$(uv --version | awk '{print $2}')" == "0.11.31" ]] ||
         rpi5_die "uv must be version 0.11.31"
     cd "$repo_root"
+    test -z "${UV_PROJECT_ENVIRONMENT:-}"
     uv lock --check
     uv sync --locked
-    test -z "${UV_PROJECT_ENVIRONMENT:-}"
     test -d .venv
     test ! -L .venv
     test "$(realpath .venv)" = "$(pwd -P)/.venv"

@@ -121,16 +121,23 @@ GNU x86_64 release archive를 고정한다.
 경로인 `UV_ARCHIVE`만 전달한다. root 스크립트는 누락, 일반 파일이 아닌
 입력, symlink를 거부하고 다음 순서를 지킨다.
 
-1. root-owned private 임시 디렉터리를 만들고 archive bytes를 그 안으로
+1. `UV_PROJECT_ENVIRONMENT`를 거부하고 repository-local `.venv`가 실제
+   non-symlink physical 디렉터리인지 먼저 확인한다.
+2. root-owned private 임시 디렉터리를 만들고 즉시 exact-path cleanup
+   trap을 건 뒤 archive bytes를 그 안으로
    먼저 복사한다.
-2. 복사본의 exact SHA-256을 실행 없이 확인한다.
-3. ownership과 permission을 보존하지 않는 안전한 tar 옵션으로 인증된
+3. 복사본의 exact SHA-256을 실행 없이 확인한다.
+4. ownership과 permission을 보존하지 않는 안전한 tar 옵션으로 인증된
    복사본을 풀어 expected `uv-x86_64-unknown-linux-gnu/uv`만 선택한다.
-4. 선택한 파일이 symlink가 아닌 root-owned 일반 파일인지 확인하고
+5. 선택한 파일이 symlink가 아닌 root-owned 일반 파일인지 확인하고
    mode `0700`으로 제한한다.
-5. 그 뒤에만 `uv --version`을 보조 검사하고 모든 privileged
-   `uv run --locked` 호출에 같은 private executable을 사용한다.
-6. 정확히 생성한 private 임시 객체만 정리한다.
+6. 각 실패 경로는 명시적으로 nonzero를 반환한다. 인증 함수는
+   command substitution 안에서 실행하지 않으며 모든 검증이 끝난 뒤에만
+   validated executable 경로를 공개한다.
+7. 그 뒤에만 `uv --version`과 physical `sys.prefix`/Python 3.12를 보조
+   검사하고 모든 privileged `uv run --locked` 호출에 같은 private
+   executable을 사용한다.
+8. 정확히 생성한 private 임시 객체만 정리한다.
 
 root network download, `sudo -E`, 사용자 경로의 실행 파일 실행은
 허용하지 않는다.
@@ -165,8 +172,14 @@ root network download, `sudo -E`, 사용자 경로의 실행 파일 실행은
 ### 최초 설정
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv lock --check
 uv sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 uv run --locked kas --version
 ```
 

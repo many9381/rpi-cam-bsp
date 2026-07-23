@@ -289,9 +289,15 @@ worktree 루트에 독립적인 `.venv`를 만든다.
 기본 명령 흐름은 다음과 같다.
 
 ```bash
+test -z "${UV_PROJECT_ENVIRONMENT:-}"
 uv --version
 uv lock --check
 uv sync --locked
+test -d .venv
+test ! -L .venv
+test "$(realpath .venv)" = "$(pwd -P)/.venv"
+uv run --locked python -c \
+  'import pathlib, sys; expected = pathlib.Path.cwd().resolve() / ".venv"; assert pathlib.Path(sys.prefix).resolve() == expected; assert sys.version_info[:2] == (3, 12)'
 ./scripts/host-preflight.sh
 ```
 
