@@ -1,0 +1,59 @@
+header:
+  version: 19
+
+build_system: openembedded
+distro: poky
+target: rpi5-minimal-image
+
+repos:
+  bitbake:
+    url: https://git.openembedded.org/bitbake
+    branch: "2.18"
+    layers: {}
+  openembedded-core:
+    url: https://git.openembedded.org/openembedded-core
+    branch: wrynose
+    layers:
+      meta:
+  meta-yocto:
+    url: https://git.yoctoproject.org/meta-yocto
+    branch: wrynose
+    layers:
+      meta-poky:
+  meta-openembedded:
+    url: https://github.com/openembedded/meta-openembedded.git
+    branch: wrynose
+    layers: {}
+  meta-raspberrypi:
+    url: https://github.com/agherzan/meta-raspberrypi.git
+    branch: wrynose
+    layers: {}
+  meta-rpi5-cam:
+    layers:
+      meta-rpi5-cam:
+
+env:
+  RPI5_ADMIN_SSH_PUBKEY: null
+  RPI5_BUILD_ID: null
+
+local_conf_header:
+  base: |
+    CONF_VERSION = "2"
+    INIT_MANAGER = "systemd"
+    PACKAGE_CLASSES = "package_rpm"
+    DL_DIR = "${TOPDIR}/../downloads"
+    SSTATE_DIR = "${TOPDIR}/../sstate-cache"
+    BB_DISKMON_DIRS = "\
+        STOPTASKS,${TMPDIR},10G,100K \
+        STOPTASKS,${DL_DIR},10G,100K \
+        STOPTASKS,${SSTATE_DIR},10G,100K \
+        HALT,${TMPDIR},5G,10K \
+        HALT,${DL_DIR},5G,10K \
+        HALT,${SSTATE_DIR},5G,10K"
+    INHERIT += "buildhistory"
+    BUILDHISTORY_COMMIT = "0"
+    COPY_LIC_MANIFEST = "1"
+    COPY_LIC_DIRS = "1"
+    RM_OLD_IMAGE = "1"
+    RPI5_ADMIN_SSH_PUBKEY ??= ""
+    RPI5_BUILD_ID ??= "unversioned"

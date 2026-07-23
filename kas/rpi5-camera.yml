@@ -1,0 +1,21 @@
+header:
+  version: 19
+  includes:
+    - kas/rpi5-minimal.yml
+
+target: rpi5-camera-image
+
+repos:
+  meta-openembedded:
+    layers:
+      meta-oe:
+      meta-python:
+      meta-multimedia:
+
+local_conf_header:
+  rpi5-camera: |
+    hostname:pn-base-files = "rpi5-camera"
+    RASPBERRYPI_CAMERA_V3 = "1"
+    PACKAGECONFIG:append:pn-libcamera-apps = " libav"
+    PACKAGECONFIG:append:pn-rpidistro-ffmpeg = " x264"
+    LICENSE_FLAGS_ACCEPTED += " commercial"
