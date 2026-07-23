@@ -1,11 +1,13 @@
 import unittest
 
-from support import read
+from support import REPO_ROOT, read
 
 
 class RepositoryContractTest(unittest.TestCase):
-    def test_build_dependency_is_pinned(self) -> None:
-        self.assertEqual(read("requirements-build.txt"), "kas==5.4\n")
+    def test_uv_project_files_replace_legacy_requirements(self) -> None:
+        for relative in ("pyproject.toml", "uv.lock", ".python-version"):
+            self.assertTrue((REPO_ROOT / relative).is_file(), relative)
+        self.assertFalse((REPO_ROOT / "requirements-build.txt").exists())
 
     def test_generated_and_sensitive_paths_are_ignored(self) -> None:
         ignored = set(read(".gitignore").splitlines())
