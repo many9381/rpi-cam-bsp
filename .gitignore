@@ -1,4 +1,6 @@
 .worktrees/
+
+# Worktree-local uv project environment.
 .venv/
 __pycache__/
 *.py[cod]
