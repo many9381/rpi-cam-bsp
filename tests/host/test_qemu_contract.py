@@ -53,19 +53,37 @@ class QemuContractTest(unittest.TestCase):
 printf 'ssh %s\\n' "$*" >> "$TEST_CALLS"
 all=" $* "
 command="${!#}"
-if [[ "$all" == *" root@127.0.0.1 "* ]]; then exit 255; fi
-if [[ "$all" == *" -o PubkeyAuthentication=no "* ]]; then exit 255; fi
+if [[ "$all" == *" root@127.0.0.1 "* ]]; then
+  [[ "${FAKE_ROOT_LOGIN_SUCCEEDS:-0}" == "1" ]] && exit 0
+  exit 255
+fi
+if [[ "$all" == *" -o PubkeyAuthentication=no "* ]]; then
+  [[ "${FAKE_NO_KEY_LOGIN_SUCCEEDS:-0}" == "1" ]] && exit 0
+  exit 255
+fi
 case "$command" in
-  true) exit 0 ;;
+  true)
+    if [[ "${FAKE_WAIT_FOR_LISTENER:-0}" == "1" ]]; then
+      while [[ ! -e "$QEMU_CONTROL/listener-ready" ]]; do sleep 0.01; done
+    fi
+    exit 0
+    ;;
   'uname -m') printf '%s\\n' "${FAKE_ARCHITECTURE:-aarch64}" ;;
   'cat /etc/rpi5-build-id') printf '%s\\n' "$FAKE_BUILD_ID" ;;
-  'systemctl is-system-running') printf 'running\\n' ;;
-  'systemctl is-active systemd-networkd.service'|'systemctl is-active sshd.service') printf 'active\\n' ;;
+  'systemctl is-system-running') printf '%s\\n' "${FAKE_SYSTEMD:-running}" ;;
+  'systemctl is-active systemd-networkd.service') printf '%s\\n' "${FAKE_NETWORKD:-active}" ;;
+  'systemctl is-active sshd.service') printf '%s\\n' "${FAKE_SSHD:-active}" ;;
   'systemctl --failed --no-pager') printf '0 loaded units listed.\\n' ;;
   'sudo -n /usr/bin/journalctl -b --no-pager') printf 'journal\\n' ;;
-  *'ip -4 -o address show scope global'*) exit 0 ;;
-  *'/var/tmp/qemu-rw-test'*) printf '%s\\n' "$RPI5_BUILD_ID" ;;
-  *'/etc/ssh/sshd_config.d/20-rpi5.conf'*) printf 'PasswordAuthentication no\\nPermitRootLogin no\\n' ;;
+  *'ip -4 -o address show scope global'*) [[ "${FAKE_NETWORK_EXIT:-0}" != "1" ]] ;;
+  *'/var/tmp/qemu-rw-test'*)
+    [[ "${FAKE_RW_EXIT:-0}" != "1" ]] || exit 1
+    printf '%s\\n' "${FAKE_RW_VALUE:-$RPI5_BUILD_ID}"
+    ;;
+  *'/etc/ssh/sshd_config.d/20-rpi5.conf'*)
+    [[ "${FAKE_POLICY_EXIT:-0}" != "1" ]] || exit 1
+    printf 'PasswordAuthentication no\\nPermitRootLogin no\\n'
+    ;;
   *'systemctl poweroff'*) touch "$QEMU_CONTROL/powered-off" ;;
 esac
 """,
@@ -97,6 +115,20 @@ trap cleanup TERM INT EXIT
 sleep 600 &
 child="$!"
 printf '%s\\n' "$child" > "$QEMU_CONTROL/qemu-child-pid"
+if [[ "${FAKE_QEMU_MODE:-poweroff}" == "term-resistant" ]]; then
+  trap '' TERM INT
+  /usr/bin/python3 -c 'import os, signal, socket, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", 2222))
+listener.listen()
+open(os.path.join(os.environ["QEMU_CONTROL"], "listener-ready"), "w").close()
+while True: time.sleep(1)' &
+  listener="$!"
+  printf '%s\\n' "$listener" > "$QEMU_CONTROL/qemu-listener-pid"
+  while :; do sleep 1; done
+fi
 if [[ "${FAKE_QEMU_MODE:-poweroff}" == "ignore" ]]; then
   while :; do sleep 1; done
 fi
@@ -170,13 +202,34 @@ exit "${FAKE_QEMU_EXIT:-0}"
     def _expired_clock_environment(self) -> Path:
         path = self.root / "expired-clock.sh"
         path.write_text(
+            "RPI5_TEST_KILL_ZERO_COUNT=0\n"
+            "kill() {\n"
+            "    if [[ \"${1:-}\" == \"-0\" ]]; then\n"
+            "        ((RPI5_TEST_KILL_ZERO_COUNT += 1))\n"
+            "        if (( RPI5_TEST_KILL_ZERO_COUNT == 1 )); then\n"
+            "            SECONDS=9999\n"
+            "        else\n"
+            "            SECONDS=999999\n"
+            "        fi\n"
+            "        return 0\n"
+            "    fi\n"
+            "    builtin kill \"$@\"\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def _resistant_cleanup_environment(self) -> Path:
+        path = self.root / "resistant-cleanup.sh"
+        path.write_text(
             "kill() {\n"
             "    if [[ \"${1:-}\" == \"-0\" ]]; then\n"
             "        SECONDS=9999\n"
             "        return 0\n"
             "    fi\n"
             "    builtin kill \"$@\"\n"
-            "}\n",
+            "}\n"
+            "wait() { return 0; }\n",
             encoding="utf-8",
         )
         return path
@@ -197,6 +250,30 @@ exit "${FAKE_QEMU_EXIT:-0}"
             time.sleep(0.02)
         self.fail(f"process {pid} survived launcher cleanup")
 
+    def _wait_for_port_2222_release(self, timeout: float = 3) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = subprocess.run(
+                ("/usr/bin/ss", "-H", "-ltn", "sport = :2222"),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if not result.stdout.strip():
+                return
+            time.sleep(0.02)
+        self.fail("localhost port 2222 survived launcher cleanup")
+
+    def _kill_fake_qemu_group(self) -> None:
+        pid_file = self.control / "qemu-pid"
+        if not pid_file.exists():
+            return
+        try:
+            os.killpg(int(pid_file.read_text()), 9)
+        except ProcessLookupError:
+            pass
+
     def test_remote_wait_refreshes_known_host_and_uses_strict_key_only_ssh(self) -> None:
         """Catches accepting an unknown host or relaxing SSH authentication options."""
         self._copy_entrypoints()
@@ -212,6 +289,9 @@ exit "${FAKE_QEMU_EXIT:-0}"
         calls = self.calls.read_text(encoding="utf-8")
         self.assertIn("StrictHostKeyChecking=yes", calls)
         self.assertIn("BatchMode=yes", calls)
+        self.assertIn("IdentitiesOnly=yes", calls)
+        self.assertIn("PasswordAuthentication=no", calls)
+        self.assertIn("KbdInteractiveAuthentication=no", calls)
         self.assertIn(f"UserKnownHostsFile={known_hosts}", calls)
         self.assertIn(f"-i {self.key}", calls)
 
@@ -238,6 +318,30 @@ exit "${FAKE_QEMU_EXIT:-0}"
         self.assertIn("architecture expected 'aarch64' but got 'x86_64'", result.stderr)
         self.assertFalse((evidence / "guest-PASS").exists())
         self.assertFalse((self.control / "powered-off").exists())
+
+    def test_each_guest_assertion_failure_blocks_pass_and_poweroff(self) -> None:
+        """Catches independently weakened guest acceptance assertions."""
+        cases = (
+            ("architecture", {"FAKE_ARCHITECTURE": "x86_64"}),
+            ("build-id", {"FAKE_BUILD_ID": "20260725T120000Z-deadbeefcafe"}),
+            ("systemd", {"FAKE_SYSTEMD": "degraded"}),
+            ("networkd", {"FAKE_NETWORKD": "inactive"}),
+            ("sshd", {"FAKE_SSHD": "inactive"}),
+            ("slirp-network", {"FAKE_NETWORK_EXIT": "1"}),
+            ("writable-storage", {"FAKE_RW_EXIT": "1"}),
+            ("sshd-policy", {"FAKE_POLICY_EXIT": "1"}),
+            ("root-login", {"FAKE_ROOT_LOGIN_SUCCEEDS": "1"}),
+            ("non-key-login", {"FAKE_NO_KEY_LOGIN_SUCCEEDS": "1"}),
+        )
+        for name, extra in cases:
+            with self.subTest(name=name):
+                self._copy_entrypoints()
+                result = self._guest(**extra)
+                evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((evidence / "guest-PASS").exists())
+                self.assertFalse((self.control / "powered-off").exists())
+                shutil.rmtree(evidence, ignore_errors=True)
 
     def test_launcher_rejects_uv_override_and_head_mismatch_before_evidence(self) -> None:
         """Catches launching kas or creating qemu-test evidence before early gates."""
@@ -285,7 +389,10 @@ exit "${FAKE_QEMU_EXIT:-0}"
         ):
             with self.subTest(name=name):
                 self._ready_launcher()
-                result = self._launcher(**extra)
+                launcher_extra = dict(extra)
+                if name == "qemu":
+                    launcher_extra["BASH_ENV"] = str(self._expired_clock_environment())
+                result = self._launcher(**launcher_extra)
                 evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((evidence / "PASS").exists())
@@ -297,6 +404,27 @@ exit "${FAKE_QEMU_EXIT:-0}"
                 shutil.rmtree(evidence, ignore_errors=True)
                 (self.control / "powered-off").unlink(missing_ok=True)
                 (self.control / "terminated").unlink(missing_ok=True)
+
+    def test_launcher_kills_term_resistant_listener_after_guest_failure(self) -> None:
+        """Catches a bounded cleanup that leaves a port-2222 process group alive."""
+        self._copy_entrypoints()
+        self._ready_launcher()
+        try:
+            result = self._launcher(
+                FAKE_ARCHITECTURE="x86_64",
+                FAKE_QEMU_MODE="term-resistant",
+                FAKE_WAIT_FOR_LISTENER="1",
+                BASH_ENV=str(self._resistant_cleanup_environment()),
+            )
+            evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((evidence / "PASS").exists())
+            self.assertTrue((self.control / "listener-ready").is_file())
+            self._wait_for_port_2222_release()
+            listener_pid = int((self.control / "qemu-listener-pid").read_text())
+            self._wait_for_process_exit(listener_pid)
+        finally:
+            self._kill_fake_qemu_group()
 
     def test_launcher_kills_refusing_qemu_after_poweroff_without_promoting_pass(self) -> None:
         """Catches the timeout path leaking a QEMU process group or sealing PASS."""
@@ -310,7 +438,8 @@ exit "${FAKE_QEMU_EXIT:-0}"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("QEMU did not exit within 30 seconds", result.stderr)
         self.assertFalse((evidence / "PASS").exists())
-        self._wait_for(self.control / "terminated")
+        qemu_pid = int((self.control / "qemu-pid").read_text())
+        self._wait_for_process_exit(qemu_pid)
 
     def test_qemu_scripts_are_valid_bash(self) -> None:
         """Catches syntax errors in any entry point before a runtime gate starts."""

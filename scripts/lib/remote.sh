@@ -15,6 +15,9 @@ rpi5_remote_init() {
     RPI5_SSH=(
         ssh -p "$port" -i "$key"
         -o BatchMode=yes
+        -o IdentitiesOnly=yes
+        -o PasswordAuthentication=no
+        -o KbdInteractiveAuthentication=no
         -o ConnectTimeout=5
         -o ServerAliveInterval=10
         -o ServerAliveCountMax=2
@@ -25,6 +28,9 @@ rpi5_remote_init() {
     RPI5_SCP=(
         scp -P "$port" -i "$key"
         -o BatchMode=yes
+        -o IdentitiesOnly=yes
+        -o PasswordAuthentication=no
+        -o KbdInteractiveAuthentication=no
         -o ConnectTimeout=5
         -o StrictHostKeyChecking=yes
         -o UserKnownHostsFile="$known_hosts"

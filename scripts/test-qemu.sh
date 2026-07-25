@@ -35,10 +35,25 @@ export KAS_WORK_DIR="$repo_root/build/kas-work"
 export KAS_BUILD_DIR="$KAS_WORK_DIR/build/qemu"
 
 qemu_pid=""
+rpi5_wait_qemu_group() {
+    local timeout_seconds="$1"
+    local deadline=$((SECONDS + timeout_seconds))
+    while kill -0 -- "-$qemu_pid" 2>/dev/null; do
+        (( SECONDS < deadline )) || return 1
+        sleep 1
+    done
+    return 0
+}
+
 cleanup() {
     if [[ -n "$qemu_pid" ]]; then
         kill -- "-$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
+        rpi5_wait_qemu_group 5 || true
+        kill -KILL -- "-$qemu_pid" 2>/dev/null || true
+        if ! kill -0 "$qemu_pid" 2>/dev/null; then
+            wait "$qemu_pid" 2>/dev/null || true
+        fi
+        qemu_pid=""
     fi
 }
 trap cleanup EXIT INT TERM
@@ -55,13 +70,9 @@ qemu_pid="$!"
     --build-id "$build_id" --host 127.0.0.1 --port 2222 \
     --timeout 180 --key "$key" --evidence-dir "$evidence"
 
-deadline=$((SECONDS + 30))
-while kill -0 "$qemu_pid" 2>/dev/null && (( SECONDS < deadline )); do
-    sleep 1
-done
-if kill -0 "$qemu_pid" 2>/dev/null; then
+rpi5_wait_qemu_group 30 || {
     rpi5_die "QEMU did not exit within 30 seconds after poweroff"
-fi
+}
 wait "$qemu_pid"
 qemu_pid=""
 
