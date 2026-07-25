@@ -66,9 +66,9 @@ log="$out/${action}.log"
 run_logged() {
     set +e
     "$@" 2>&1 | tee "$log"
-    local status="${PIPESTATUS[0]}"
+    local statuses=("${PIPESTATUS[@]}")
     set -e
-    return "$status"
+    (( statuses[0] == 0 && statuses[1] == 0 )) || return 1
 }
 
 cd "$repo_root"

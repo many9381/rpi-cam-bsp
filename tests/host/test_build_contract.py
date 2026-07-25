@@ -64,7 +64,9 @@ fi
             self.fake_bin / "uv",
             """#!/usr/bin/env bash
 printf 'uv args=%s work=%s build=%s\\n' "$*" "${KAS_WORK_DIR:-}" "${KAS_BUILD_DIR:-}" >> "$TEST_CALLS"
-if [[ " $* " == " run --locked kas --version " ]]; then
+if [[ "${FAIL_FOR_ALL_REPOS:-}" == "1" && " $* " == *" kas for-all-repos "* ]]; then
+    exit 1
+elif [[ " $* " == " run --locked kas --version " ]]; then
     printf 'kas 5.4\\n'
 elif [[ " $* " == *" kas for-all-repos "* ]]; then
     printf 'z-layer zzz\\n'
@@ -296,6 +298,81 @@ fi
         self.assertEqual((out / f"{image}-raspberrypi5.rootfs.wic.bz2").read_bytes(), b"disk")
         self.assertEqual((out / f"{image}-raspberrypi5.rootfs.wic.bmap").read_text(encoding="utf-8"), "bmap\n")
         self.assertTrue((out.parent / "COMPLETE").is_file())
+
+    def test_failed_build_log_sink_prevents_collection_and_completion(self) -> None:
+        """Catches ignoring tee failures after a successful kas build command."""
+        self._create_qemu_outputs()
+        self._write_executable(
+            self.fake_bin / "tee",
+            "#!/usr/bin/env bash\ncat >/dev/null\nexit 1\n",
+        )
+
+        result = self._run(
+            "bash", "scripts/build.sh", "--build-id", BUILD_ID, "qemu", "build"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uv args=run --locked kas build kas/qemuarm64-minimal.yml", self._calls())
+        self.assertNotIn("uv args=run --locked kas for-all-repos", self._calls())
+        self.assertFalse((self.root / "artifacts" / BUILD_ID / "qemu" / "COMPLETE").exists())
+
+    def test_collector_rejects_traversal_profile_before_artifact_mutation(self) -> None:
+        """Catches constructing an artifact path from an unvalidated profile."""
+        result = self._run(
+            "bash", "scripts/collect-artifacts.sh", "--build-id", BUILD_ID,
+            "--profile", "../escaped", "--config", "kas/qemuarm64-minimal.yml",
+            "--machine", "qemuarm64", "--image", "rpi5-minimal-image",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown profile", result.stderr)
+        self.assertFalse((self.root / "artifacts").exists())
+        self.assertNotIn("uv args=", self._calls())
+
+    def test_collector_rejects_mismatched_profile_tuple_before_artifact_mutation(self) -> None:
+        """Catches collecting evidence with config, machine, or image from another profile."""
+        result = self._run(
+            "bash", "scripts/collect-artifacts.sh", "--build-id", BUILD_ID,
+            "--profile", "qemu", "--config", "kas/rpi5-camera.yml",
+            "--machine", "raspberrypi5", "--image", "rpi5-camera-image",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("collector arguments do not match profile", result.stderr)
+        self.assertFalse((self.root / "artifacts").exists())
+        self.assertNotIn("uv args=", self._calls())
+
+    def test_incomplete_collection_retry_does_not_seal_stale_license_files(self) -> None:
+        """Catches merging changed license evidence into an incomplete prior attempt."""
+        self._create_qemu_outputs()
+        source_licenses = (
+            self.root
+            / "build/kas-work/build/qemu/tmp/deploy/licenses/"
+            "rpi5-minimal-image-qemuarm64"
+        )
+        (source_licenses / "OBSOLETE").write_text("old\n", encoding="utf-8")
+
+        first = self._run(*self._collector_arguments(), FAIL_FOR_ALL_REPOS="1")
+
+        self.assertNotEqual(first.returncode, 0)
+        output_licenses = (
+            self.root / "artifacts" / BUILD_ID / "qemu" / "licenses"
+            / "rpi5-minimal-image-qemuarm64"
+        )
+        self.assertTrue((output_licenses / "OBSOLETE").is_file())
+        self.assertFalse((output_licenses.parent.parent / "COMPLETE").exists())
+        (source_licenses / "OBSOLETE").unlink()
+        (source_licenses / "LICENSE.manifest").write_text("Apache-2.0\n", encoding="utf-8")
+
+        second = self._run(*self._collector_arguments())
+
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse((output_licenses / "OBSOLETE").exists())
+        self.assertEqual(
+            (output_licenses / "LICENSE.manifest").read_text(encoding="utf-8"),
+            "Apache-2.0\n",
+        )
+        self.assertTrue((output_licenses.parent.parent / "COMPLETE").is_file())
 
     def test_scripts_are_valid_bash(self) -> None:
         """Catches syntax errors that prevent either shell entry point from starting."""

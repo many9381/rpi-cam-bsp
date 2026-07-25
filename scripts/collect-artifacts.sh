@@ -18,6 +18,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$profile" in
+    qemu)
+        expected_config="kas/qemuarm64-minimal.yml"
+        expected_machine="qemuarm64"
+        expected_image="rpi5-minimal-image"
+        ;;
+    rpi5-minimal)
+        expected_config="kas/rpi5-minimal.yml"
+        expected_machine="raspberrypi5"
+        expected_image="rpi5-minimal-image"
+        ;;
+    rpi5-camera)
+        expected_config="kas/rpi5-camera.yml"
+        expected_machine="raspberrypi5"
+        expected_image="rpi5-camera-image"
+        ;;
+    *) rpi5_die "unknown profile: $profile" ;;
+esac
+[[ "$config" == "$expected_config" && "$machine" == "$expected_machine" && \
+    "$image" == "$expected_image" ]] || \
+    rpi5_die "collector arguments do not match profile: $profile"
+
 rpi5_validate_build_id "$build_id" || rpi5_die "invalid build ID: $build_id"
 repo_root="$(rpi5_repo_root)"
 current_revision="$(git -C "$repo_root" rev-parse --short=12 HEAD)"
@@ -30,6 +52,9 @@ out="$repo_root/artifacts/$build_id/$profile"
 cd "$repo_root"
 build_dir="$repo_root/build/kas-work/build/$profile"
 deploy="$build_dir/tmp/deploy/images/$machine"
+for subtree in images checksums manifests licenses; do
+    rm -rf -- "$out/$subtree"
+done
 mkdir -p "$out/images" "$out/checksums" "$out/manifests" "$out/licenses"
 
 copy_required() {
