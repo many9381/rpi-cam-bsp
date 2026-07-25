@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -33,6 +34,9 @@ class QemuContractTest(unittest.TestCase):
         self.real_uv = shutil.which("uv")
         if self.real_uv is None:
             self.fail("uv is required for the locked listener helper")
+        self.real_timeout = shutil.which("timeout")
+        if self.real_timeout is None:
+            self.fail("timeout is required for the bounded guest-check helper")
         self.key = self.root / "keys/rpi5_admin"
         self.key.write_text("private\n", encoding="utf-8")
         self.key.chmod(0o600)
@@ -61,6 +65,11 @@ class QemuContractTest(unittest.TestCase):
 printf 'ssh %s\\n' "$*" >> "$TEST_CALLS"
 all=" $* "
 command="${!#}"
+if [[ "$command" == "${FAKE_HANG_COMMAND:-}" ]]; then
+  printf '%s\n' "$$" > "$QEMU_CONTROL/guest-hang-pid"
+  trap '' TERM INT
+  while :; do sleep 1; done
+fi
 if [[ "$all" == *" root@127.0.0.1 "* ]]; then
   [[ "${FAKE_ROOT_LOGIN_SUCCEEDS:-0}" == "1" ]] && exit 0
   exit 255
@@ -70,17 +79,35 @@ if [[ "$all" == *" -o PubkeyAuthentication=no "* ]]; then
   exit 255
 fi
 case "$command" in
-  true)
-    if [[ "${FAKE_WAIT_FOR_LISTENER:-0}" == "1" ]]; then
-      while [[ ! -e "$QEMU_CONTROL/listener-ready" ]]; do sleep 0.01; done
-    fi
-    exit 0
+	  true)
+	    if [[ "${FAKE_WAIT_FOR_LISTENER:-0}" == "1" ]]; then
+	      deadline=$((SECONDS + 10))
+	      while [[ ! -e "$QEMU_CONTROL/listener-ready" ]]; do
+	        (( SECONDS < deadline )) || exit 88
+	        sleep 0.01
+	      done
+	    fi
+	    if [[ "${FAKE_WAIT_FOR_PROCESS_TREE:-0}" == "1" ]]; then
+	      printf '%s\n' "$$" > "$QEMU_CONTROL/guest-wait-pid"
+	      deadline=$((SECONDS + 10))
+	      while [[ ! -e "$QEMU_CONTROL/process-tree-ready" ]]; do
+	        (( SECONDS < deadline )) || exit 88
+	        sleep 0.01
+	      done
+	    fi
+	    exit 0
     ;;
   'uname -m') printf '%s\\n' "${FAKE_ARCHITECTURE:-aarch64}" ;;
   'cat /etc/rpi5-build-id') printf '%s\\n' "$FAKE_BUILD_ID" ;;
   'systemctl is-system-running') printf '%s\\n' "${FAKE_SYSTEMD:-running}" ;;
   'systemctl is-active systemd-networkd.service') printf '%s\\n' "${FAKE_NETWORKD:-active}" ;;
   'systemctl is-active sshd.service') printf '%s\\n' "${FAKE_SSHD:-active}" ;;
+  *'passwordauthentication'*) printf '%s\\n' "${FAKE_PASSWORD_AUTHENTICATION:-no}" ;;
+  *'kbdinteractiveauthentication'*) printf '%s\\n' "${FAKE_KBD_INTERACTIVE_AUTHENTICATION:-no}" ;;
+  *'permitrootlogin'*) printf '%s\\n' "${FAKE_PERMIT_ROOT_LOGIN:-no}" ;;
+  *'authenticationmethods'*) printf '%s\\n' "${FAKE_AUTHENTICATION_METHODS:-publickey}" ;;
+  *'allowusers'*) printf '%s\\n' "${FAKE_ALLOW_USERS:-rpiadmin}" ;;
+  *'passwd -S'*) printf '%s\\n' "${FAKE_ACCOUNT_LOCK:-L}" ;;
   'systemctl --failed --no-pager') printf '0 loaded units listed.\\n' ;;
   'sudo -n /usr/bin/journalctl -b --no-pager') printf 'journal\\n' ;;
   *'ip -4 -o address show scope global'*) [[ "${FAKE_NETWORK_EXIT:-0}" != "1" ]] ;;
@@ -102,7 +129,7 @@ esac
         )
         self._write_executable(
             self.fake_bin / "ss",
-            "#!/usr/bin/env bash\nexit 0\n",
+            "#!/usr/bin/env bash\nexit \"${FAKE_SS_EXIT:-0}\"\n",
         )
         self._write_executable(
             self.fake_bin / "uv",
@@ -173,6 +200,7 @@ exit "${FAKE_QEMU_EXIT:-0}"
                 "FAKE_REVISION": REVISION,
                 "FAKE_BUILD_ID": BUILD_ID,
                 "RPI5_REAL_UV": self.real_uv,
+                "RPI5_REAL_TIMEOUT": self.real_timeout,
             },
         )
         environment.update(extra)
@@ -203,37 +231,60 @@ exit "${FAKE_QEMU_EXIT:-0}"
     def _launcher(self, **extra: str) -> subprocess.CompletedProcess[str]:
         return self._run("bash", "scripts/test-qemu.sh", "--build-id", BUILD_ID, **extra)
 
-    def _expired_clock_environment(self) -> Path:
-        path = self.root / "expired-clock.sh"
+    def _start_launcher(self, **extra: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            ("bash", "scripts/test-qemu.sh", "--build-id", BUILD_ID),
+            cwd=self.root,
+            env=self._environment(**extra),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+    def _expired_qemu_shutdown_environment(self) -> Path:
+        path = self.root / "expired-qemu-shutdown.sh"
         path.write_text(
-            "RPI5_TEST_KILL_ZERO_COUNT=0\n"
-            "kill() {\n"
-            "    if [[ \"${1:-}\" == \"-0\" ]]; then\n"
-            "        ((RPI5_TEST_KILL_ZERO_COUNT += 1))\n"
-            "        if (( RPI5_TEST_KILL_ZERO_COUNT == 1 )); then\n"
-            "            SECONDS=9999\n"
-            "        else\n"
-            "            SECONDS=999999\n"
-            "        fi\n"
-            "        return 0\n"
+            "RPI5_TEST_EXPIRE_QEMU_WAIT=1\n"
+            "sleep() {\n"
+            "    if (( RPI5_TEST_EXPIRE_QEMU_WAIT )); then\n"
+            "        SECONDS=9999\n"
+            "        RPI5_TEST_EXPIRE_QEMU_WAIT=0\n"
             "    fi\n"
-            "    builtin kill \"$@\"\n"
+            "    builtin sleep 0.01\n"
             "}\n",
             encoding="utf-8",
         )
         return path
 
-    def _resistant_cleanup_environment(self) -> Path:
-        path = self.root / "resistant-cleanup.sh"
+    def _reap_order_environment(self) -> Path:
+        path = self.root / "reap-order.sh"
         path.write_text(
+            "RPI5_TEST_QEMU_KILLED=0\n"
+            "RPI5_TEST_QEMU_REAPED=0\n"
             "kill() {\n"
-            "    if [[ \"${1:-}\" == \"-0\" ]]; then\n"
-            "        SECONDS=9999\n"
+            "    local qemu_pid=\"\"\n"
+            "    [[ ! -f \"$QEMU_CONTROL/qemu-pid\" ]] || "
+            "qemu_pid=\"$(<\"$QEMU_CONTROL/qemu-pid\")\"\n"
+            "    if [[ \"${1:-}\" == \"-KILL\" && \"${3:-}\" == \"-$qemu_pid\" ]]; then\n"
+            "        RPI5_TEST_QEMU_KILLED=1\n"
+            "    fi\n"
+            "    if [[ \"${1:-}\" == \"-0\" && \"${3:-}\" == \"-$qemu_pid\" ]] "
+            "&& (( RPI5_TEST_QEMU_KILLED && ! RPI5_TEST_QEMU_REAPED )); then\n"
             "        return 0\n"
             "    fi\n"
             "    builtin kill \"$@\"\n"
             "}\n"
-            "wait() { return 0; }\n",
+            "wait() {\n"
+            "    local status=0\n"
+            "    builtin wait \"$@\" || status=$?\n"
+            "    if [[ -f \"$QEMU_CONTROL/qemu-pid\" "
+            "&& \"${1:-}\" == \"$(<\"$QEMU_CONTROL/qemu-pid\")\" ]]; then\n"
+            "        RPI5_TEST_QEMU_REAPED=1\n"
+            "        touch \"$QEMU_CONTROL/leader-reaped\"\n"
+            "    fi\n"
+            "    return \"$status\"\n"
+            "}\n",
             encoding="utf-8",
         )
         return path
@@ -253,6 +304,16 @@ exit "${FAKE_QEMU_EXIT:-0}"
                 return
             time.sleep(0.02)
         self.fail(f"process {pid} survived launcher cleanup")
+
+    def _wait_for_process_group_exit(self, pgid: int, timeout: float = 3) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        self.fail(f"process group {pgid} survived launcher cleanup")
 
     def _wait_for_port_2222_release(self, timeout: float = 3) -> None:
         deadline = time.monotonic() + timeout
@@ -277,6 +338,156 @@ exit "${FAKE_QEMU_EXIT:-0}"
             os.killpg(int(pid_file.read_text()), 9)
         except ProcessLookupError:
             pass
+
+    def _kill_process_group(self, pgid: int) -> None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def _install_short_guest_timeout(self) -> None:
+        self._write_executable(
+            self.fake_bin / "timeout",
+            """#!/usr/bin/env bash
+if [[ "${1:-}" == "--foreground" && "${2:-}" == "--kill-after=10s" && "${3:-}" == "240s" ]]; then
+  exec "$RPI5_REAL_TIMEOUT" "$1" "$2" 1s "${@:4}"
+fi
+exec "$RPI5_REAL_TIMEOUT" "$@"
+""",
+        )
+
+    def _install_locked_environment(self) -> None:
+        shutil.copytree(REPO_ROOT / ".venv", self.root / ".venv", symlinks=True)
+
+    def _prepare_real_kas_fixture(self) -> tuple[str, Path]:
+        self._install_locked_environment()
+        kas_dir = self.root / "kas"
+        kas_dir.mkdir()
+        fixture_repo = self.root / "fixture-repo"
+        fixture_repo.mkdir()
+        fixture_bin = self.root / "runqemu-fixture-bin"
+        fixture_bin.mkdir()
+        (kas_dir / "qemuarm64-minimal.yml").write_text(
+            "header:\n"
+            "  version: 19\n"
+            "repos:\n"
+            "  fixture:\n"
+            f"    path: {fixture_repo}\n"
+            "    layers:\n"
+            "      .: disabled\n"
+            "env:\n"
+            "  QEMU_CONTROL: null\n"
+            "  RPI5_FIXTURE_ROOT: null\n"
+            "  RPI5_REAL_UV: null\n",
+            encoding="utf-8",
+        )
+        self._write_executable(
+            fixture_repo / "oe-init-build-env",
+            "#!/usr/bin/env bash\n"
+            "mkdir -p \"$1/conf\"\n"
+            "export BBPATH=\"$1\"\n"
+            f"export PATH=\"{fixture_bin}:$PATH\"\n",
+        )
+        self._write_executable(
+            fixture_bin / "runqemu",
+            """#!/usr/bin/env bash
+trap '' TERM INT
+printf '%s\n' "$$" > "$QEMU_CONTROL/runqemu-pid"
+pgid="$(ps -o pgid= -p "$$" | tr -d ' ')"
+printf '%s\n' "$pgid" > "$QEMU_CONTROL/outer-pgid"
+sleep 600 &
+printf '%s\n' "$!" > "$QEMU_CONTROL/runqemu-sleep-pid"
+(
+  cd "$RPI5_FIXTURE_ROOT"
+  exec "$RPI5_REAL_UV" run --locked --offline python \
+    tests/host/qemu_listener.py \
+    --ready "$QEMU_CONTROL/listener-ready" \
+    --runtime "$QEMU_CONTROL/listener-runtime"
+) &
+printf '%s\n' "$!" > "$QEMU_CONTROL/listener-wrapper-pid"
+while [[ ! -e "$QEMU_CONTROL/listener-ready" ]]; do sleep 0.01; done
+ps -eo pid=,ppid=,pgid=,args= |
+  awk -v pgid="$pgid" '$3 == pgid { print }' \
+  > "$QEMU_CONTROL/process-tree.tsv"
+touch "$QEMU_CONTROL/process-tree-ready"
+while :; do sleep 1; done
+""",
+        )
+
+        outer_bin = self.root / "outer-fixture-bin"
+        outer_bin.mkdir()
+        for command in ("ssh-keygen", "ssh-keyscan", "ssh", "scp"):
+            shutil.copy2(self.fake_bin / command, outer_bin / command)
+
+        (self.root / ".gitignore").write_text(
+            ".venv/\n"
+            ".uv-cache/\n"
+            "artifacts/\n"
+            "build/\n"
+            "calls.log\n"
+            "control/\n"
+            "fake-bin/\n"
+            "outer-fixture-bin/\n"
+            "runqemu-fixture-bin/\n",
+            encoding="utf-8",
+        )
+        git_commands = (
+            ("git", "init", "-q"),
+            ("git", "add", ".gitignore", "keys", "kas", "fixture-repo", "scripts",
+             "pyproject.toml", "uv.lock", "tests/host/qemu_listener.py"),
+            (
+                "git", "-c", "user.name=QEMU Contract", "-c",
+                "user.email=qemu-contract@example.invalid", "commit", "-q",
+                "--no-gpg-sign", "-m", "test fixture",
+            ),
+        )
+        for command in git_commands:
+            result = subprocess.run(
+                command,
+                cwd=self.root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+        revision = subprocess.run(
+            ("git", "rev-parse", "--short=12", "HEAD"),
+            cwd=self.root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.strip()
+        return f"20260725T120000Z-{revision}", outer_bin
+
+    def _real_kas_environment(
+        self,
+        build_id: str,
+        outer_bin: Path,
+        **extra: str,
+    ) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.pop("UV_PROJECT_ENVIRONMENT", None)
+        environment.pop("VIRTUAL_ENV", None)
+        environment.update(
+            {
+                "PATH": (
+                    f"{self.root / 'runqemu-fixture-bin'}:"
+                    f"{outer_bin}:{environment['PATH']}"
+                ),
+                "TEST_CALLS": str(self.calls),
+                "QEMU_CONTROL": str(self.control),
+                "FAKE_BUILD_ID": build_id,
+                "RPI5_REAL_UV": self.real_uv,
+                "RPI5_FIXTURE_ROOT": str(self.root),
+                "RPI5_RUNQEMU_FIXTURE_BIN": str(self.root / "runqemu-fixture-bin"),
+                "UV_CACHE_DIR": str(self.root / ".uv-cache"),
+                "UV_OFFLINE": "1",
+            },
+        )
+        environment.update(extra)
+        return environment
 
     def test_remote_wait_refreshes_known_host_and_uses_strict_key_only_ssh(self) -> None:
         """Catches accepting an unknown host or relaxing SSH authentication options."""
@@ -309,6 +520,7 @@ exit "${FAKE_QEMU_EXIT:-0}"
         self.assertIn('"architecture":"aarch64"', (evidence / "result.json").read_text())
         self.assertIn('"systemd":"running"', (evidence / "result.json").read_text())
         self.assertIn('"ssh":"key-only"', (evidence / "result.json").read_text())
+        self.assertIn('"account":"locked"', (evidence / "result.json").read_text())
         self.assertTrue((evidence / "systemd-failed.log").is_file())
         self.assertTrue((evidence / "journal.log").is_file())
         self.assertTrue((self.control / "powered-off").is_file())
@@ -333,7 +545,15 @@ exit "${FAKE_QEMU_EXIT:-0}"
             ("sshd", {"FAKE_SSHD": "inactive"}),
             ("slirp-network", {"FAKE_NETWORK_EXIT": "1"}),
             ("writable-storage", {"FAKE_RW_EXIT": "1"}),
-            ("sshd-policy", {"FAKE_POLICY_EXIT": "1"}),
+            ("password-authentication", {"FAKE_PASSWORD_AUTHENTICATION": "yes"}),
+            (
+                "kbd-interactive-authentication",
+                {"FAKE_KBD_INTERACTIVE_AUTHENTICATION": "yes"},
+            ),
+            ("permit-root-login", {"FAKE_PERMIT_ROOT_LOGIN": "prohibit-password"}),
+            ("authentication-methods", {"FAKE_AUTHENTICATION_METHODS": "any"}),
+            ("allow-users", {"FAKE_ALLOW_USERS": "rpiadmin camera"}),
+            ("account-lock", {"FAKE_ACCOUNT_LOCK": "P"}),
             ("root-login", {"FAKE_ROOT_LOGIN_SUCCEEDS": "1"}),
             ("non-key-login", {"FAKE_NO_KEY_LOGIN_SUCCEEDS": "1"}),
         )
@@ -346,6 +566,24 @@ exit "${FAKE_QEMU_EXIT:-0}"
                 self.assertFalse((evidence / "guest-PASS").exists())
                 self.assertFalse((self.control / "powered-off").exists())
                 shutil.rmtree(evidence, ignore_errors=True)
+
+    def test_guest_uses_effective_sshd_policy_instead_of_static_dropin(self) -> None:
+        """Catches trusting a drop-in that sshd could override or ignore."""
+        self._copy_entrypoints()
+        result = self._guest(FAKE_POLICY_EXIT="1")
+        evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((evidence / "guest-PASS").is_file())
+        calls = self.calls.read_text(encoding="utf-8")
+        for setting in (
+            "passwordauthentication",
+            "kbdinteractiveauthentication",
+            "permitrootlogin",
+            "authenticationmethods",
+            "allowusers",
+        ):
+            self.assertIn(setting, calls)
+        self.assertIn("passwd -S rpiadmin", calls)
 
     def test_launcher_rejects_uv_override_and_head_mismatch_before_evidence(self) -> None:
         """Catches launching kas or creating qemu-test evidence before early gates."""
@@ -360,6 +598,17 @@ exit "${FAKE_QEMU_EXIT:-0}"
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertIn("does not match HEAD deadbeefcafe", mismatch.stderr)
         self.assertFalse((self.root / "artifacts" / BUILD_ID / "qemu-test").exists())
+        self.assertFalse(self.calls.exists())
+
+    def test_launcher_fails_closed_when_port_state_cannot_be_verified(self) -> None:
+        """Catches treating an ss inspection error as proof port 2222 is free."""
+        self._copy_entrypoints()
+        self._ready_launcher()
+        result = self._launcher(FAKE_SS_EXIT="2")
+        evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not inspect localhost port 2222", result.stderr)
+        self.assertFalse((evidence / "PASS").exists())
         self.assertFalse(self.calls.exists())
 
     def test_launcher_preserves_final_pass_and_replaces_stale_transient_pass(self) -> None:
@@ -394,8 +643,6 @@ exit "${FAKE_QEMU_EXIT:-0}"
             with self.subTest(name=name):
                 self._ready_launcher()
                 launcher_extra = dict(extra)
-                if name == "qemu":
-                    launcher_extra["BASH_ENV"] = str(self._expired_clock_environment())
                 result = self._launcher(**launcher_extra)
                 evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
                 self.assertNotEqual(result.returncode, 0)
@@ -409,16 +656,191 @@ exit "${FAKE_QEMU_EXIT:-0}"
                 (self.control / "powered-off").unlink(missing_ok=True)
                 (self.control / "terminated").unlink(missing_ok=True)
 
+    def test_launcher_times_out_hung_guest_command_and_cleans_every_process(self) -> None:
+        """Catches an SSH command escaping the whole-checker deadline and cleanup."""
+        self._copy_entrypoints()
+        self._ready_launcher()
+        self._install_short_guest_timeout()
+        try:
+            result = self._launcher(FAKE_HANG_COMMAND="uname -m")
+            evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertFalse((evidence / "PASS").exists())
+            self.assertFalse((evidence / "guest-PASS").exists())
+            guest_hang_pid = int((self.control / "guest-hang-pid").read_text())
+            self._wait_for_process_exit(guest_hang_pid)
+            qemu_pid = int((self.control / "qemu-pid").read_text())
+            self._wait_for_process_exit(qemu_pid)
+            self._wait_for_port_2222_release()
+        finally:
+            self._kill_fake_qemu_group()
+
+    def _assert_direct_signal_cleanup(self, sent_signal: int, expected_status: int) -> None:
+        self._copy_entrypoints()
+        self._install_locked_environment()
+        self._ready_launcher()
+        launcher = self._start_launcher(
+            FAKE_HANG_COMMAND="uname -m",
+            FAKE_QEMU_MODE="term-resistant",
+            FAKE_WAIT_FOR_LISTENER="1",
+        )
+        guest_pgid = None
+        qemu_pgid = None
+        try:
+            self._wait_for(self.control / "listener-ready")
+            self._wait_for(self.control / "guest-hang-pid")
+            guest_pid = int((self.control / "guest-hang-pid").read_text())
+            guest_pgid = os.getpgid(guest_pid)
+            qemu_pid = int((self.control / "qemu-pid").read_text())
+            qemu_pgid = os.getpgid(qemu_pid)
+            launcher.send_signal(sent_signal)
+            try:
+                stdout, stderr = launcher.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                self._kill_process_group(launcher.pid)
+                self._kill_process_group(guest_pgid)
+                self._kill_process_group(qemu_pgid)
+                launcher.communicate(timeout=3)
+                self.fail(f"launcher did not finish cleanup after signal {sent_signal}")
+            self.assertEqual(launcher.returncode, expected_status, (stdout, stderr))
+            evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+            self.assertFalse((evidence / "PASS").exists())
+            self._wait_for_process_exit(guest_pid)
+            self._wait_for_process_group_exit(guest_pgid)
+            self._wait_for_process_exit(qemu_pid)
+            self._wait_for_process_group_exit(qemu_pgid)
+            self._wait_for_port_2222_release()
+        finally:
+            self._kill_process_group(launcher.pid)
+            if guest_pgid is not None:
+                self._kill_process_group(guest_pgid)
+            if qemu_pgid is not None:
+                self._kill_process_group(qemu_pgid)
+            self._kill_fake_qemu_group()
+
+    def test_launcher_sigint_exits_130_after_full_cleanup(self) -> None:
+        """Catches SIGINT bypassing EXIT cleanup or orphaning the guest checker."""
+        self._assert_direct_signal_cleanup(signal.SIGINT, 130)
+
+    def test_launcher_sigterm_exits_143_after_full_cleanup(self) -> None:
+        """Catches SIGTERM bypassing EXIT cleanup or orphaning the guest checker."""
+        self._assert_direct_signal_cleanup(signal.SIGTERM, 143)
+
+    def test_launcher_real_uv_kas_path_cleans_complete_process_tree(self) -> None:
+        """Catches a fake outer wrapper hiding uv/kas descendant or PGID leaks."""
+        self._copy_entrypoints()
+        build_id, outer_bin = self._prepare_real_kas_fixture()
+        (self.root / "artifacts" / build_id / "qemu").mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        (self.root / "artifacts" / build_id / "qemu/COMPLETE").touch()
+        (self.root / "build" / "kas-work" / "build").mkdir(parents=True)
+        launcher = subprocess.Popen(
+            ("bash", "scripts/test-qemu.sh", "--build-id", build_id),
+            cwd=self.root,
+            env=self._real_kas_environment(
+                build_id,
+                outer_bin,
+                FAKE_ARCHITECTURE="x86_64",
+                FAKE_WAIT_FOR_PROCESS_TREE="1",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        outer_pgid = None
+        guest_pgid = None
+        fallback_pgids: set[int] = set()
+        try:
+            try:
+                stdout, stderr = launcher.communicate(timeout=25)
+            except subprocess.TimeoutExpired:
+                evidence = self.root / "artifacts" / build_id / "qemu-test"
+                console_path = evidence / "console.log"
+                console = (
+                    console_path.read_text(encoding="utf-8")
+                    if console_path.is_file()
+                    else "<no console>"
+                )
+                process_snapshot = subprocess.run(
+                    ("ps", "-eo", "pid,ppid,pgid,sid,stat,args"),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                ).stdout
+                fixture_processes = "\n".join(
+                    line for line in process_snapshot.splitlines()
+                    if str(self.root) in line
+                )
+                for line in fixture_processes.splitlines():
+                    fields = line.split(maxsplit=5)
+                    if len(fields) >= 3:
+                        fallback_pgids.add(int(fields[2]))
+                control_files = sorted(path.name for path in self.control.iterdir())
+                if (self.control / "outer-pgid").is_file():
+                    outer_pgid = int((self.control / "outer-pgid").read_text())
+                if (self.control / "guest-wait-pid").is_file():
+                    guest_pid = int((self.control / "guest-wait-pid").read_text())
+                    guest_pgid = os.getpgid(guest_pid)
+                self._kill_process_group(launcher.pid)
+                if outer_pgid is not None:
+                    self._kill_process_group(outer_pgid)
+                if guest_pgid is not None:
+                    self._kill_process_group(guest_pgid)
+                for pgid in fallback_pgids:
+                    self._kill_process_group(pgid)
+                launcher.communicate(timeout=3)
+                self.fail(
+                    "real uv/kas launcher exceeded its bounded cleanup window\n"
+                    f"control={control_files}\nconsole={console}\n"
+                    f"processes={fixture_processes}"
+                )
+            self.assertNotEqual(launcher.returncode, 0, (stdout, stderr))
+            evidence = self.root / "artifacts" / build_id / "qemu-test"
+            self.assertFalse((evidence / "PASS").exists())
+            console = (evidence / "console.log").read_text(encoding="utf-8")
+            self.assertTrue(
+                (self.control / "process-tree-ready").is_file(),
+                (stdout, stderr, console),
+            )
+            tree = (self.control / "process-tree.tsv").read_text(encoding="utf-8")
+            process_ids = {
+                int(line.split(maxsplit=1)[0])
+                for line in tree.splitlines()
+                if line.strip()
+            }
+            outer_pgid = int((self.control / "outer-pgid").read_text())
+            self.assertIn(outer_pgid, process_ids)
+            self.assertGreaterEqual(len(process_ids), 5, tree)
+            self.assertIn("uv run --locked kas shell kas/qemuarm64-minimal.yml", tree)
+            self.assertIn("kas 5.4 started", console)
+            for pid in process_ids:
+                self._wait_for_process_exit(pid)
+            self._wait_for_process_group_exit(outer_pgid)
+            self._wait_for_port_2222_release()
+        finally:
+            self._kill_process_group(launcher.pid)
+            if outer_pgid is not None:
+                self._kill_process_group(outer_pgid)
+            if guest_pgid is not None:
+                self._kill_process_group(guest_pgid)
+            for pgid in fallback_pgids:
+                self._kill_process_group(pgid)
+
     def test_launcher_kills_term_resistant_listener_after_guest_failure(self) -> None:
         """Catches a bounded cleanup that leaves a port-2222 process group alive."""
         self._copy_entrypoints()
+        self._install_locked_environment()
         self._ready_launcher()
         try:
             result = self._launcher(
                 FAKE_ARCHITECTURE="x86_64",
                 FAKE_QEMU_MODE="term-resistant",
                 FAKE_WAIT_FOR_LISTENER="1",
-                BASH_ENV=str(self._resistant_cleanup_environment()),
+                BASH_ENV=str(self._reap_order_environment()),
             )
             evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
             self.assertNotEqual(result.returncode, 0)
@@ -433,6 +855,7 @@ exit "${FAKE_QEMU_EXIT:-0}"
             self._wait_for_port_2222_release()
             listener_pid = int((self.control / "qemu-listener-pid").read_text())
             self._wait_for_process_exit(listener_pid)
+            self.assertTrue((self.control / "leader-reaped").is_file())
         finally:
             self._kill_fake_qemu_group()
 
@@ -442,7 +865,7 @@ exit "${FAKE_QEMU_EXIT:-0}"
         self._ready_launcher()
         result = self._launcher(
             FAKE_QEMU_MODE="ignore",
-            BASH_ENV=str(self._expired_clock_environment()),
+            BASH_ENV=str(self._expired_qemu_shutdown_environment()),
         )
         evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
         self.assertNotEqual(result.returncode, 0)

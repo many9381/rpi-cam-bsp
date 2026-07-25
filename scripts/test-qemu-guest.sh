@@ -54,11 +54,15 @@ check_exact build_id "$build_id" 'cat /etc/rpi5-build-id'
 check_exact systemd running 'systemctl is-system-running'
 check_exact networkd active 'systemctl is-active systemd-networkd.service'
 check_exact sshd active 'systemctl is-active sshd.service'
+check_exact password_authentication no "sshd -T | awk '\$1 == \"passwordauthentication\" { print \$2 }'"
+check_exact kbd_interactive_authentication no "sshd -T | awk '\$1 == \"kbdinteractiveauthentication\" { print \$2 }'"
+check_exact permit_root_login no "sshd -T | awk '\$1 == \"permitrootlogin\" { print \$2 }'"
+check_exact authentication_methods publickey "sshd -T | awk '\$1 == \"authenticationmethods\" { print \$2 }'"
+check_exact allow_users rpiadmin "sshd -T | awk '\$1 == \"allowusers\" { print \$2 }'"
+check_exact account_locked L "passwd -S rpiadmin | awk '\$1 == \"rpiadmin\" { print \$2 }'"
 
 rpi5_remote "ip -4 -o address show scope global | grep -Eq 'inet 10\\.0\\.2\\.'"
 rpi5_remote "printf '%s' '$build_id' > /var/tmp/qemu-rw-test && grep -Fx '$build_id' /var/tmp/qemu-rw-test && rm /var/tmp/qemu-rw-test" \
-    >> "$ssh_log"
-rpi5_remote "grep -Fx 'PasswordAuthentication no' /etc/ssh/sshd_config.d/20-rpi5.conf && grep -Fx 'PermitRootLogin no' /etc/ssh/sshd_config.d/20-rpi5.conf" \
     >> "$ssh_log"
 
 root_ssh=(
@@ -82,7 +86,7 @@ if "${password_only[@]}" >> "$ssh_log" 2>&1; then
     rpi5_die "non-key SSH login unexpectedly succeeded"
 fi
 
-printf '{"build_id":"%s","architecture":"aarch64","systemd":"running","network":"active","ssh":"key-only"}\n' \
+printf '{"build_id":"%s","architecture":"aarch64","systemd":"running","network":"active","ssh":"key-only","account":"locked"}\n' \
     "$build_id" > "$evidence_dir/result.json"
 touch "$evidence_dir/guest-PASS"
 rpi5_remote 'sudo -n /usr/bin/systemctl poweroff'
