@@ -70,6 +70,12 @@ if [[ "$command" == "${FAKE_HANG_COMMAND:-}" ]]; then
   trap '' TERM INT
   while :; do sleep 1; done
 fi
+if [[ "$command" == *'authenticationmethods'* ]]; then
+  filter="${command#*| }"
+  printf '%s\n' "authenticationmethods ${FAKE_AUTHENTICATION_METHODS:-publickey}" |
+    bash -c "$filter"
+  exit $?
+fi
 if [[ "$all" == *" root@127.0.0.1 "* ]]; then
   [[ "${FAKE_ROOT_LOGIN_SUCCEEDS:-0}" == "1" ]] && exit 0
   exit 255
@@ -105,7 +111,6 @@ case "$command" in
   *'passwordauthentication'*) printf '%s\\n' "${FAKE_PASSWORD_AUTHENTICATION:-no}" ;;
   *'kbdinteractiveauthentication'*) printf '%s\\n' "${FAKE_KBD_INTERACTIVE_AUTHENTICATION:-no}" ;;
   *'permitrootlogin'*) printf '%s\\n' "${FAKE_PERMIT_ROOT_LOGIN:-no}" ;;
-  *'authenticationmethods'*) printf '%s\\n' "${FAKE_AUTHENTICATION_METHODS:-publickey}" ;;
   *'allowusers'*) printf '%s\\n' "${FAKE_ALLOW_USERS:-rpiadmin}" ;;
   *'passwd -S'*) printf '%s\\n' "${FAKE_ACCOUNT_LOCK:-L}" ;;
   'systemctl --failed --no-pager') printf '0 loaded units listed.\\n' ;;
@@ -532,6 +537,22 @@ while :; do sleep 1; done
         evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("architecture expected 'aarch64' but got 'x86_64'", result.stderr)
+        self.assertFalse((evidence / "guest-PASS").exists())
+        self.assertFalse((self.control / "powered-off").exists())
+
+    def test_guest_rejects_additional_authentication_method_alternative(self) -> None:
+        """Catches accepting publickey when sshd also permits a password alternative."""
+        self._copy_entrypoints()
+        result = self._guest(FAKE_AUTHENTICATION_METHODS="publickey password")
+        evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            (
+                f"guest-PASS={str((evidence / 'guest-PASS').exists()).lower()} "
+                f"powered-off={str((self.control / 'powered-off').exists()).lower()}"
+            ),
+        )
         self.assertFalse((evidence / "guest-PASS").exists())
         self.assertFalse((self.control / "powered-off").exists())
 

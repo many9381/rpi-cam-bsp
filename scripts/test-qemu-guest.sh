@@ -57,7 +57,24 @@ check_exact sshd active 'systemctl is-active sshd.service'
 check_exact password_authentication no "sshd -T | awk '\$1 == \"passwordauthentication\" { print \$2 }'"
 check_exact kbd_interactive_authentication no "sshd -T | awk '\$1 == \"kbdinteractiveauthentication\" { print \$2 }'"
 check_exact permit_root_login no "sshd -T | awk '\$1 == \"permitrootlogin\" { print \$2 }'"
-check_exact authentication_methods publickey "sshd -T | awk '\$1 == \"authenticationmethods\" { print \$2 }'"
+check_exact authentication_methods publickey "sshd -T | awk '
+    \$1 == \"authenticationmethods\" {
+        count += 1
+        line = \$0
+        if (sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, \"\", line) != 1 ||
+                line == \"\") {
+            invalid = 1
+        } else if (count == 1) {
+            value = line
+        }
+    }
+    END {
+        if (count != 1 || invalid) {
+            exit 1
+        }
+        print value
+    }
+'"
 check_exact allow_users rpiadmin "sshd -T | awk '\$1 == \"allowusers\" { print \$2 }'"
 check_exact account_locked L "passwd -S rpiadmin | awk '\$1 == \"rpiadmin\" { print \$2 }'"
 
