@@ -25,6 +25,14 @@ class QemuContractTest(unittest.TestCase):
         (self.root / "scripts" / "lib").mkdir(parents=True)
         (self.root / "keys").mkdir()
         shutil.copy2(REPO_ROOT / "scripts/lib/common.sh", self.root / "scripts/lib/common.sh")
+        for relative in ("pyproject.toml", "uv.lock", "tests/host/qemu_listener.py"):
+            source = REPO_ROOT / relative
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        self.real_uv = shutil.which("uv")
+        if self.real_uv is None:
+            self.fail("uv is required for the locked listener helper")
         self.key = self.root / "keys/rpi5_admin"
         self.key.write_text("private\n", encoding="utf-8")
         self.key.chmod(0o600)
@@ -117,14 +125,9 @@ child="$!"
 printf '%s\\n' "$child" > "$QEMU_CONTROL/qemu-child-pid"
 if [[ "${FAKE_QEMU_MODE:-poweroff}" == "term-resistant" ]]; then
   trap '' TERM INT
-  /usr/bin/python3 -c 'import os, signal, socket, time
-signal.signal(signal.SIGTERM, signal.SIG_IGN)
-listener = socket.socket()
-listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("127.0.0.1", 2222))
-listener.listen()
-open(os.path.join(os.environ["QEMU_CONTROL"], "listener-ready"), "w").close()
-while True: time.sleep(1)' &
+  "$RPI5_REAL_UV" run --locked --offline python tests/host/qemu_listener.py \
+    --ready "$QEMU_CONTROL/listener-ready" \
+    --runtime "$QEMU_CONTROL/listener-runtime" &
   listener="$!"
   printf '%s\\n' "$listener" > "$QEMU_CONTROL/qemu-listener-pid"
   while :; do sleep 1; done
@@ -169,6 +172,7 @@ exit "${FAKE_QEMU_EXIT:-0}"
                 "QEMU_CONTROL": str(self.control),
                 "FAKE_REVISION": REVISION,
                 "FAKE_BUILD_ID": BUILD_ID,
+                "RPI5_REAL_UV": self.real_uv,
             },
         )
         environment.update(extra)
@@ -420,6 +424,12 @@ exit "${FAKE_QEMU_EXIT:-0}"
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((evidence / "PASS").exists())
             self.assertTrue((self.control / "listener-ready").is_file())
+            listener_runtime = self.control / "listener-runtime"
+            self.assertTrue(listener_runtime.is_file())
+            self.assertEqual(
+                listener_runtime.read_text(encoding="utf-8").strip(),
+                str(self.root / ".venv"),
+            )
             self._wait_for_port_2222_release()
             listener_pid = int((self.control / "qemu-listener-pid").read_text())
             self._wait_for_process_exit(listener_pid)
