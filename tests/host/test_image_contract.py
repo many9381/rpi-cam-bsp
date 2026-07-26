@@ -68,6 +68,16 @@ class ImageContractTest(unittest.TestCase):
         self.assertNotIn("LICENSE_FLAGS_ACCEPTED", minimal)
         self.assertNotIn("LICENSE_FLAGS_ACCEPTED", qemu)
 
+    def test_camera_user_has_only_required_device_groups(self) -> None:
+        camera = read(
+            "meta-rpi5-cam/recipes-core/images/rpi5-camera-image.bb"
+        )
+        self.assertIn(
+            'EXTRA_USERS_PARAMS:append = " usermod -a -G video,render rpiadmin;"',
+            camera,
+        )
+        self.assertNotIn("sudoers", camera.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,4 +12,6 @@ IMAGE_INSTALL:append = " \
     file \
 "
 
+EXTRA_USERS_PARAMS:append = " usermod -a -G video,render rpiadmin;"
+
 IMAGE_ROOTFS_SIZE = "4194304"
