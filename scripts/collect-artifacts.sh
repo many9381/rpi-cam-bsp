@@ -79,12 +79,16 @@ manifest="$deploy/$image-$machine.rootfs.manifest"
 [[ -e "$manifest" ]] || rpi5_die "package manifest missing: $manifest"
 cp -L "$manifest" "$out/manifests/"
 
-shopt -s nullglob
-license_dirs=(
-    "$build_dir/tmp/deploy/licenses/$machine/$image-$machine.rootfs-"*
-)
-[[ "${#license_dirs[@]}" -gt 0 ]] || rpi5_die "license manifest directory missing"
-cp -a "${license_dirs[@]}" "$out/licenses/"
+license_root="$build_dir/tmp/deploy/licenses/$machine"
+license_link="$license_root/$image-$machine.rootfs"
+[[ -L "$license_link" ]] || rpi5_die "license manifest link missing: $license_link"
+license_dir="$(readlink -f -- "$license_link")"
+[[ -d "$license_dir" ]] || rpi5_die "license manifest directory missing"
+case "$license_dir" in
+    "$license_root/$image-$machine.rootfs-"*) ;;
+    *) rpi5_die "license manifest link escapes expected image scope" ;;
+esac
+cp -a "$license_dir" "$out/licenses/"
 
 export KAS_WORK_DIR="$repo_root/build/kas-work"
 export KAS_BUILD_DIR="$build_dir"
