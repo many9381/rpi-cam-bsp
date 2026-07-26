@@ -137,7 +137,11 @@ fi
         (deploy / "rpi5-minimal-image-qemuarm64.rootfs.manifest").write_text(
             "package-a\\n", encoding="utf-8"
         )
-        licenses = self.root / "build/kas-work/build/qemu/tmp/deploy/licenses/rpi5-minimal-image-qemuarm64"
+        licenses = (
+            self.root
+            / "build/kas-work/build/qemu/tmp/deploy/licenses/qemuarm64/"
+            "rpi5-minimal-image-qemuarm64.rootfs-20260726012334"
+        )
         licenses.mkdir(parents=True)
         (licenses / "LICENSE.manifest").write_text("MIT\\n", encoding="utf-8")
         return deploy
@@ -287,7 +291,11 @@ fi
         (deploy / f"{image}-raspberrypi5.rootfs.wic.bz2").write_bytes(b"disk")
         (deploy / f"{image}-raspberrypi5.rootfs.wic.bmap").write_text("bmap\n", encoding="utf-8")
         (deploy / f"{image}-raspberrypi5.rootfs.manifest").write_text("package-a\n", encoding="utf-8")
-        licenses = self.root / "build/kas-work/build/rpi5-minimal/tmp/deploy/licenses/rpi5-minimal-image-raspberrypi5"
+        licenses = (
+            self.root
+            / "build/kas-work/build/rpi5-minimal/tmp/deploy/licenses/"
+            "raspberrypi5/rpi5-minimal-image-raspberrypi5.rootfs-20260726012334"
+        )
         licenses.mkdir(parents=True)
         (licenses / "LICENSE.manifest").write_text("MIT\n", encoding="utf-8")
 
@@ -348,7 +356,7 @@ fi
         source_licenses = (
             self.root
             / "build/kas-work/build/qemu/tmp/deploy/licenses/"
-            "rpi5-minimal-image-qemuarm64"
+            "qemuarm64/rpi5-minimal-image-qemuarm64.rootfs-20260726012334"
         )
         (source_licenses / "OBSOLETE").write_text("old\n", encoding="utf-8")
 
@@ -357,7 +365,7 @@ fi
         self.assertNotEqual(first.returncode, 0)
         output_licenses = (
             self.root / "artifacts" / BUILD_ID / "qemu" / "licenses"
-            / "rpi5-minimal-image-qemuarm64"
+            / "rpi5-minimal-image-qemuarm64.rootfs-20260726012334"
         )
         self.assertTrue((output_licenses / "OBSOLETE").is_file())
         self.assertFalse((output_licenses.parent.parent / "COMPLETE").exists())

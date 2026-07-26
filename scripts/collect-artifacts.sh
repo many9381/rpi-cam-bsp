@@ -80,7 +80,9 @@ manifest="$deploy/$image-$machine.rootfs.manifest"
 cp -L "$manifest" "$out/manifests/"
 
 shopt -s nullglob
-license_dirs=("$build_dir/tmp/deploy/licenses/$image-$machine"*)
+license_dirs=(
+    "$build_dir/tmp/deploy/licenses/$machine/$image-$machine.rootfs-"*
+)
 [[ "${#license_dirs[@]}" -gt 0 ]] || rpi5_die "license manifest directory missing"
 cp -a "${license_dirs[@]}" "$out/licenses/"
 
