@@ -4,14 +4,16 @@ set -euo pipefail
 source "$(dirname "$0")/lib/common.sh"
 
 usage() {
-    printf 'Usage: %s [--initial|--incremental] [--key PATH]\n' "$0"
+    printf 'Usage: %s [--initial|--incremental] [--container] [--key PATH]\n' "$0"
 }
 
 mode="--incremental"
+container_mode="0"
 key_path="$(rpi5_repo_root)/keys/rpi5_admin"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --initial|--incremental) mode="$1"; shift ;;
+        --container) container_mode="1"; shift ;;
         --key) key_path="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
@@ -26,9 +28,14 @@ minimum_disk_kib=20971520
 [[ "$EUID" -ne 0 ]] || rpi5_die "BitBake must not run as root"
 [[ "$(uname -m)" == "x86_64" ]] || rpi5_die "host architecture must be x86_64"
 
-source /etc/os-release
-[[ "$ID" == "ubuntu" && "$VERSION_ID" == "24.04" ]] || \
-    rpi5_die "supported host is Ubuntu 24.04"
+if [[ "$container_mode" == "1" ]]; then
+    [[ -f /.dockerenv || -f /run/.containerenv ]] || \
+        rpi5_die "--container requires a real container environment"
+else
+    source /etc/os-release
+    [[ "$ID" == "ubuntu" && "$VERSION_ID" == "24.04" ]] || \
+        rpi5_die "supported native host is Ubuntu 24.04"
+fi
 [[ "$(nproc)" -ge 4 ]] || rpi5_die "at least 4 logical CPUs are required"
 
 memory_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
@@ -46,12 +53,17 @@ locale -a | grep -Eiq '^en_US\.(utf-?8|UTF-?8)$' || \
 
 required_commands=(
     git tar make gcc python3 uv
-    bmaptool qemu-system-aarch64
     ssh scp ssh-keygen ssh-keyscan ss
-    avahi-resolve-host-name ping
-    lsblk findmnt blockdev partprobe udevadm
-    mount umount sha256sum file ffprobe
+    qemu-system-aarch64
+    sha256sum setsid sort awk grep stat df nproc tr tee
 )
+if [[ "$container_mode" == "0" ]]; then
+    required_commands+=(
+        bmaptool avahi-resolve-host-name ping
+        lsblk findmnt blockdev partprobe udevadm
+        mount umount file ffprobe
+    )
+fi
 for required in "${required_commands[@]}"; do
     rpi5_require_cmd "$required"
 done
