@@ -672,8 +672,8 @@ while :; do sleep 1; done
         self.assertEqual(final.read_text(encoding="utf-8"), "")
         self.assertFalse(stale.exists())
 
-    def test_launcher_uses_collected_uncompressed_rootfs(self) -> None:
-        """Catches runqemu auto-selecting a compressed rootfs it cannot boot."""
+    def test_launcher_uses_disposable_copy_of_collected_uncompressed_rootfs(self) -> None:
+        """Catches QEMU mutating the collected deployment artifact in place."""
         self._copy_entrypoints()
         self._ready_launcher()
 
@@ -686,14 +686,18 @@ while :; do sleep 1; done
             / BUILD_ID
             / "qemu/images/rpi5-minimal-image-qemuarm64.rootfs.ext4"
         )
+        runtime_dir = self.root / "build/qemu-runtime"
         launch = (
             self.root
             / "artifacts"
             / BUILD_ID
             / "qemu-test/launch-command.txt"
         ).read_text(encoding="utf-8")
-        self.assertIn(str(expected), launch)
+        self.assertNotIn(str(expected), launch)
+        self.assertIn(str(runtime_dir), launch)
         self.assertNotIn(".ext4.zst", launch)
+        self.assertEqual(expected.read_bytes(), b"rootfs")
+        self.assertEqual(list(runtime_dir.glob(f"{BUILD_ID}.*")), [])
 
     def test_launcher_reports_immediate_qemu_exit_without_guest_timeout(self) -> None:
         """Catches waiting for SSH after the QEMU launcher has already failed."""

@@ -50,6 +50,8 @@ qemu_pid=""
 qemu_pgid=""
 guest_check_pid=""
 guest_check_pgid=""
+runtime_dir=""
+runtime_rootfs=""
 
 rpi5_wait_process_group_gone() {
     local pgid="$1"
@@ -138,6 +140,12 @@ cleanup() {
             cleanup_failed=1
         fi
     fi
+    if [[ -n "$runtime_rootfs" ]]; then
+        rm -f -- "$runtime_rootfs" || cleanup_failed=1
+    fi
+    if [[ -n "$runtime_dir" ]]; then
+        rmdir -- "$runtime_dir" || cleanup_failed=1
+    fi
     (( cleanup_failed == 0 )) || printf '%s\n' \
         "ERROR: QEMU cleanup could not confirm all processes and port 2222 were gone" >&2
 
@@ -151,7 +159,13 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf -v quoted_rootfs '%q' "$rootfs"
+runtime_parent="$repo_root/build/qemu-runtime"
+mkdir -p "$runtime_parent"
+runtime_dir="$(mktemp -d "$runtime_parent/$build_id.XXXXXX")"
+runtime_rootfs="$runtime_dir/$(basename "$rootfs")"
+cp --reflink=auto --sparse=always -- "$rootfs" "$runtime_rootfs"
+
+printf -v quoted_rootfs '%q' "$runtime_rootfs"
 runqemu_command="runqemu qemuarm64 $quoted_rootfs nographic slirp"
 printf 'uv run --locked kas shell kas/qemuarm64-minimal.yml -c %q\n' \
     "$runqemu_command" > "$evidence/launch-command.txt"
