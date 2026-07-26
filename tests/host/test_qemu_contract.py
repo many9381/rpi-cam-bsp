@@ -621,6 +621,7 @@ while :; do sleep 1; done
             "allowusers",
         ):
             self.assertIn(setting, calls)
+        self.assertIn("sudo -n /usr/sbin/sshd -T", calls)
         self.assertIn("passwd -S rpiadmin", calls)
 
     def test_launcher_rejects_uv_override_and_head_mismatch_before_evidence(self) -> None:

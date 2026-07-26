@@ -142,8 +142,10 @@ class LayerContractTest(unittest.TestCase):
         self.assertNotIn("ALL=(ALL) NOPASSWD: ALL", sudoers)
         self.assertIn("/usr/bin/systemctl reboot", sudoers)
         self.assertIn("/usr/bin/systemctl poweroff", sudoers)
+        self.assertIn("/usr/sbin/sshd -T", sudoers)
         self.assertIn('/usr/bin/dmesg ""', sudoers)
         self.assertNotRegex(sudoers, r"/usr/bin/dmesg(?:,|$)")
+        self.assertNotRegex(sudoers, r"/usr/sbin/sshd(?:,|$)")
 
 
 if __name__ == "__main__":
