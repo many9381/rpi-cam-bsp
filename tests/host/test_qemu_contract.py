@@ -105,7 +105,9 @@ case "$command" in
     ;;
   'uname -m') printf '%s\\n' "${FAKE_ARCHITECTURE:-aarch64}" ;;
   'cat /etc/rpi5-build-id') printf '%s\\n' "$FAKE_BUILD_ID" ;;
-  'systemctl is-system-running') printf '%s\\n' "${FAKE_SYSTEMD:-running}" ;;
+  'systemctl is-system-running'|'systemctl is-system-running --wait')
+    printf '%s\\n' "${FAKE_SYSTEMD:-running}"
+    ;;
   'systemctl is-active systemd-networkd.service') printf '%s\\n' "${FAKE_NETWORKD:-active}" ;;
   'systemctl is-active sshd.service') printf '%s\\n' "${FAKE_SSHD:-active}" ;;
   *'passwordauthentication'*) printf '%s\\n' "${FAKE_PASSWORD_AUTHENTICATION:-no}" ;;
@@ -536,6 +538,10 @@ while :; do sleep 1; done
         self.assertTrue((evidence / "systemd-failed.log").is_file())
         self.assertTrue((evidence / "journal.log").is_file())
         self.assertTrue((self.control / "powered-off").is_file())
+        self.assertIn(
+            "systemctl is-system-running --wait",
+            self.calls.read_text(encoding="utf-8"),
+        )
 
     def test_guest_failure_never_writes_guest_pass_or_powers_off(self) -> None:
         """Catches marking an invalid guest successful after an assertion failure."""

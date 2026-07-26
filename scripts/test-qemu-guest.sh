@@ -51,7 +51,7 @@ check_exact() {
 
 check_exact architecture aarch64 'uname -m'
 check_exact build_id "$build_id" 'cat /etc/rpi5-build-id'
-check_exact systemd running 'systemctl is-system-running'
+check_exact systemd running 'systemctl is-system-running --wait'
 check_exact networkd active 'systemctl is-active systemd-networkd.service'
 check_exact sshd active 'systemctl is-active sshd.service'
 check_exact password_authentication no "sshd -T | awk '\$1 == \"passwordauthentication\" { print \$2 }'"
