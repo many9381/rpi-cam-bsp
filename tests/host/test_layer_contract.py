@@ -84,10 +84,6 @@ class LayerContractTest(unittest.TestCase):
             recipe,
         )
         self.assertIn(
-            "install -d -m 2755 ${D}${localstatedir}/log/journal",
-            recipe,
-        )
-        self.assertIn(
             "install -d -m 0750 ${D}${sysconfdir}/sudoers.d",
             recipe,
         )
@@ -95,6 +91,16 @@ class LayerContractTest(unittest.TestCase):
             "chmod 0644 ${D}${sysconfdir}/rpi5-build-id",
             recipe,
         )
+
+    def test_device_recipe_leaves_journal_directory_to_systemd(self) -> None:
+        recipe = read(
+            "meta-rpi5-cam/recipes-core/device-config/device-config.bb"
+        )
+        self.assertNotIn(
+            "install -d -m 2755 ${D}${localstatedir}/log/journal",
+            recipe,
+        )
+        self.assertNotIn("${localstatedir}/log/journal", recipe)
 
     def test_device_package_provides_required_runtime_services(self) -> None:
         recipe = read(

@@ -55,7 +55,6 @@ do_install() {
     install -d -m 0755 ${D}${sysconfdir}/systemd/journald.conf.d
     install -m 0644 ${UNPACKDIR}/journald.conf.d-rpi5.conf \
         ${D}${sysconfdir}/systemd/journald.conf.d/20-rpi5.conf
-    install -d -m 2755 ${D}${localstatedir}/log/journal
 
     install -d -m 0750 ${D}${sysconfdir}/sudoers.d
     install -m 0440 ${UNPACKDIR}/rpi5-admin-sudoers \
@@ -72,7 +71,6 @@ FILES:${PN} += " \
     ${sysconfdir}/sudoers.d/rpi5-admin \
     ${sysconfdir}/systemd/journald.conf.d/20-rpi5.conf \
     ${sysconfdir}/systemd/network/20-wired.network \
-    ${localstatedir}/log/journal \
 "
 
 CONFFILES:${PN} = " \
