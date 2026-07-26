@@ -142,6 +142,9 @@ esac
 printf 'uv %s\\n' "$*" >> "$TEST_CALLS"
 if [[ " $* " != *" kas shell "* ]]; then exit 0; fi
 printf '%s\\n' "$$" > "$QEMU_CONTROL/qemu-pid"
+if [[ -n "${FAKE_QEMU_EXIT_IMMEDIATE:-}" ]]; then
+  exit "$FAKE_QEMU_EXIT_IMMEDIATE"
+fi
 child=""
 cleanup() {
   status="$?"
@@ -230,7 +233,11 @@ exit "${FAKE_QEMU_EXIT:-0}"
         )
 
     def _ready_launcher(self) -> None:
-        (self.root / "artifacts" / BUILD_ID / "qemu").mkdir(parents=True, exist_ok=True)
+        images = self.root / "artifacts" / BUILD_ID / "qemu/images"
+        images.mkdir(parents=True, exist_ok=True)
+        (images / "rpi5-minimal-image-qemuarm64.rootfs.ext4").write_bytes(
+            b"rootfs"
+        )
         (self.root / "artifacts" / BUILD_ID / "qemu/COMPLETE").touch()
 
     def _launcher(self, **extra: str) -> subprocess.CompletedProcess[str]:
@@ -654,6 +661,47 @@ while :; do sleep 1; done
         self.assertEqual(final.read_text(encoding="utf-8"), "")
         self.assertFalse(stale.exists())
 
+    def test_launcher_uses_collected_uncompressed_rootfs(self) -> None:
+        """Catches runqemu auto-selecting a compressed rootfs it cannot boot."""
+        self._copy_entrypoints()
+        self._ready_launcher()
+
+        result = self._launcher()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = (
+            self.root
+            / "artifacts"
+            / BUILD_ID
+            / "qemu/images/rpi5-minimal-image-qemuarm64.rootfs.ext4"
+        )
+        launch = (
+            self.root
+            / "artifacts"
+            / BUILD_ID
+            / "qemu-test/launch-command.txt"
+        ).read_text(encoding="utf-8")
+        self.assertIn(str(expected), launch)
+        self.assertNotIn(".ext4.zst", launch)
+
+    def test_launcher_reports_immediate_qemu_exit_without_guest_timeout(self) -> None:
+        """Catches waiting for SSH after the QEMU launcher has already failed."""
+        self._copy_entrypoints()
+        self._ready_launcher()
+        self._install_short_guest_timeout()
+        started = time.monotonic()
+
+        result = self._launcher(
+            FAKE_QEMU_EXIT_IMMEDIATE="42",
+            FAKE_HANG_COMMAND="uname -m",
+        )
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+        self.assertFalse((evidence / "PASS").exists())
+        self.assertFalse((evidence / "guest-PASS").exists())
+
     def test_launcher_failure_paths_do_not_promote_pass_and_terminate_qemu_group(self) -> None:
         """Catches leaked QEMU groups or PASS promotion after guest or QEMU failure."""
         self._copy_entrypoints()
@@ -754,6 +802,11 @@ while :; do sleep 1; done
         (self.root / "artifacts" / build_id / "qemu").mkdir(
             parents=True,
             exist_ok=True,
+        )
+        images = self.root / "artifacts" / build_id / "qemu/images"
+        images.mkdir()
+        (images / "rpi5-minimal-image-qemuarm64.rootfs.ext4").write_bytes(
+            b"rootfs"
         )
         (self.root / "artifacts" / build_id / "qemu/COMPLETE").touch()
         (self.root / "build" / "kas-work" / "build").mkdir(parents=True)
