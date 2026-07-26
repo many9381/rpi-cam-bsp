@@ -137,9 +137,21 @@ fi
         (deploy / "rpi5-minimal-image-qemuarm64.rootfs.manifest").write_text(
             "package-a\\n", encoding="utf-8"
         )
-        licenses = self.root / "build/kas-work/build/qemu/tmp/deploy/licenses/rpi5-minimal-image-qemuarm64"
+        licenses = (
+            self.root
+            / "build/kas-work/build/qemu/tmp/deploy/licenses/qemuarm64/"
+            "rpi5-minimal-image-qemuarm64.rootfs-20260726013314"
+        )
         licenses.mkdir(parents=True)
         (licenses / "LICENSE.manifest").write_text("MIT\\n", encoding="utf-8")
+        license_link = licenses.parent / "rpi5-minimal-image-qemuarm64.rootfs"
+        license_link.symlink_to(licenses.name, target_is_directory=True)
+        stale = (
+            licenses.parent
+            / "rpi5-minimal-image-qemuarm64.rootfs-20260726012334"
+        )
+        stale.mkdir()
+        (stale / "STALE").write_text("old build\n", encoding="utf-8")
         return deploy
 
     def test_parse_uses_profile_specific_locked_kas_environment(self) -> None:
@@ -264,6 +276,20 @@ fi
         metadata = (out / "manifests" / "build-metadata.json").read_text(encoding="utf-8")
         self.assertIn(f'"build_id":"{BUILD_ID}"', metadata)
         self.assertIn(f'"project_revision":"{FULL_REVISION}"', metadata)
+        licenses = out / "licenses"
+        self.assertTrue(
+            (
+                licenses
+                / "rpi5-minimal-image-qemuarm64.rootfs-20260726013314"
+                / "LICENSE.manifest"
+            ).is_file()
+        )
+        self.assertFalse(
+            (
+                licenses
+                / "rpi5-minimal-image-qemuarm64.rootfs-20260726012334"
+            ).exists()
+        )
         self.assertIn("uv args=run --locked kas for-all-repos", self._calls())
         self.assertIn("uv args=run --locked kas --version", self._calls())
 
@@ -287,9 +313,17 @@ fi
         (deploy / f"{image}-raspberrypi5.rootfs.wic.bz2").write_bytes(b"disk")
         (deploy / f"{image}-raspberrypi5.rootfs.wic.bmap").write_text("bmap\n", encoding="utf-8")
         (deploy / f"{image}-raspberrypi5.rootfs.manifest").write_text("package-a\n", encoding="utf-8")
-        licenses = self.root / "build/kas-work/build/rpi5-minimal/tmp/deploy/licenses/rpi5-minimal-image-raspberrypi5"
+        licenses = (
+            self.root
+            / "build/kas-work/build/rpi5-minimal/tmp/deploy/licenses/"
+            "raspberrypi5/rpi5-minimal-image-raspberrypi5.rootfs-20260726012334"
+        )
         licenses.mkdir(parents=True)
         (licenses / "LICENSE.manifest").write_text("MIT\n", encoding="utf-8")
+        (licenses.parent / f"{image}-raspberrypi5.rootfs").symlink_to(
+            licenses.name,
+            target_is_directory=True,
+        )
 
         result = self._run(*self._collector_arguments(profile))
 
@@ -348,7 +382,7 @@ fi
         source_licenses = (
             self.root
             / "build/kas-work/build/qemu/tmp/deploy/licenses/"
-            "rpi5-minimal-image-qemuarm64"
+            "qemuarm64/rpi5-minimal-image-qemuarm64.rootfs-20260726013314"
         )
         (source_licenses / "OBSOLETE").write_text("old\n", encoding="utf-8")
 
@@ -357,7 +391,7 @@ fi
         self.assertNotEqual(first.returncode, 0)
         output_licenses = (
             self.root / "artifacts" / BUILD_ID / "qemu" / "licenses"
-            / "rpi5-minimal-image-qemuarm64"
+            / "rpi5-minimal-image-qemuarm64.rootfs-20260726013314"
         )
         self.assertTrue((output_licenses / "OBSOLETE").is_file())
         self.assertFalse((output_licenses.parent.parent / "COMPLETE").exists())

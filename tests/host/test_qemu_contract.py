@@ -105,9 +105,11 @@ case "$command" in
     ;;
   'uname -m') printf '%s\\n' "${FAKE_ARCHITECTURE:-aarch64}" ;;
   'cat /etc/rpi5-build-id') printf '%s\\n' "$FAKE_BUILD_ID" ;;
-  'systemctl is-system-running') printf '%s\\n' "${FAKE_SYSTEMD:-running}" ;;
+  'systemctl is-system-running'|'systemctl is-system-running --wait')
+    printf '%s\\n' "${FAKE_SYSTEMD:-running}"
+    ;;
   'systemctl is-active systemd-networkd.service') printf '%s\\n' "${FAKE_NETWORKD:-active}" ;;
-  'systemctl is-active sshd.service') printf '%s\\n' "${FAKE_SSHD:-active}" ;;
+  'systemctl is-active sshd.socket') printf '%s\\n' "${FAKE_SSHD:-active}" ;;
   *'passwordauthentication'*) printf '%s\\n' "${FAKE_PASSWORD_AUTHENTICATION:-no}" ;;
   *'kbdinteractiveauthentication'*) printf '%s\\n' "${FAKE_KBD_INTERACTIVE_AUTHENTICATION:-no}" ;;
   *'permitrootlogin'*) printf '%s\\n' "${FAKE_PERMIT_ROOT_LOGIN:-no}" ;;
@@ -142,6 +144,9 @@ esac
 printf 'uv %s\\n' "$*" >> "$TEST_CALLS"
 if [[ " $* " != *" kas shell "* ]]; then exit 0; fi
 printf '%s\\n' "$$" > "$QEMU_CONTROL/qemu-pid"
+if [[ -n "${FAKE_QEMU_EXIT_IMMEDIATE:-}" ]]; then
+  exit "$FAKE_QEMU_EXIT_IMMEDIATE"
+fi
 child=""
 cleanup() {
   status="$?"
@@ -230,7 +235,11 @@ exit "${FAKE_QEMU_EXIT:-0}"
         )
 
     def _ready_launcher(self) -> None:
-        (self.root / "artifacts" / BUILD_ID / "qemu").mkdir(parents=True, exist_ok=True)
+        images = self.root / "artifacts" / BUILD_ID / "qemu/images"
+        images.mkdir(parents=True, exist_ok=True)
+        (images / "rpi5-minimal-image-qemuarm64.rootfs.ext4").write_bytes(
+            b"rootfs"
+        )
         (self.root / "artifacts" / BUILD_ID / "qemu/COMPLETE").touch()
 
     def _launcher(self, **extra: str) -> subprocess.CompletedProcess[str]:
@@ -529,6 +538,14 @@ while :; do sleep 1; done
         self.assertTrue((evidence / "systemd-failed.log").is_file())
         self.assertTrue((evidence / "journal.log").is_file())
         self.assertTrue((self.control / "powered-off").is_file())
+        self.assertIn(
+            "systemctl is-system-running --wait",
+            self.calls.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "systemctl is-active sshd.socket",
+            self.calls.read_text(encoding="utf-8"),
+        )
 
     def test_guest_failure_never_writes_guest_pass_or_powers_off(self) -> None:
         """Catches marking an invalid guest successful after an assertion failure."""
@@ -604,6 +621,7 @@ while :; do sleep 1; done
             "allowusers",
         ):
             self.assertIn(setting, calls)
+        self.assertIn("sudo -n /usr/sbin/sshd -T", calls)
         self.assertIn("passwd -S rpiadmin", calls)
 
     def test_launcher_rejects_uv_override_and_head_mismatch_before_evidence(self) -> None:
@@ -653,6 +671,51 @@ while :; do sleep 1; done
         self.assertTrue(final.is_file())
         self.assertEqual(final.read_text(encoding="utf-8"), "")
         self.assertFalse(stale.exists())
+
+    def test_launcher_uses_disposable_copy_of_collected_uncompressed_rootfs(self) -> None:
+        """Catches QEMU mutating the collected deployment artifact in place."""
+        self._copy_entrypoints()
+        self._ready_launcher()
+
+        result = self._launcher()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = (
+            self.root
+            / "artifacts"
+            / BUILD_ID
+            / "qemu/images/rpi5-minimal-image-qemuarm64.rootfs.ext4"
+        )
+        runtime_dir = self.root / "build/qemu-runtime"
+        launch = (
+            self.root
+            / "artifacts"
+            / BUILD_ID
+            / "qemu-test/launch-command.txt"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(str(expected), launch)
+        self.assertIn(str(runtime_dir), launch)
+        self.assertNotIn(".ext4.zst", launch)
+        self.assertEqual(expected.read_bytes(), b"rootfs")
+        self.assertEqual(list(runtime_dir.glob(f"{BUILD_ID}.*")), [])
+
+    def test_launcher_reports_immediate_qemu_exit_without_guest_timeout(self) -> None:
+        """Catches waiting for SSH after the QEMU launcher has already failed."""
+        self._copy_entrypoints()
+        self._ready_launcher()
+        self._install_short_guest_timeout()
+        started = time.monotonic()
+
+        result = self._launcher(
+            FAKE_QEMU_EXIT_IMMEDIATE="42",
+            FAKE_HANG_COMMAND="uname -m",
+        )
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        evidence = self.root / "artifacts" / BUILD_ID / "qemu-test"
+        self.assertFalse((evidence / "PASS").exists())
+        self.assertFalse((evidence / "guest-PASS").exists())
 
     def test_launcher_failure_paths_do_not_promote_pass_and_terminate_qemu_group(self) -> None:
         """Catches leaked QEMU groups or PASS promotion after guest or QEMU failure."""
@@ -754,6 +817,11 @@ while :; do sleep 1; done
         (self.root / "artifacts" / build_id / "qemu").mkdir(
             parents=True,
             exist_ok=True,
+        )
+        images = self.root / "artifacts" / build_id / "qemu/images"
+        images.mkdir()
+        (images / "rpi5-minimal-image-qemuarm64.rootfs.ext4").write_bytes(
+            b"rootfs"
         )
         (self.root / "artifacts" / build_id / "qemu/COMPLETE").touch()
         (self.root / "build" / "kas-work" / "build").mkdir(parents=True)

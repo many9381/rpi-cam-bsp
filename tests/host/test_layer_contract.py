@@ -16,7 +16,8 @@ class LayerContractTest(unittest.TestCase):
             "meta-rpi5-cam/recipes-core/device-config/device-config.bb"
         )
         self.assertIn("inherit useradd", recipe)
-        self.assertIn("--password '!' rpiadmin", recipe)
+        self.assertIn("--password '*' rpiadmin", recipe)
+        self.assertNotIn("--password '!' rpiadmin", recipe)
         self.assertIn("RPI5_ADMIN_SSH_PUBKEY", recipe)
         self.assertIn("authorized_keys", recipe)
         self.assertIn("RPI5_BUILD_ID", recipe)
@@ -84,10 +85,6 @@ class LayerContractTest(unittest.TestCase):
             recipe,
         )
         self.assertIn(
-            "install -d -m 2755 ${D}${localstatedir}/log/journal",
-            recipe,
-        )
-        self.assertIn(
             "install -d -m 0750 ${D}${sysconfdir}/sudoers.d",
             recipe,
         )
@@ -95,6 +92,16 @@ class LayerContractTest(unittest.TestCase):
             "chmod 0644 ${D}${sysconfdir}/rpi5-build-id",
             recipe,
         )
+
+    def test_device_recipe_leaves_journal_directory_to_systemd(self) -> None:
+        recipe = read(
+            "meta-rpi5-cam/recipes-core/device-config/device-config.bb"
+        )
+        self.assertNotIn(
+            "install -d -m 2755 ${D}${localstatedir}/log/journal",
+            recipe,
+        )
+        self.assertNotIn("${localstatedir}/log/journal", recipe)
 
     def test_device_package_provides_required_runtime_services(self) -> None:
         recipe = read(
@@ -135,8 +142,10 @@ class LayerContractTest(unittest.TestCase):
         self.assertNotIn("ALL=(ALL) NOPASSWD: ALL", sudoers)
         self.assertIn("/usr/bin/systemctl reboot", sudoers)
         self.assertIn("/usr/bin/systemctl poweroff", sudoers)
+        self.assertIn("/usr/sbin/sshd -T", sudoers)
         self.assertIn('/usr/bin/dmesg ""', sudoers)
         self.assertNotRegex(sudoers, r"/usr/bin/dmesg(?:,|$)")
+        self.assertNotRegex(sudoers, r"/usr/sbin/sshd(?:,|$)")
 
 
 if __name__ == "__main__":

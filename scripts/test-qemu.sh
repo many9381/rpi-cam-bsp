@@ -19,6 +19,8 @@ current_revision="$(git -C "$repo_root" rev-parse --short=12 HEAD)"
 key="$repo_root/keys/rpi5_admin"
 rpi5_validate_key_pair "$key"
 rpi5_require_pass "$repo_root/artifacts/$build_id/qemu/COMPLETE" "QEMU build"
+rootfs="$repo_root/artifacts/$build_id/qemu/images/rpi5-minimal-image-qemuarm64.rootfs.ext4"
+[[ -f "$rootfs" ]] || rpi5_die "QEMU rootfs missing: $rootfs"
 
 rpi5_port_2222_listening() {
     local listeners=""
@@ -48,6 +50,8 @@ qemu_pid=""
 qemu_pgid=""
 guest_check_pid=""
 guest_check_pgid=""
+runtime_dir=""
+runtime_rootfs=""
 
 rpi5_wait_process_group_gone() {
     local pgid="$1"
@@ -136,6 +140,12 @@ cleanup() {
             cleanup_failed=1
         fi
     fi
+    if [[ -n "$runtime_rootfs" ]]; then
+        rm -f -- "$runtime_rootfs" || cleanup_failed=1
+    fi
+    if [[ -n "$runtime_dir" ]]; then
+        rmdir -- "$runtime_dir" || cleanup_failed=1
+    fi
     (( cleanup_failed == 0 )) || printf '%s\n' \
         "ERROR: QEMU cleanup could not confirm all processes and port 2222 were gone" >&2
 
@@ -149,11 +159,19 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf '%s\n' "uv run --locked kas shell kas/qemuarm64-minimal.yml -c runqemu qemuarm64 rpi5-minimal-image nographic slirp" \
-    > "$evidence/launch-command.txt"
+runtime_parent="$repo_root/build/qemu-runtime"
+mkdir -p "$runtime_parent"
+runtime_dir="$(mktemp -d "$runtime_parent/$build_id.XXXXXX")"
+runtime_rootfs="$runtime_dir/$(basename "$rootfs")"
+cp --reflink=auto --sparse=always -- "$rootfs" "$runtime_rootfs"
+
+printf -v quoted_rootfs '%q' "$runtime_rootfs"
+runqemu_command="runqemu qemuarm64 $quoted_rootfs nographic slirp"
+printf 'uv run --locked kas shell kas/qemuarm64-minimal.yml -c %q\n' \
+    "$runqemu_command" > "$evidence/launch-command.txt"
 cd "$repo_root"
 setsid uv run --locked kas shell kas/qemuarm64-minimal.yml \
-    -c 'runqemu qemuarm64 rpi5-minimal-image nographic slirp' \
+    -c "$runqemu_command" \
     > "$evidence/console.log" 2>&1 &
 qemu_pid="$!"
 qemu_pgid="$qemu_pid"
@@ -164,18 +182,36 @@ setsid timeout --foreground --kill-after=10s 240s \
     --timeout 180 --key "$key" --evidence-dir "$evidence" &
 guest_check_pid="$!"
 guest_check_pgid="$guest_check_pid"
-wait "$guest_check_pid"
+
+completed_pid=""
+completed_status=0
+wait -n -p completed_pid "$qemu_pid" "$guest_check_pid" || \
+    completed_status=$?
+qemu_status=0
+if [[ "$completed_pid" == "$qemu_pid" ]]; then
+    qemu_status="$completed_status"
+    if [[ ! -f "$evidence/guest-PASS" ]]; then
+        (( qemu_status != 0 )) && exit "$qemu_status"
+        rpi5_die "QEMU exited before guest assertions passed"
+    fi
+    guest_status=0
+    wait "$guest_check_pid" || guest_status=$?
+    (( guest_status == 0 )) || exit "$guest_status"
+else
+    (( completed_status == 0 )) || exit "$completed_status"
+fi
 if ! rpi5_wait_process_group_gone "$guest_check_pgid" 1; then
     rpi5_die "QEMU guest checker left surviving descendants"
 fi
 guest_check_pid=""
 guest_check_pgid=""
 
-rpi5_wait_process_stopped "$qemu_pid" 30 || {
-    rpi5_die "QEMU did not exit within 30 seconds after poweroff"
-}
-qemu_status=0
-wait "$qemu_pid" || qemu_status=$?
+if [[ "$completed_pid" != "$qemu_pid" ]]; then
+    rpi5_wait_process_stopped "$qemu_pid" 30 || {
+        rpi5_die "QEMU did not exit within 30 seconds after poweroff"
+    }
+    wait "$qemu_pid" || qemu_status=$?
+fi
 (( qemu_status == 0 )) || exit "$qemu_status"
 if ! rpi5_wait_process_group_gone "$qemu_pgid" 5; then
     rpi5_die "QEMU left surviving descendants after poweroff"
