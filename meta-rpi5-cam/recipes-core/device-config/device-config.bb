@@ -16,7 +16,7 @@ inherit useradd
 
 USERADD_PACKAGES = "${PN}"
 USERADD_PARAM:${PN} = "--uid 1000 --home-dir /home/rpiadmin \
-    --create-home --shell /bin/sh --user-group --password '!' rpiadmin"
+    --create-home --shell /bin/sh --user-group --password '*' rpiadmin"
 
 RPI5_ADMIN_SSH_PUBKEY ??= ""
 RPI5_BUILD_ID ??= "unversioned"

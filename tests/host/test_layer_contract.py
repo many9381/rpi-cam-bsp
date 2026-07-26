@@ -16,7 +16,8 @@ class LayerContractTest(unittest.TestCase):
             "meta-rpi5-cam/recipes-core/device-config/device-config.bb"
         )
         self.assertIn("inherit useradd", recipe)
-        self.assertIn("--password '!' rpiadmin", recipe)
+        self.assertIn("--password '*' rpiadmin", recipe)
+        self.assertNotIn("--password '!' rpiadmin", recipe)
         self.assertIn("RPI5_ADMIN_SSH_PUBKEY", recipe)
         self.assertIn("authorized_keys", recipe)
         self.assertIn("RPI5_BUILD_ID", recipe)
