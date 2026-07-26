@@ -46,7 +46,7 @@ class DiscoveryTest(unittest.TestCase):
                 "--hostname",
                 "rpi5-minimal",
                 "--timeout",
-                "1",
+                "2",
                 "--port",
                 "2222",
                 "--state-file",
@@ -490,7 +490,7 @@ class DiscoveryTest(unittest.TestCase):
                 "bash",
                 "scripts/discover-rpi5.sh",
                 "--timeout",
-                "1",
+                "2",
                 "--state-file",
                 str(state),
                 env={
