@@ -1,5 +1,8 @@
 import re
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
 from support import REPO_ROOT, read, run
 
@@ -43,6 +46,86 @@ class HostToolsTest(unittest.TestCase):
             "ffprobe",
         ):
             self.assertIn(command, script)
+
+    def test_preflight_rejects_missing_yocto_host_tools(self) -> None:
+        """Catches preflight passing before BitBake rejects its host."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            for command in (
+                "bash",
+                "dirname",
+                "uname",
+                "locale",
+                "realpath",
+                "wc",
+                "git",
+                "tar",
+                "make",
+                "gcc",
+                "python3",
+                "uv",
+                "ssh",
+                "scp",
+                "ssh-keygen",
+                "ssh-keyscan",
+                "ss",
+                "qemu-system-aarch64",
+                "sha256sum",
+                "setsid",
+                "sort",
+                "awk",
+                "grep",
+                "stat",
+                "df",
+                "nproc",
+                "tr",
+                "tee",
+                "bmaptool",
+                "avahi-resolve-host-name",
+                "ping",
+                "lsblk",
+                "findmnt",
+                "blockdev",
+                "partprobe",
+                "udevadm",
+                "mount",
+                "umount",
+                "file",
+                "ffprobe",
+            ):
+                source = shutil.which(command)
+                self.assertIsNotNone(source, command)
+                (fake_bin / command).symlink_to(source)
+
+            key = root / "rpi5_admin"
+            generated = run(
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-f",
+                str(key),
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+
+            result = run(
+                "/usr/bin/bash",
+                "scripts/host-preflight.sh",
+                "--incremental",
+                "--key",
+                str(key),
+                env={"PATH": str(fake_bin)},
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(
+                "required command not found: chrpath",
+                result.stderr,
+            )
 
     def test_preflight_rejects_uv_environment_override_before_uv_commands(
         self,

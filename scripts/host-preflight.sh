@@ -52,7 +52,7 @@ locale -a | grep -Eiq '^en_US\.(utf-?8|UTF-?8)$' || \
     rpi5_die "en_US.UTF-8 locale is required"
 
 required_commands=(
-    git tar make gcc python3 uv
+    git tar make gcc chrpath diffstat python3 uv
     ssh scp ssh-keygen ssh-keyscan ss
     qemu-system-aarch64
     sha256sum setsid sort awk grep stat df nproc tr tee
