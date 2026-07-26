@@ -109,7 +109,7 @@ case "$command" in
     printf '%s\\n' "${FAKE_SYSTEMD:-running}"
     ;;
   'systemctl is-active systemd-networkd.service') printf '%s\\n' "${FAKE_NETWORKD:-active}" ;;
-  'systemctl is-active sshd.service') printf '%s\\n' "${FAKE_SSHD:-active}" ;;
+  'systemctl is-active sshd.socket') printf '%s\\n' "${FAKE_SSHD:-active}" ;;
   *'passwordauthentication'*) printf '%s\\n' "${FAKE_PASSWORD_AUTHENTICATION:-no}" ;;
   *'kbdinteractiveauthentication'*) printf '%s\\n' "${FAKE_KBD_INTERACTIVE_AUTHENTICATION:-no}" ;;
   *'permitrootlogin'*) printf '%s\\n' "${FAKE_PERMIT_ROOT_LOGIN:-no}" ;;
@@ -540,6 +540,10 @@ while :; do sleep 1; done
         self.assertTrue((self.control / "powered-off").is_file())
         self.assertIn(
             "systemctl is-system-running --wait",
+            self.calls.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "systemctl is-active sshd.socket",
             self.calls.read_text(encoding="utf-8"),
         )
 
