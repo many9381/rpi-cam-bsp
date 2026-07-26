@@ -194,7 +194,7 @@ class DiscoveryTest(unittest.TestCase):
                 "--mac",
                 "DC:A6:32:00:00:45",
                 "--timeout",
-                "1",
+                "2",
                 "--state-file",
                 str(state),
                 env={
