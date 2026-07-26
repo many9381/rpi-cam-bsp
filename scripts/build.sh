@@ -53,7 +53,11 @@ if [[ "$action" == "build" && "$profile" == "rpi5-camera" ]]; then
 fi
 
 key_path="$repo_root/keys/rpi5_admin"
-"$repo_root/scripts/host-preflight.sh" --incremental --key "$key_path"
+preflight_args=(--incremental --key "$key_path")
+if [[ "${RPI5_CI_CONTAINER:-0}" == "1" ]]; then
+    preflight_args+=(--container)
+fi
+"$repo_root/scripts/host-preflight.sh" "${preflight_args[@]}"
 
 export RPI5_ADMIN_SSH_PUBKEY
 RPI5_ADMIN_SSH_PUBKEY="$(tr -d '\n' < "${key_path}.pub")"

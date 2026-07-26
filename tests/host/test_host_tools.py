@@ -66,6 +66,20 @@ class HostToolsTest(unittest.TestCase):
             interpreter_check,
         )
 
+    def test_preflight_container_mode_requires_runtime_evidence(self) -> None:
+        """Catches a container mode that can be enabled by an argument alone."""
+        help_result = run("bash", "scripts/host-preflight.sh", "--help")
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--container", help_result.stdout)
+
+        script = read("scripts/host-preflight.sh")
+        self.assertIn("/.dockerenv", script)
+        self.assertIn("/run/.containerenv", script)
+        self.assertIn(
+            "--container requires a real container environment",
+            script,
+        )
+
     def test_scripts_are_valid_bash(self) -> None:
         for path in (
             "scripts/lib/common.sh",

@@ -85,6 +85,7 @@ fi
     def _environment(self, **extra: str) -> dict[str, str]:
         environment = os.environ.copy()
         environment.pop("UV_PROJECT_ENVIRONMENT", None)
+        environment.pop("RPI5_CI_CONTAINER", None)
         environment.update(
             {
                 "PATH": f"{self.fake_bin}:{environment['PATH']}",
@@ -174,6 +175,38 @@ fi
                     f"work={self.root}/build/kas-work "
                     f"build={self.root}/build/kas-work/build/{profile}",
                     calls,
+                )
+
+    def test_ci_container_mode_is_forwarded_only_when_explicitly_enabled(self) -> None:
+        """Catches silently running a CI build with native-host preflight rules."""
+        cases = (
+            ({}, False),
+            ({"RPI5_CI_CONTAINER": "0"}, False),
+            ({"RPI5_CI_CONTAINER": "1"}, True),
+        )
+        for environment, expect_container in cases:
+            with self.subTest(environment=environment):
+                self.calls.unlink(missing_ok=True)
+                result = self._run(
+                    "bash",
+                    "scripts/build.sh",
+                    "--build-id",
+                    BUILD_ID,
+                    "qemu",
+                    "parse",
+                    **environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                preflight_calls = [
+                    line
+                    for line in self._calls().splitlines()
+                    if line.startswith("preflight ")
+                ]
+                self.assertEqual(len(preflight_calls), 1)
+                self.assertEqual(
+                    preflight_calls[0].endswith(" --container"),
+                    expect_container,
+                    preflight_calls[0],
                 )
 
     def test_hardware_gates_block_all_external_work_and_artifact_mutation(self) -> None:
