@@ -41,6 +41,7 @@ local_conf_header:
     CONF_VERSION = "2"
     INIT_MANAGER = "systemd"
     PACKAGE_CLASSES = "package_rpm"
+    FILESYSTEM_PERMS_TABLES:remove = "files/fs-perms-volatile-log.txt"
     DL_DIR = "${TOPDIR}/../downloads"
     SSTATE_DIR = "${TOPDIR}/../sstate-cache"
     BB_DISKMON_DIRS = "\

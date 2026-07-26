@@ -38,6 +38,14 @@ class KasContractTest(unittest.TestCase):
         self.assertIn('SSTATE_DIR = "${TOPDIR}/../sstate-cache"', conf)
         self.assertNotIn("debug-tweaks", conf)
 
+    def test_base_keeps_system_journal_on_persistent_storage(self) -> None:
+        base = load("base.yml")
+        conf = base["local_conf_header"]["base"]
+        self.assertIn(
+            'FILESYSTEM_PERMS_TABLES:remove = "files/fs-perms-volatile-log.txt"',
+            conf,
+        )
+
     def test_qemu_profile_is_hardware_independent(self) -> None:
         data = load("qemuarm64-minimal.yml")
         self.assertEqual(data["machine"], "qemuarm64")
