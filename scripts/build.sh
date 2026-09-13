@@ -4,7 +4,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib/common.sh"
 
 usage() {
-    printf 'Usage: %s --build-id ID {qemu|rpi5-minimal|rpi5-camera} {checkout|layers|parse|build}\n' "$0"
+    printf 'Usage: %s --build-id ID {qemu|rpi5-minimal|rpi5-camera|rpi5-camera-hailo} {checkout|layers|parse|build}\n' "$0"
 }
 
 test -z "${UV_PROJECT_ENVIRONMENT:-}" || \
@@ -32,6 +32,11 @@ case "$profile" in
         machine="raspberrypi5"
         image="rpi5-camera-image"
         ;;
+    rpi5-camera-hailo)
+        config="kas/rpi5-camera-hailo.yml"
+        machine="raspberrypi5"
+        image="rpi5-camera-image"
+        ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -48,7 +53,7 @@ out="$repo_root/artifacts/$build_id/$profile"
 if [[ "$action" == "build" && "$profile" != "qemu" ]]; then
     rpi5_require_pass "$repo_root/artifacts/$build_id/qemu-test/PASS" "QEMU"
 fi
-if [[ "$action" == "build" && "$profile" == "rpi5-camera" ]]; then
+if [[ "$action" == "build" && ( "$profile" == "rpi5-camera" || "$profile" == "rpi5-camera-hailo" ) ]]; then
     rpi5_require_pass "$repo_root/artifacts/$build_id/rpi5-test/PASS" "phase-1 hardware"
 fi
 

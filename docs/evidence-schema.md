@@ -5,7 +5,7 @@ contain console logs, an IP address, a MAC address, a device serial, SSH host
 keys, sample media, a user name, retrieved captures, and a raw journal, so it
 is never committed. A private key or public key is never copied into evidence.
 
-Only `artifacts/releases/BUILD_ID.json` may be committed. Schema version 1 has
+The default profile may commit `artifacts/releases/BUILD_ID.json`. Schema version 1 has
 this logical structure:
 
 ```json
@@ -48,3 +48,18 @@ build ID exists and both image metadata records match the current full project
 revision. Exact external source revisions must match the kas lock and collected
 layer revisions. Image checksum files and raw evidence remain in controlled
 external storage under the [artifact retention policy](../artifacts/README.md).
+
+## Optional Hailo image
+
+`release_summary.py --profile rpi5-camera-hailo` writes
+`artifacts/releases/BUILD_ID-rpi5-camera-hailo.json` using schema version 2.
+It preserves the same sanitized fields and `images.rpi5_camera` checksum slot,
+and adds `camera_profile: "rpi5-camera-hailo"` plus
+`validation.hailo_inference: "NOT_TESTED"`. Camera capture acceptance does not
+certify AI inference. The selected variant must have its own image/flash
+markers and `camera-hailo-test/` results; `camera-test/PASS` is never reused.
+The Hailo capture result must identify its profile explicitly.
+
+Only these two sanitized release filename forms may be committed. All raw
+Hailo diagnostics, model inputs, device identifiers and source/build logs obey
+the same private evidence policy as the default profile.

@@ -24,6 +24,7 @@ class RepositoryContractTest(unittest.TestCase):
             "artifacts/releases/*",
             "!artifacts/releases/*.json",
             ".state/",
+            "/rpi-cam-hailo/",
             "bitbake/",
             "openembedded-core/",
             "meta-yocto/",

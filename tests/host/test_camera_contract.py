@@ -40,6 +40,7 @@ class CameraAcceptanceContractTest(unittest.TestCase):
         for option in (
             "--build-id",
             "--host",
+            "--profile",
             "--hostname",
             "--port",
             "--key",
@@ -204,7 +205,9 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
             check=False,
         )
 
-    def _acceptance(self, build_id: str = BUILD_ID) -> subprocess.CompletedProcess[str]:
+    def _acceptance(
+        self, build_id: str = BUILD_ID, profile: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return self._run(
             "bash",
             "scripts/test-camera.sh",
@@ -213,6 +216,7 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
             "--host",
             "192.0.2.20",
             "--wide-label-confirmed",
+            *(("--profile", profile) if profile is not None else ()),
         )
 
     def _marker(self, relative: str) -> Path:
@@ -221,18 +225,19 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
         marker.touch()
         return marker
 
-    def _ready_prerequisites(self) -> None:
+    def _ready_prerequisites(self, profile: str = "rpi5-camera") -> None:
         for relative in (
             "qemu-test/PASS",
             "rpi5-test/PASS",
-            "rpi5-camera/COMPLETE",
-            "flash/rpi5-camera-PASS",
+            f"{profile}/COMPLETE",
+            f"flash/{profile}-PASS",
         ):
             self._marker(relative)
 
-    def _reset_runtime(self) -> tuple[Path, Path]:
+    def _reset_runtime(self, profile: str = "rpi5-camera") -> tuple[Path, Path]:
         control = self.root / "control"
-        evidence = self.root / "artifacts" / BUILD_ID / "camera-test"
+        evidence_name = "camera-hailo-test" if profile == "rpi5-camera-hailo" else "camera-test"
+        evidence = self.root / "artifacts" / BUILD_ID / evidence_name
         shutil.rmtree(control, ignore_errors=True)
         shutil.rmtree(evidence, ignore_errors=True)
         control.mkdir()
@@ -241,13 +246,15 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
 
     def _run_ready_acceptance(
         self,
+        profile: str | None = None,
         **extra: str,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
-        control, evidence = self._reset_runtime()
+        control, evidence = self._reset_runtime(profile or "rpi5-camera")
         environment = {
             "CAMERA_CONTROL": str(control),
             "CAMERA_EVIDENCE": str(evidence),
             "FAKE_BUILD_ID": BUILD_ID,
+            "FAKE_PROFILE": profile or "rpi5-camera",
             "FAKE_SAMPLE_SHA": SAMPLE_SHA256,
         }
         environment.update(extra)
@@ -259,6 +266,7 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
             "--host",
             "192.0.2.20",
             "--wide-label-confirmed",
+            *(("--profile", profile) if profile is not None else ()),
             **environment,
         )
         return result, control, evidence
@@ -292,6 +300,15 @@ case "$command" in
   true) exit 0 ;;
   'cat /etc/rpi5-build-id')
     printf '%s\n' "${FAKE_REMOTE_BUILD_ID:-$FAKE_BUILD_ID}"
+    ;;
+  'cat /etc/rpi5-camera-profile')
+    remote_profile="${FAKE_REMOTE_PROFILE-$FAKE_PROFILE}"
+    if [[ "${FAKE_CHANGE_REMOTE_PROFILE:-0}" == "1" &&
+          -f "$CAMERA_CONTROL/boot-index" &&
+          "$(<"$CAMERA_CONTROL/boot-index")" -gt 0 ]]; then
+      remote_profile='rpi5-camera'
+    fi
+    printf '%s\n' "$remote_profile"
     ;;
   'systemctl is-system-running --wait')
     printf '%s\n' "${FAKE_SYSTEMD:-running}"
@@ -456,6 +473,77 @@ printf '%s\n' "${FAKE_DISCOVERED_HOST:-192.0.2.21}"
             "diagnostic-media-topology.log",
         ):
             self.assertTrue((evidence / diagnostic).is_file(), diagnostic)
+
+    def test_hailo_capture_uses_separate_evidence_and_records_profile(self) -> None:
+        """Catches Hailo capture overwriting or consuming normal camera PASS."""
+        self._ready_prerequisites("rpi5-camera-hailo")
+        self._install_success_commands()
+        standard_pass = self._marker("camera-test/PASS")
+        standard_pass.write_text("standard accepted\n", encoding="utf-8")
+
+        result, _, evidence = self._run_ready_acceptance(profile="rpi5-camera-hailo")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(evidence.name, "camera-hailo-test")
+        self.assertTrue((evidence / "PASS").is_file())
+        self.assertEqual(standard_pass.read_text(encoding="utf-8"), "standard accepted\n")
+        summary = json.loads((evidence / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["profile"], "rpi5-camera-hailo")
+        self.assertEqual(summary["result"], "PASS")
+        self.assertNotIn("hailo_inference", summary)
+
+        repeated = self._acceptance(profile="rpi5-camera-hailo")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("camera PASS already exists", repeated.stderr)
+
+    def test_hailo_profile_requires_its_own_build_and_flash(self) -> None:
+        """Catches normal camera markers being accepted for the variant."""
+        self._ready_prerequisites()
+        for marker, expected in (
+            ("rpi5-camera-hailo/COMPLETE", "camera image PASS marker missing"),
+            ("flash/rpi5-camera-hailo-PASS", "camera flash PASS marker missing"),
+        ):
+            result = self._acceptance(profile="rpi5-camera-hailo")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(expected, result.stderr)
+            self.assertFalse(self.calls.exists())
+            self.assertFalse((self.root / "artifacts" / BUILD_ID / "camera-hailo-test").exists())
+            self._marker(marker)
+
+    def test_unknown_camera_profile_stops_before_network(self) -> None:
+        """Catches unknown profiles falling through to standard evidence."""
+        result = self._acceptance(profile="rpi5-minimal")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid camera profile", result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_capture_rejects_wrong_or_absent_booted_profile(self) -> None:
+        """Catches camera images with a shared build ID attesting another profile."""
+        self._install_success_commands()
+        for selected_profile, remote_profile in (
+            ("rpi5-camera-hailo", "rpi5-camera"),
+            ("rpi5-camera", "rpi5-camera-hailo"),
+            ("rpi5-camera-hailo", ""),
+        ):
+            with self.subTest(selected=selected_profile, remote=remote_profile):
+                self._ready_prerequisites(selected_profile)
+                result, _, evidence = self._run_ready_acceptance(
+                    profile=selected_profile, FAKE_REMOTE_PROFILE=remote_profile,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("camera image profile mismatch", result.stderr)
+                self.assertFalse((evidence / "PASS").exists())
+
+    def test_hailo_capture_rechecks_booted_profile_after_reboot(self) -> None:
+        """Catches recovery into a different profile with the same build ID."""
+        self._ready_prerequisites("rpi5-camera-hailo")
+        self._install_success_commands()
+        result, _, evidence = self._run_ready_acceptance(
+            profile="rpi5-camera-hailo", FAKE_CHANGE_REMOTE_PROFILE="1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("camera image profile mismatch", result.stderr)
+        self.assertFalse((evidence / "PASS").exists())
 
     def test_failed_camera_invariant_is_fail_closed_with_diagnostics(self) -> None:
         """Catches unsafe promotion when a required camera invariant is false."""

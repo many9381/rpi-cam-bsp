@@ -1,0 +1,33 @@
+From: Camera Firmware Maintainers <maintainers@example.invalid>
+Subject: [PATCH] Select Raspberry Pi compatibility from the target kernel
+
+The build host's uname does not describe the target. Use the kernel's
+CONFIG_ARCH_BCM2835 instead for the Raspberry Pi compatibility backport.
+
+The public standalone driver stores its shared headers alongside its common
+sources, rather than in the internal monorepo's common/include directory.
+
+Upstream-Status: Inappropriate [Yocto cross compilation]
+
+diff --git a/linux/pcie/Kbuild b/linux/pcie/Kbuild
+--- a/linux/pcie/Kbuild
++++ b/linux/pcie/Kbuild
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ COMMON_SRC_DIRECTORY=../../common
+-COMMON_INCLUDE_DIRECTORY=../../../../common/include
++COMMON_INCLUDE_DIRECTORY=../../common
+ VDMA_SRC_DIRECTORY=../vdma
+ UTILS_SRC_DIRECTORY=../utils
+ BASE_INCLUDE_DIRECTORY=..
+@@ -34,8 +34,7 @@ ccflags-y      += -I$(src)/$(BASE_INCLUDE_DIRECTORY)
+ 
+ clean-files := $(hailo_pci-objs)
+ 
+-UNAME_STR=$(shell uname -a)
+-ifneq (,$(findstring raspi, $(UNAME_STR)))
++ifeq ($(CONFIG_ARCH_BCM2835),y)
+     ccflags-y      += -DHAILO_RASBERRY_PIE
+ endif
+ 

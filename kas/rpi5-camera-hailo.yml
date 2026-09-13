@@ -1,0 +1,10 @@
+header:
+  version: 19
+  includes:
+    - kas/rpi5-camera.yml
+
+local_conf_header:
+  rpi5-camera-hailo: |
+    RPI5_CAMERA_PROFILE:pn-rpi5-camera-image = "rpi5-camera-hailo"
+    PACKAGECONFIG:append:pn-camera-firmware = " hailo"
+    IMAGE_INSTALL:append:pn-rpi5-camera-image = " packagegroup-camera-firmware-hailo"

@@ -74,6 +74,7 @@ class KasContractTest(unittest.TestCase):
             'RASPBERRYPI_CAMERA_V3 = "1"',
             'PACKAGECONFIG:append:pn-libcamera-apps = " libav"',
             'PACKAGECONFIG:append:pn-rpidistro-ffmpeg = " x264"',
+            'PACKAGECONFIG:append:pn-gstreamer1.0-plugins-bad = " srtp"',
             'LICENSE_FLAGS_ACCEPTED += " commercial"',
         ):
             self.assertIn(required, conf)

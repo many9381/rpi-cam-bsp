@@ -34,6 +34,11 @@ case "$profile" in
         expected_machine="raspberrypi5"
         expected_image="rpi5-camera-image"
         ;;
+    rpi5-camera-hailo)
+        expected_config="kas/rpi5-camera-hailo.yml"
+        expected_machine="raspberrypi5"
+        expected_image="rpi5-camera-image"
+        ;;
     *) rpi5_die "unknown profile: $profile" ;;
 esac
 [[ "$config" == "$expected_config" && "$machine" == "$expected_machine" && \
@@ -68,7 +73,7 @@ case "$profile" in
         copy_required "$deploy/$image-$machine.rootfs.ext4"
         copy_required "$deploy/Image"
         ;;
-    rpi5-minimal|rpi5-camera)
+    rpi5-minimal|rpi5-camera|rpi5-camera-hailo)
         copy_required "$deploy/$image-$machine.rootfs.wic.bz2"
         copy_required "$deploy/$image-$machine.rootfs.wic.bmap"
         ;;

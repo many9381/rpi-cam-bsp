@@ -25,12 +25,18 @@ EXPECTED_IMAGES = {
     "rpi5-minimal": "rpi5-minimal-image-raspberrypi5.rootfs.wic.bz2",
     "rpi5-camera": "rpi5-camera-image-raspberrypi5.rootfs.wic.bz2",
 }
-REQUIRED_MARKERS = (
+CAMERA_EVIDENCE = {
+    "rpi5-camera": "camera-test",
+    "rpi5-camera-hailo": "camera-hailo-test",
+}
+COMMON_REQUIRED_MARKERS = (
     "qemu/COMPLETE",
     "qemu-test/PASS",
     "rpi5-minimal/COMPLETE",
     "flash/rpi5-minimal-PASS",
     "rpi5-test/PASS",
+)
+REQUIRED_MARKERS = COMMON_REQUIRED_MARKERS + (
     "rpi5-camera/COMPLETE",
     "flash/rpi5-camera-PASS",
     "camera-test/PASS",
@@ -182,9 +188,14 @@ def validate_metadata(
         raise ValueError(f"{profile} build ID mismatch")
     if metadata.get("project_revision") != project_revision:
         raise ValueError(f"{profile} project revision mismatch")
+    if (
+        profile in CAMERA_EVIDENCE
+        and metadata.get("profile", "rpi5-camera") != profile
+    ):
+        raise ValueError(f"{profile} build metadata profile mismatch")
 
 
-def validate_results(base: Path, build_id: str) -> None:
+def validate_results(base: Path, build_id: str, profile: str) -> None:
     rpi_result = load_json(
         base / "rpi5-test/result.json",
         "Raspberry Pi acceptance result",
@@ -198,7 +209,7 @@ def validate_results(base: Path, build_id: str) -> None:
         raise ValueError("exactly three Raspberry Pi reboots are required")
 
     camera_result = load_json(
-        base / "camera-test/result.json",
+        base / CAMERA_EVIDENCE[profile] / "result.json",
         "camera acceptance result",
     )
     if (
@@ -206,6 +217,9 @@ def validate_results(base: Path, build_id: str) -> None:
         or camera_result.get("result") != "PASS"
     ):
         raise ValueError("camera result mismatch")
+    # Older standard capture evidence predates explicit profile recording.
+    if camera_result.get("profile", "rpi5-camera") != profile:
+        raise ValueError("camera profile mismatch")
     if camera_result.get("sensor") != "imx708":
         raise ValueError("camera sensor is not IMX708")
     if camera_result.get("lens_variant") != "wide-operator-verified":
@@ -219,34 +233,43 @@ def build_record(
     build_id: str,
     project_revision: str,
     completed_at: str,
+    profile: str = "rpi5-camera",
 ) -> dict[str, Any]:
+    if profile not in CAMERA_EVIDENCE:
+        raise ValueError("invalid camera profile")
     validate_identity(build_id, project_revision, completed_at)
     base = root / "artifacts" / build_id
 
-    for marker in REQUIRED_MARKERS:
+    markers = (
+        *COMMON_REQUIRED_MARKERS,
+        f"{profile}/COMPLETE",
+        f"flash/{profile}-PASS",
+        f"{CAMERA_EVIDENCE[profile]}/PASS",
+    )
+    for marker in markers:
         require_regular_file(base / marker, f"required marker {marker}")
 
-    for profile in EXPECTED_IMAGES:
-        validate_metadata(base, profile, build_id, project_revision)
+    for image_profile in ("rpi5-minimal", profile):
+        validate_metadata(base, image_profile, build_id, project_revision)
 
     pins = load_pins(root)
     revisions = load_revisions(
-        base / "rpi5-camera/manifests/layer-revisions.txt"
+        base / profile / "manifests/layer-revisions.txt"
     )
     if revisions != pins:
         raise ValueError("source revisions do not exactly match the kas lock")
 
-    validate_results(base, build_id)
+    validate_results(base, build_id, profile)
     minimal_checksum = image_checksum(
         base / "rpi5-minimal/checksums/SHA256SUMS",
         EXPECTED_IMAGES["rpi5-minimal"],
     )
     camera_checksum = image_checksum(
-        base / "rpi5-camera/checksums/SHA256SUMS",
+        base / profile / "checksums/SHA256SUMS",
         EXPECTED_IMAGES["rpi5-camera"],
     )
 
-    return {
+    record = {
         "schema_version": 1,
         "build_id": build_id,
         "project_revision": project_revision,
@@ -269,6 +292,11 @@ def build_record(
         },
         "validation_completed_at": completed_at,
     }
+    if profile == "rpi5-camera-hailo":
+        record["schema_version"] = 2
+        record["camera_profile"] = profile
+        record["validation"]["hailo_inference"] = "NOT_TESTED"
+    return record
 
 
 def write_record(output: Path, record: dict[str, Any]) -> None:
@@ -288,6 +316,7 @@ def main() -> int:
         description="Generate a sanitized Raspberry Pi 5 release evidence record."
     )
     parser.add_argument("--build-id", required=True)
+    parser.add_argument("--profile", choices=tuple(CAMERA_EVIDENCE), default="rpi5-camera")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -322,9 +351,11 @@ def main() -> int:
             args.build_id,
             project_revision,
             completed_at,
+            profile=args.profile,
         )
+        suffix = "" if args.profile == "rpi5-camera" else f"-{args.profile}"
         output = (
-            root / "artifacts/releases" / f"{args.build_id}.json"
+            root / "artifacts/releases" / f"{args.build_id}{suffix}.json"
         )
         write_record(output, record)
     except FileExistsError as error:

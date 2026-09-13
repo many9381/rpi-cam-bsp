@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import hashlib
 import os
 from pathlib import Path
@@ -121,7 +122,7 @@ fi
         else:
             machine, image, config = (
                 "raspberrypi5",
-                f"rpi5-{'camera' if profile == 'rpi5-camera' else 'minimal'}-image",
+                "rpi5-camera-image" if profile in ("rpi5-camera", "rpi5-camera-hailo") else "rpi5-minimal-image",
                 f"kas/{profile}.yml",
             )
         return (
@@ -161,6 +162,7 @@ fi
             "qemu": "kas/qemuarm64-minimal.yml",
             "rpi5-minimal": "kas/rpi5-minimal.yml",
             "rpi5-camera": "kas/rpi5-camera.yml",
+            "rpi5-camera-hailo": "kas/rpi5-camera-hailo.yml",
         }
         for profile, config in expected.items():
             with self.subTest(profile=profile):
@@ -214,6 +216,7 @@ fi
         cases = (
             ("rpi5-minimal", "QEMU PASS marker missing"),
             ("rpi5-camera", "phase-1 hardware PASS marker missing"),
+            ("rpi5-camera-hailo", "phase-1 hardware PASS marker missing"),
         )
         (self.root / "artifacts" / BUILD_ID / "qemu-test").mkdir(parents=True)
         (self.root / "artifacts" / BUILD_ID / "qemu-test" / "PASS").touch()
@@ -339,32 +342,38 @@ fi
 
     def test_collector_preserves_hardware_disk_image_and_bmap(self) -> None:
         """Catches collecting a hardware build without its flash image or bmap."""
-        profile = "rpi5-minimal"
-        image = "rpi5-minimal-image"
-        deploy = self.root / "build/kas-work/build/rpi5-minimal/tmp/deploy/images/raspberrypi5"
-        deploy.mkdir(parents=True)
-        (deploy / f"{image}-raspberrypi5.rootfs.wic.bz2").write_bytes(b"disk")
-        (deploy / f"{image}-raspberrypi5.rootfs.wic.bmap").write_text("bmap\n", encoding="utf-8")
-        (deploy / f"{image}-raspberrypi5.rootfs.manifest").write_text("package-a\n", encoding="utf-8")
-        licenses = (
-            self.root
-            / "build/kas-work/build/rpi5-minimal/tmp/deploy/licenses/"
-            "raspberrypi5/rpi5-minimal-image-raspberrypi5.rootfs-20260726012334"
-        )
-        licenses.mkdir(parents=True)
-        (licenses / "LICENSE.manifest").write_text("MIT\n", encoding="utf-8")
-        (licenses.parent / f"{image}-raspberrypi5.rootfs").symlink_to(
-            licenses.name,
-            target_is_directory=True,
-        )
+        for profile, image in (
+            ("rpi5-minimal", "rpi5-minimal-image"),
+            ("rpi5-camera", "rpi5-camera-image"),
+            ("rpi5-camera-hailo", "rpi5-camera-image"),
+        ):
+            with self.subTest(profile=profile):
+                build = self.root / "build/kas-work/build" / profile
+                deploy = build / "tmp/deploy/images/raspberrypi5"
+                deploy.mkdir(parents=True)
+                (deploy / f"{image}-raspberrypi5.rootfs.wic.bz2").write_bytes(b"disk")
+                (deploy / f"{image}-raspberrypi5.rootfs.wic.bmap").write_text("bmap\n", encoding="utf-8")
+                (deploy / f"{image}-raspberrypi5.rootfs.manifest").write_text("package-a\n", encoding="utf-8")
+                licenses = (
+                    build / "tmp/deploy/licenses/raspberrypi5"
+                    / f"{image}-raspberrypi5.rootfs-20260726012334"
+                )
+                licenses.mkdir(parents=True)
+                (licenses / "LICENSE.manifest").write_text("MIT\n", encoding="utf-8")
+                (licenses.parent / f"{image}-raspberrypi5.rootfs").symlink_to(
+                    licenses.name, target_is_directory=True,
+                )
 
-        result = self._run(*self._collector_arguments(profile))
+                result = self._run(*self._collector_arguments(profile))
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        out = self.root / "artifacts" / BUILD_ID / profile / "images"
-        self.assertEqual((out / f"{image}-raspberrypi5.rootfs.wic.bz2").read_bytes(), b"disk")
-        self.assertEqual((out / f"{image}-raspberrypi5.rootfs.wic.bmap").read_text(encoding="utf-8"), "bmap\n")
-        self.assertTrue((out.parent / "COMPLETE").is_file())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                out = self.root / "artifacts" / BUILD_ID / profile / "images"
+                self.assertEqual((out / f"{image}-raspberrypi5.rootfs.wic.bz2").read_bytes(), b"disk")
+                self.assertEqual((out / f"{image}-raspberrypi5.rootfs.wic.bmap").read_text(encoding="utf-8"), "bmap\n")
+                self.assertTrue((out.parent / "COMPLETE").is_file())
+                metadata = json.loads((out.parent / "manifests/build-metadata.json").read_text(encoding="utf-8"))
+                self.assertEqual(metadata["profile"], profile)
+                self.assertEqual(metadata["image"], image)
 
     def test_failed_build_log_sink_prevents_collection_and_completion(self) -> None:
         """Catches ignoring tee failures after a successful kas build command."""

@@ -1,4 +1,5 @@
 .worktrees/
+/rpi-cam-hailo/
 
 # Worktree-local uv project environment.
 .venv/

@@ -5,7 +5,7 @@ source "$(dirname "$0")/lib/common.sh"
 source "$(dirname "$0")/lib/remote.sh"
 
 usage() {
-    printf 'Usage: %s --build-id ID --host IP --wide-label-confirmed [--hostname NAME] [--port PORT] [--key PATH] [--lease-file PATH] [--mac MAC]\n' "$0"
+    printf 'Usage: %s --build-id ID --host IP --wide-label-confirmed [--profile {rpi5-camera|rpi5-camera-hailo}] [--hostname NAME] [--port PORT] [--key PATH] [--lease-file PATH] [--mac MAC]\n' "$0"
 }
 
 require_option_value() {
@@ -43,6 +43,7 @@ valid_hostname() {
 
 repo_root="$(rpi5_repo_root)"
 build_id=""
+profile="rpi5-camera"
 host=""
 hostname="rpi5-camera"
 port="22"
@@ -61,6 +62,11 @@ while [[ $# -gt 0 ]]; do
         --host)
             require_option_value "$@"
             host="$2"
+            shift 2
+            ;;
+        --profile)
+            require_option_value "$@"
+            profile="$2"
             shift 2
             ;;
         --wide-label-confirmed)
@@ -104,6 +110,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 rpi5_validate_build_id "$build_id" || rpi5_die "invalid build ID"
+case "$profile" in
+    rpi5-camera) evidence_name="camera-test" ;;
+    rpi5-camera-hailo) evidence_name="camera-hailo-test" ;;
+    *) rpi5_die "invalid camera profile" ;;
+esac
 valid_ipv4 "$host" || rpi5_die "invalid initial host"
 valid_hostname "$hostname" || rpi5_die "invalid hostname"
 [[ "$port" =~ ^[1-9][0-9]*$ ]] || rpi5_die "invalid SSH port"
@@ -126,11 +137,11 @@ rpi5_require_pass "$repo_root/artifacts/$build_id/qemu-test/PASS" "QEMU"
 rpi5_require_pass \
     "$repo_root/artifacts/$build_id/rpi5-test/PASS" "phase-1 hardware"
 rpi5_require_pass \
-    "$repo_root/artifacts/$build_id/rpi5-camera/COMPLETE" "camera image"
+    "$repo_root/artifacts/$build_id/$profile/COMPLETE" "camera image"
 rpi5_require_pass \
-    "$repo_root/artifacts/$build_id/flash/rpi5-camera-PASS" "camera flash"
+    "$repo_root/artifacts/$build_id/flash/$profile-PASS" "camera flash"
 
-evidence="$repo_root/artifacts/$build_id/camera-test"
+evidence="$repo_root/artifacts/$build_id/$evidence_name"
 [[ ! -e "$evidence/PASS" ]] || rpi5_die "camera PASS already exists"
 mkdir -p "$evidence/samples"
 : > "$evidence/samples/SHA256SUMS"
@@ -178,6 +189,7 @@ connect_current_host() {
     local transport=""
     local root_uuid=""
     local remote_build_id=""
+    local remote_profile=""
     local system_state=""
 
     rpi5_remote_init "$host" "$port" "$key" "$known_hosts"
@@ -188,6 +200,9 @@ connect_current_host() {
     remote_build_id="$(rpi5_remote 'cat /etc/rpi5-build-id')"
     [[ "$remote_build_id" == "$build_id" ]] ||
         rpi5_die "camera image build ID mismatch"
+    remote_profile="$(rpi5_remote 'cat /etc/rpi5-camera-profile')"
+    [[ "$remote_profile" == "$profile" ]] ||
+        rpi5_die "camera image profile mismatch"
     system_state="$(rpi5_remote 'systemctl is-system-running --wait')"
     [[ "$system_state" == "running" ]] ||
         rpi5_die "camera image systemd is not running"
@@ -380,9 +395,9 @@ check_thermal post-reboot
 
 collect_camera_diagnostics
 result_temporary="$evidence/result.json.tmp"
-printf '{"build_id":"%s","sensor":"imx708","lens_variant":"wide-operator-verified","jpeg":"PASS","h264":"libx264-1920x1080-30fps","reboot_capture":"PASS","result":"PASS"}\n' \
-    "$build_id" > "$result_temporary"
+printf '{"build_id":"%s","profile":"%s","sensor":"imx708","lens_variant":"wide-operator-verified","jpeg":"PASS","h264":"libx264-1920x1080-30fps","reboot_capture":"PASS","result":"PASS"}\n' \
+    "$build_id" "$profile" > "$result_temporary"
 mv -f -- "$result_temporary" "$evidence/result.json"
 touch "$evidence/PASS"
 trap - EXIT
-printf 'PASS camera build_id=%s sensor=imx708 host=%s\n' "$build_id" "$host"
+printf 'PASS camera build_id=%s profile=%s sensor=imx708 host=%s\n' "$build_id" "$profile" "$host"

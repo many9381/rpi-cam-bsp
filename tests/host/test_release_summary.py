@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from support import REPO_ROOT
 
@@ -366,6 +368,147 @@ class ReleaseSummaryTest(unittest.TestCase):
                 json.loads(output.read_text(encoding="utf-8")),
                 record,
             )
+
+    def hailo_fixture(self, root: Path) -> None:
+        self.fixture(root)
+        base = root / "artifacts" / BUILD_ID
+        shutil.copytree(base / "rpi5-camera", base / "rpi5-camera-hailo")
+        metadata_path = base / "rpi5-camera-hailo/manifests/build-metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["profile"] = "rpi5-camera-hailo"
+        self.write_json(metadata_path, metadata)
+        (base / "flash/rpi5-camera-hailo-PASS").touch()
+        shutil.copytree(base / "camera-test", base / "camera-hailo-test")
+        result_path = base / "camera-hailo-test/result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["profile"] = "rpi5-camera-hailo"
+        self.write_json(result_path, result)
+
+    def build_hailo(self, root: Path) -> dict[str, object]:
+        return release_summary.build_record(
+            root, BUILD_ID, REVISION, COMPLETED_AT,
+            profile="rpi5-camera-hailo",
+        )
+
+    def test_hailo_record_uses_selected_artifacts_and_bounds_validation(self) -> None:
+        """Catches a variant release consuming standard artifacts or claiming inference."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.hailo_fixture(root)
+            base = root / "artifacts" / BUILD_ID
+            shutil.rmtree(base / "rpi5-camera")
+            shutil.rmtree(base / "camera-test")
+            (base / "flash/rpi5-camera-PASS").unlink()
+            sums = base / "rpi5-camera-hailo/checksums/SHA256SUMS"
+            sums.write_text(f"{'d' * 64}  images/{CAMERA_IMAGE}\n", encoding="utf-8")
+
+            record = self.build_hailo(root)
+
+            expected = self.expected_record()
+            expected["schema_version"] = 2
+            expected["camera_profile"] = "rpi5-camera-hailo"
+            expected["images"]["rpi5_camera"]["sha256"] = "d" * 64
+            expected["validation"]["hailo_inference"] = "NOT_TESTED"
+            self.assertEqual(record, expected)
+
+    def test_hailo_release_rejects_standard_camera_gate_substitution(self) -> None:
+        """Catches shared camera markers attesting the optional Hailo variant."""
+        for relative in (
+            "rpi5-camera-hailo/COMPLETE",
+            "flash/rpi5-camera-hailo-PASS",
+            "camera-hailo-test/PASS",
+        ):
+            with self.subTest(marker=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.hailo_fixture(root)
+                (root / "artifacts" / BUILD_ID / relative).unlink()
+                with self.assertRaisesRegex(ValueError, "required marker"):
+                    self.build_hailo(root)
+
+    def test_hailo_release_rejects_capture_result_without_matching_profile(self) -> None:
+        """Catches a standard capture result copied into the variant directory."""
+        for profile in (None, "rpi5-camera"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.hailo_fixture(root)
+                result_path = root / "artifacts" / BUILD_ID / "camera-hailo-test/result.json"
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                if profile is None:
+                    result.pop("profile")
+                else:
+                    result["profile"] = profile
+                self.write_json(result_path, result)
+                with self.assertRaisesRegex(ValueError, "camera profile"):
+                    self.build_hailo(root)
+
+    def test_hailo_release_rejects_metadata_without_matching_profile(self) -> None:
+        """Catches normal image metadata copied into the Hailo directory."""
+        for profile in (None, "rpi5-camera"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.hailo_fixture(root)
+                metadata_path = root / "artifacts" / BUILD_ID / "rpi5-camera-hailo/manifests/build-metadata.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if profile is None:
+                    metadata.pop("profile")
+                else:
+                    metadata["profile"] = profile
+                self.write_json(metadata_path, metadata)
+                with self.assertRaisesRegex(ValueError, "profile"):
+                    self.build_hailo(root)
+
+    def test_standard_release_rejects_explicit_metadata_profile_mismatch(self) -> None:
+        """Catches Hailo metadata attesting a standard camera release."""
+        for profile in ("rpi5-camera-hailo", "rpi5-minimal", None, ""):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.fixture(root)
+                metadata_path = (
+                    root / "artifacts" / BUILD_ID
+                    / "rpi5-camera/manifests/build-metadata.json"
+                )
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["profile"] = profile
+                self.write_json(metadata_path, metadata)
+
+                with self.assertRaisesRegex(ValueError, "profile"):
+                    self.build(root)
+
+    def test_release_cli_preserves_normal_output_and_separates_variant_output(self) -> None:
+        """Catches variant summaries colliding with an existing normal release record."""
+        for profile, filename in (
+            (None, f"{BUILD_ID}.json"),
+            ("rpi5-camera-hailo", f"{BUILD_ID}-rpi5-camera-hailo.json"),
+        ):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.hailo_fixture(root)
+                arguments = ["release_summary.py", "--build-id", BUILD_ID]
+                if profile is not None:
+                    arguments += ["--profile", profile]
+                with (
+                    patch.object(sys, "argv", arguments),
+                    patch.object(release_summary, "__file__", str(root / "scripts/release_summary.py")),
+                    patch.object(release_summary.subprocess, "run", side_effect=[
+                        type("Result", (), {"stdout": ""})(),
+                        type("Result", (), {"stdout": REVISION})(),
+                    ]),
+                    patch("builtins.print"),
+                ):
+                    self.assertEqual(release_summary.main(), 0)
+                output = root / "artifacts/releases" / filename
+                self.assertTrue(output.is_file())
+                record = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(record["schema_version"], 2 if profile else 1)
+
+    def test_unknown_release_profile_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            with self.assertRaisesRegex(ValueError, "camera profile"):
+                release_summary.build_record(
+                    root, BUILD_ID, REVISION, COMPLETED_AT, profile="rpi5-minimal",
+                )
 
 
 if __name__ == "__main__":

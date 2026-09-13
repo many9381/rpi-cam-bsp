@@ -1,0 +1,112 @@
+From: Camera Firmware Maintainers <maintainers@example.invalid>
+Subject: [PATCH] Use an explicit native protoc and honor cross installation
+
+The build system supplies protoc 21.12 separately from the target protobuf
+libraries. Do not launch an unisolated host CMake build while configuring a
+cross build. Use CMake's generator helpers with the explicitly selected
+compiler and the vendored target library instead.
+
+Make the diagnostic CLI optional and avoid running the host ldconfig during
+DESTDIR installation. Yocto manages the loader cache on the target.
+
+Upstream-Status: Inappropriate [Yocto integration]
+
+diff --git a/hailort/CMakeLists.txt b/hailort/CMakeLists.txt
+--- a/hailort/CMakeLists.txt
++++ b/hailort/CMakeLists.txt
+@@ -5,6 +5,7 @@ option(HAILO_BUILD_UT "Build Unit Tests" OFF)
+ option(HAILO_INTERNAL_BUILD "Build internal hailort componments" OFF)
+ option(HAILO_BUILD_GSTREAMER "Compile gstreamer plugins" OFF)
+ option(HAILO_BUILD_EXAMPLES "Build examples" OFF)
++option(HAILO_BUILD_CLI "Build diagnostic command line tools" ON)
+ option(HAILO_OFFLINE_COMPILATION "Don't download external dependencies" OFF)
+ option(HAILO_BUILD_SERVICE "Build hailort service" OFF)
+ option(HAILO_COMPILE_WARNING_AS_ERROR "Add compilation flag for treating compilation warnings as errors" OFF)
+@@ -73,7 +74,9 @@ add_subdirectory(common)
+ add_subdirectory(hrpc)
+ add_subdirectory(hrpc_protocol)
+ add_subdirectory(libhailort)
+-add_subdirectory(hailortcli)
++if(HAILO_BUILD_CLI)
++    add_subdirectory(hailortcli)
++endif()
+ if(HAILO_INTERNAL_BUILD)
+     add_subdirectory(tools)
+     add_subdirectory(internals)
+diff --git a/hailort/cmake/external/protobuf.cmake b/hailort/cmake/external/protobuf.cmake
+--- a/hailort/cmake/external/protobuf.cmake
++++ b/hailort/cmake/external/protobuf.cmake
+@@ -16,40 +16,15 @@ FetchContent_GetProperties(protobuf)
+ if(NOT protobuf_POPULATED)
+     FetchContent_Populate(protobuf)
+     if (NOT HAILO_EXTERNALS_EXCLUDE_TARGETS)
+-        message(STATUS "Building protobuf::protoc...")
+-        include(${CMAKE_CURRENT_LIST_DIR}/../execute_cmake.cmake)
+-        set(TOOL_BUILD_TYPE "Release")
+-        set(PROTOBUF_INSTALL_DIR ${HAILO_EXTERNAL_DIR}/protobuf-install)
+-
+-        execute_cmake(
+-            SOURCE_DIR ${HAILO_EXTERNAL_DIR}/protobuf-src
+-            BUILD_DIR ${HAILO_EXTERNAL_DIR}/protobuf-build
+-            CONFIGURE_ARGS
+-                -DCMAKE_BUILD_TYPE=${TOOL_BUILD_TYPE}
+-                -DCMAKE_INSTALL_PREFIX=${PROTOBUF_INSTALL_DIR}
+-
+-                -Dprotobuf_BUILD_TESTS:BOOL=OFF
+-                -Dprotobuf_WITH_ZLIB:BOOL=OFF
+-                -Dprotobuf_MSVC_STATIC_RUNTIME:BOOL=OFF
+-            BUILD_ARGS
+-                # NOTE: We are installing instead of building protoc because "hailort\external\protobuf-build\cmake\protobuf-targets.cmake" (in Windows) is based on config type.
+-                # TODO: consider importing protobuf_generate_cpp instead? will it solve it?
+-                --config ${TOOL_BUILD_TYPE} --target install ${CMAKE_EXTRA_BUILD_ARGS}
+-            PARALLEL_BUILD
+-        )
+-
+-        if(WIN32)
+-            set(PROTOBUF_CONFIG_DIR ${PROTOBUF_INSTALL_DIR}/cmake)
+-        else()
+-            set(PROTOBUF_CONFIG_DIR ${PROTOBUF_INSTALL_DIR}/lib/cmake/protobuf)
++        if(NOT IS_ABSOLUTE "${Protobuf_PROTOC_EXECUTABLE}" OR
++                NOT EXISTS "${Protobuf_PROTOC_EXECUTABLE}")
++            message(FATAL_ERROR "An absolute native Protobuf_PROTOC_EXECUTABLE is required")
+         endif()
+-
+-        # Include host protobuf for protoc (https://stackoverflow.com/questions/53651181/cmake-find-protobuf-package-in-custom-directory)
+-        include(${PROTOBUF_CONFIG_DIR}/protobuf-config.cmake)
+-        include(${PROTOBUF_CONFIG_DIR}/protobuf-module.cmake)
+-
+         set(protobuf_BUILD_TESTS OFF CACHE BOOL "Build protobuf tests" FORCE)
+         set(protobuf_BUILD_PROTOC_BINARIES OFF CACHE BOOL "Build libprotoc and protoc compiler" FORCE)
++        set(protobuf_BUILD_LIBPROTOC OFF CACHE BOOL "Build libprotoc" FORCE)
++        set(protobuf_BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared protobuf" FORCE)
++        set(protobuf_INSTALL OFF CACHE BOOL "Install private protobuf" FORCE)
+         set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "Protobuf MSVC static runtime" FORCE)
+         set(protobuf_WITH_ZLIB OFF CACHE BOOL "Compile protobuf with zlib" FORCE)
+         add_subdirectory(${protobuf_SOURCE_DIR} ${protobuf_BINARY_DIR} EXCLUDE_FROM_ALL)
+@@ -60,5 +35,12 @@ if(NOT protobuf_POPULATED)
+             set_target_properties(libprotobuf PROPERTIES POSITION_INDEPENDENT_CODE ON)
+             set_target_properties(libprotobuf-lite PROPERTIES POSITION_INDEPENDENT_CODE ON)
+         endif()
++
++        # FindProtobuf provides code generators with the native compiler;
++        # target library aliases already exist from add_subdirectory above.
++        set(Protobuf_INCLUDE_DIR "${protobuf_SOURCE_DIR}/src")
++        set(Protobuf_LIBRARY libprotobuf)
++        set(Protobuf_LITE_LIBRARY libprotobuf-lite)
++        find_package(Protobuf 3.21.12 EXACT REQUIRED MODULE)
+     endif()
+ endif()
+diff --git a/hailort/libhailort/src/CMakeLists.txt b/hailort/libhailort/src/CMakeLists.txt
+--- a/hailort/libhailort/src/CMakeLists.txt
++++ b/hailort/libhailort/src/CMakeLists.txt
+@@ -197,10 +197,6 @@ install(TARGETS libhailort
+     INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+ )
+ 
+-if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+-    install(CODE "execute_process(COMMAND ldconfig)")
+-endif()
+-
+ # Export libhailort
+ set(CMAKE_SCRIPTS_DIR ${CMAKE_CURRENT_BINARY_DIR})
+ configure_package_config_file(${CMAKE_CURRENT_SOURCE_DIR}/Config.cmake.in

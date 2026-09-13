@@ -5,6 +5,13 @@ x86_64 Ubuntu 24.04 host. The supported target is a Raspberry Pi 5 booting
 from a USB SSD with Camera Module 3 Wide (IMX708), headless autofocus still
 capture, and software H.264 encoding.
 
+The camera image also packages the separately maintained `rpi-cam-hailo`
+C++20 application, its React web assets and secure streaming dependencies.
+`kas/rpi5-camera-hailo.yml` adds Hailo-8 support. The source checkout is ignored
+by Git; recipes fetch an immutable application revision. See the
+[firmware integration runbook](docs/runbooks/camera-firmware.md) for source
+access, offline web builds and device provisioning before service startup.
+
 ## Supported route
 
 Use one unchanged Git revision and build ID for the complete acceptance run:
@@ -25,6 +32,7 @@ Follow these documents in order:
 2. [USB SSD build and flash](docs/runbooks/usb-ssd-bringup.md)
 3. [Remote Raspberry Pi validation](docs/runbooks/remote-validation.md)
 4. [Camera Module 3 Wide validation](docs/runbooks/camera-validation.md)
+5. [Camera firmware provisioning and streaming](docs/runbooks/camera-firmware.md)
 
 [EEPROM recovery](docs/runbooks/eeprom-recovery.md) is an exception path, not
 part of normal boot. Before publishing any camera image, apply the

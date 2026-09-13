@@ -7,6 +7,59 @@ from support import REPO_ROOT, read, run
 
 
 class FlashContractTest(unittest.TestCase):
+    def test_flash_profile_selects_correct_image_and_rejects_unknown_profile(self) -> None:
+        """Catches a camera variant resolving to the minimal image."""
+        for profile, expected_image in (
+            ("rpi5-minimal", "rpi5-minimal-image-raspberrypi5.rootfs.wic.bz2"),
+            ("rpi5-camera", "rpi5-camera-image-raspberrypi5.rootfs.wic.bz2"),
+            ("rpi5-camera-hailo", "rpi5-camera-image-raspberrypi5.rootfs.wic.bz2"),
+        ):
+            with self.subTest(profile=profile):
+                result = run(
+                    "bash", "-c", 'source "$1"; flash_profile_image "$2"',
+                    "bash", str(REPO_ROOT / "scripts/flash-ssd.sh"), profile,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected_image)
+        result = run(
+            "bash", "-c", 'source "$1"; flash_profile_image "$2"',
+            "bash", str(REPO_ROOT / "scripts/flash-ssd.sh"), "rpi5-camera-other",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid profile", result.stderr)
+
+    def test_camera_flash_profiles_require_qemu_selected_build_and_phase_one(self) -> None:
+        """Catches Hailo flashing bypassing phase-one or using normal COMPLETE."""
+        for profile in ("rpi5-camera", "rpi5-camera-hailo"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                base = root / "artifacts/test-build"
+                unrelated = base / "rpi5-minimal/COMPLETE"
+                unrelated.parent.mkdir(parents=True)
+                unrelated.touch()
+                for marker, error in (
+                    ("qemu-test/PASS", "QEMU PASS marker missing"),
+                    (f"{profile}/COMPLETE", f"{profile} build PASS marker missing"),
+                    ("rpi5-test/PASS", "phase-1 hardware PASS marker missing"),
+                ):
+                    result = run(
+                        "bash", "-c",
+                        'source "$1"; require_flash_prerequisites "$2" test-build "$3"',
+                        "bash", str(REPO_ROOT / "scripts/flash-ssd.sh"),
+                        str(root), profile,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(error, result.stderr)
+                    path = base / marker
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.touch()
+                result = run(
+                    "bash", "-c",
+                    'source "$1"; require_flash_prerequisites "$2" test-build "$3"',
+                    "bash", str(REPO_ROOT / "scripts/flash-ssd.sh"), str(root), profile,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_flash_requires_all_safety_inputs(self) -> None:
         script = read("scripts/flash-ssd.sh")
         for required in (

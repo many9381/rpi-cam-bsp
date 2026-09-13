@@ -87,12 +87,37 @@ uv_run_locked() {
         "$uv_executable" run --locked --offline "$@"
 }
 
+flash_profile_image() {
+    case "$1" in
+        rpi5-minimal)
+            printf '%s\n' 'rpi5-minimal-image-raspberrypi5.rootfs.wic.bz2'
+            ;;
+        rpi5-camera|rpi5-camera-hailo)
+            printf '%s\n' 'rpi5-camera-image-raspberrypi5.rootfs.wic.bz2'
+            ;;
+        *) rpi5_die "invalid profile"; return 1 ;;
+    esac
+}
+
+require_flash_prerequisites() {
+    local artifact_root="$1/artifacts/$2"
+    local selected_profile="$3"
+
+    rpi5_require_pass "$artifact_root/qemu-test/PASS" "QEMU"
+    rpi5_require_pass \
+        "$artifact_root/$selected_profile/COMPLETE" "$selected_profile build"
+    if [[ "$selected_profile" == "rpi5-camera" ||
+          "$selected_profile" == "rpi5-camera-hailo" ]]; then
+        rpi5_require_pass "$artifact_root/rpi5-test/PASS" "phase-1 hardware"
+    fi
+}
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     return 0
 fi
 
 usage() {
-    printf 'Usage: sudo UV_ARCHIVE=/absolute/path/to/uv-release.tar.gz %s --build-id ID --profile {rpi5-minimal|rpi5-camera} --device /dev/DEVICE --confirm ERASE:/dev/DEVICE:ID\n' "$0"
+    printf 'Usage: sudo UV_ARCHIVE=/absolute/path/to/uv-release.tar.gz %s --build-id ID --profile {rpi5-minimal|rpi5-camera|rpi5-camera-hailo} --device /dev/DEVICE --confirm ERASE:/dev/DEVICE:ID\n' "$0"
 }
 
 build_id=""
@@ -131,8 +156,7 @@ done
 [[ -z "${UV_PROJECT_ENVIRONMENT:-}" ]] || \
     rpi5_die "UV_PROJECT_ENVIRONMENT must be unset for privileged flashing"
 rpi5_validate_build_id "$build_id" || rpi5_die "invalid build ID"
-[[ "$profile" == "rpi5-minimal" || "$profile" == "rpi5-camera" ]] || \
-    rpi5_die "invalid profile"
+image_name="$(flash_profile_image "$profile")"
 [[ "$device" == /dev/* ]] || \
     rpi5_die "device must be an explicit /dev path"
 [[ "$confirmation" == "ERASE:$device:$build_id" ]] || \
@@ -180,17 +204,7 @@ flash_marker="$flash_root/${profile}-PASS"
 [[ ! -e "$flash_marker" ]] || \
     rpi5_die "flash PASS already exists for $profile"
 mkdir -p "$flash_root"
-rpi5_require_pass "$repo_root/artifacts/$build_id/qemu-test/PASS" "QEMU"
-rpi5_require_pass "$profile_root/COMPLETE" "$profile build"
-if [[ "$profile" == "rpi5-camera" ]]; then
-    rpi5_require_pass \
-        "$repo_root/artifacts/$build_id/rpi5-test/PASS" \
-        "phase-1 hardware"
-fi
-
-image_name="rpi5-minimal-image-raspberrypi5.rootfs.wic.bz2"
-[[ "$profile" == "rpi5-camera" ]] && \
-    image_name="rpi5-camera-image-raspberrypi5.rootfs.wic.bz2"
+require_flash_prerequisites "$repo_root" "$build_id" "$profile"
 image="$profile_root/images/$image_name"
 bmap="${image%.bz2}.bmap"
 [[ -f "$image" && -f "$bmap" ]] || \

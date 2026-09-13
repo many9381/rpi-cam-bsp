@@ -1,0 +1,2 @@
+# The unprivileged camera service uses the accelerator through its video group.
+SUBSYSTEM=="hailo_chardev", KERNEL=="hailo[0-9]*", OWNER="root", GROUP="video", MODE="0660"

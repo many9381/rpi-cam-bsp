@@ -1,0 +1,135 @@
+From: Camera Firmware Integration <noreply@example.invalid>
+Subject: [PATCH] cmake: support packaged web assets and target installation
+
+Let packaging select Hailo deterministically, supply separately built web
+assets, and install the runtime programs and secure SRTP module. Keep the
+exact Drogon/Trantor Git identity checks and all four hardening patches intact.
+
+Upstream-Status: Inappropriate [distribution integration]
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6d052b6..93b9b1a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,6 +25,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ include(CTest)
++include(GNUInstallDirs)
++option(CF_BUILD_WEB "Build web assets with the native Node.js toolchain" ON)
+ include(cmake/Dependencies.cmake)
+ include(cmake/EmbedIntegrityPublicKey.cmake)
+ 
+@@ -43,7 +45,9 @@ add_subdirectory(src/rtsp)
+ add_subdirectory(src/runtime)
+ add_subdirectory(src/service)
+ add_subdirectory(plugins/gst-secure-srtp)
+-add_subdirectory(web)
++if(CF_BUILD_WEB)
++  add_subdirectory(web)
++endif()
+ add_subdirectory(apps/camera-firmware)
+ add_subdirectory(apps/camera-firmware-integrity)
+ add_subdirectory(apps/rtsp-digest-credential)
+diff --git a/apps/camera-firmware-integrity/CMakeLists.txt b/apps/camera-firmware-integrity/CMakeLists.txt
+index d37d281..1435cc8 100644
+--- a/apps/camera-firmware-integrity/CMakeLists.txt
++++ b/apps/camera-firmware-integrity/CMakeLists.txt
+@@ -6,3 +6,6 @@ target_link_libraries(camera-firmware-integrity
+     PRIVATE
+         camera_firmware_integrity_signer
+ )
++
++install(TARGETS camera-firmware-integrity
++    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff --git a/apps/camera-firmware/CMakeLists.txt b/apps/camera-firmware/CMakeLists.txt
+index 9dcf918..63c1c90 100644
+--- a/apps/camera-firmware/CMakeLists.txt
++++ b/apps/camera-firmware/CMakeLists.txt
+@@ -1,3 +1,8 @@
++# A packager sets this to the target GStreamer directory. Standalone builds
++# retain the build-tree default used by the integration tests.
++set(CF_SECURE_SRTP_PLUGIN_DIR "$<TARGET_FILE_DIR:gstcfsecuresrtp>" CACHE STRING
++    "Runtime directory containing the secure SRTP GStreamer module")
++
+ function(camera_firmware_add_application target)
+     add_executable(${target}
+         main.cpp
+@@ -16,16 +21,19 @@ function(camera_firmware_add_application target)
+ 
+     target_compile_definitions(${target}
+         PRIVATE
+-            CF_SECURE_SRTP_PLUGIN_DIR="$<TARGET_FILE_DIR:gstcfsecuresrtp>"
++            CF_SECURE_SRTP_PLUGIN_DIR="${CF_SECURE_SRTP_PLUGIN_DIR}"
+     )
+ 
+     add_dependencies(${target}
+-        camera_firmware_web
+         gstcfsecuresrtp
+     )
++    if(CF_BUILD_WEB)
++        add_dependencies(${target} camera_firmware_web)
++    endif()
+ endfunction()
+ 
+ camera_firmware_add_application(camera-firmware)
++install(TARGETS camera-firmware RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+ 
+ if(BUILD_TESTING)
+     camera_firmware_add_application(camera-firmware-integration)
+diff --git a/apps/rtsp-digest-credential/CMakeLists.txt b/apps/rtsp-digest-credential/CMakeLists.txt
+index 7898795..7be5adb 100644
+--- a/apps/rtsp-digest-credential/CMakeLists.txt
++++ b/apps/rtsp-digest-credential/CMakeLists.txt
+@@ -6,3 +6,6 @@ target_link_libraries(rtsp-digest-credential
+     PRIVATE
+         camera_firmware_rtsp
+ )
++
++install(TARGETS rtsp-digest-credential
++    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+diff --git a/cmake/Dependencies.cmake b/cmake/Dependencies.cmake
+index 3e30223..bd8ca78 100644
+--- a/cmake/Dependencies.cmake
++++ b/cmake/Dependencies.cmake
+@@ -311,13 +311,22 @@ pkg_check_modules(X264 REQUIRED IMPORTED_TARGET x264)
+ pkg_check_modules(LIBSWSCALE REQUIRED IMPORTED_TARGET libswscale)
+ pkg_check_modules(LIBAVUTIL REQUIRED IMPORTED_TARGET libavutil)
+ 
+-find_path(HAILORT_INCLUDE_DIR
+-    NAMES hailo/hailort.h hailo/vdevice.hpp hailo/infer_model.hpp
+-)
+-find_library(HAILORT_LIBRARY
+-    NAMES hailort
+-)
+-if(HAILORT_INCLUDE_DIR AND HAILORT_LIBRARY)
++option(CF_WITH_HAILORT "Build the Hailo inference backend" OFF)
++set(CF_TEST_EXPECT_HAILORT OFF)
++if(CF_WITH_HAILORT)
++  find_path(HAILORT_INCLUDE_DIR
++      NAMES hailo/hailort.h
++      REQUIRED
++  )
++  find_library(HAILORT_LIBRARY
++      NAMES hailort
++      REQUIRED
++  )
++  foreach(_cf_hailort_header hailo/vdevice.hpp hailo/infer_model.hpp)
++    if(NOT EXISTS "${HAILORT_INCLUDE_DIR}/${_cf_hailort_header}")
++      message(FATAL_ERROR "Missing HailoRT C++ header: ${_cf_hailort_header}")
++    endif()
++  endforeach()
+   set(CF_TEST_EXPECT_HAILORT ON)
+   if(NOT TARGET HailoRT::HailoRT)
+     add_library(HailoRT::HailoRT UNKNOWN IMPORTED)
+diff --git a/plugins/gst-secure-srtp/CMakeLists.txt b/plugins/gst-secure-srtp/CMakeLists.txt
+index 57ae3cf..0a6fe15 100644
+--- a/plugins/gst-secure-srtp/CMakeLists.txt
++++ b/plugins/gst-secure-srtp/CMakeLists.txt
+@@ -25,3 +25,6 @@ target_compile_definitions(gstcfsecuresrtp
+     PRIVATE
+         PACKAGE="camera-firmware"
+ )
++
++install(TARGETS gstcfsecuresrtp
++    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/gstreamer-1.0)
