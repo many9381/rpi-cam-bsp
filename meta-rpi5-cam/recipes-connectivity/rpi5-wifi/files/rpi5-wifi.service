@@ -1,0 +1,17 @@
+[Unit]
+Description=Raspberry Pi 5 local Wi-Fi connection
+ConditionPathExists=@SYSCONFDIR@/wpa_supplicant/wpa_supplicant-wlan0.conf
+BindsTo=sys-subsystem-net-devices-wlan0.device
+After=sys-subsystem-net-devices-wlan0.device systemd-rfkill.service
+
+[Service]
+Type=simple
+ExecStartPre=@SBINDIR@/rfkill unblock wlan
+ExecStart=@SBINDIR@/wpa_supplicant -i wlan0 -D nl80211 -c @SYSCONFDIR@/wpa_supplicant/wpa_supplicant-wlan0.conf
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+# Start when the interface appears, without pulling a missing device into boot.
+WantedBy=sys-subsystem-net-devices-wlan0.device

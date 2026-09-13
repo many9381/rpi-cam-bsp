@@ -16,6 +16,11 @@ Both camera variants also include the pinned Codex CLI and its sandbox/search
 tools for interactive use over SSH. Account credentials are provisioned after
 boot, never baked into the image. See [Codex on the camera](docs/runbooks/codex.md).
 
+All Raspberry Pi images support optional Wi-Fi automatic connection using a
+Git-ignored local configuration. See [Wi-Fi provisioning](docs/runbooks/wifi.md)
+before building: provisioned images contain the Wi-Fi key and must stay private.
+QEMU remains wired-only.
+
 ## Supported route
 
 Use one unchanged Git revision and build ID for the complete acceptance run:

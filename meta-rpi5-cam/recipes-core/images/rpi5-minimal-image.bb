@@ -23,6 +23,9 @@ IMAGE_LINGUAS = " "
 IMAGE_ROOTFS_SIZE = "1048576"
 IMAGE_ROOTFS_EXTRA_SPACE = "524288"
 
-inherit core-image extrausers
+inherit core-image extrausers rpi5-wifi-provision
+
+# The camera image requires this recipe; QEMU stays wired-only.
+IMAGE_INSTALL:append:raspberrypi5 = " rpi5-wifi"
 
 EXTRA_USERS_PARAMS = "usermod -p '!' root;"
