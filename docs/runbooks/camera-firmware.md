@@ -11,7 +11,7 @@ The Yocto camera image includes the firmware implemented in the separate
 |---|---|
 | `camera-firmware` | C++20 executable, integrity/digest helper CLIs, custom SRTP plugin, service and configuration example |
 | `camera-firmware-web` | Prebuilt React UI under `/usr/share/camera-firmware/web` |
-| `packagegroup-camera-firmware` | Included by `rpi5-camera-image` |
+| `packagegroup-camera-firmware` | Application and Codex operator tools, included by `rpi5-camera-image` |
 | `packagegroup-camera-firmware-hailo` | Optional HailoRT library/CLI, matching PCIe driver and chip firmware |
 
 The recipes reuse `libcamera`, `gstreamer1.0`, `gstreamer1.0-plugins-base`,

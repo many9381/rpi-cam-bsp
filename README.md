@@ -12,6 +12,10 @@ by Git; recipes fetch an immutable application revision. See the
 [firmware integration runbook](docs/runbooks/camera-firmware.md) for source
 access, offline web builds and device provisioning before service startup.
 
+Both camera variants also include the pinned Codex CLI and its sandbox/search
+tools for interactive use over SSH. Account credentials are provisioned after
+boot, never baked into the image. See [Codex on the camera](docs/runbooks/codex.md).
+
 ## Supported route
 
 Use one unchanged Git revision and build ID for the complete acceptance run:
