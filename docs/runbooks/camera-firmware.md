@@ -106,7 +106,7 @@ plugin. It is active only when the multimedia layer is present.
 
 | Source | Revision |
 |---|---|
-| Camera application | `ba503a1fbc4ed68c1fd29aace7214a5c330d7021` |
+| Camera application | `a6364ff4c8161334fdf89b54b8d2eeb4ec55a32c` |
 | Drogon 1.9.0 | `f215cb15a0f53abd0ca7ee8b95ed8c9c3b40d262` |
 | Trantor 1.5.20 | `79e1ffc59aa1b9c8226c2988fe2e1185e97cd795` |
 
@@ -454,3 +454,13 @@ The application source has no license grant, so it is packaged as `CLOSED`
 alongside declarations/notices for bundled third-party components. This does
 not grant redistribution rights. The existing H.264 licensing gate still
 applies; Hailo chip firmware carries its own license included in the package.
+
+## Published network examples
+
+Use documentation-only addresses in reports, examples, tests and patch
+fixtures. Keep real site configuration in ignored local inputs. The
+[privacy cleanup](../../rpi-cam-hailo/docs/security/privacy-cleanup-2026-10-16.md)
+rewrote the affected history; the current source pin is the sanitized
+counterpart of the original base. Existing production sources and patch order
+are preserved. Older embedded development clones must not reintroduce the
+original history when pushing changes.

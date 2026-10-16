@@ -15,13 +15,12 @@ new commit IDs into historical build or deployment records.
 
 - Compressed image: `images/rpi5-camera-image-raspberrypi5.rootfs.wic.bz2`.
 - SHA-256: `49417cfdc898f1cb0ab9aae7a2f78de92d19f45666a0e4c0a5f2d4276f7a9c12`.
-- Firmware recipe pin: `ba503a1fbc4ed68c1fd29aace7214a5c330d7021`, with the
-  existing recipe patch chains through `0010`. The snapshot does not change
-  this pin; selecting the new firmware commit while retaining these patches
-  would apply integrated changes twice.
-- Firmware snapshot commit: `f1675ff7ea4bf5e2d243b89f681e930bbf9d32da`, also
-  available as `validated-20261016T111625Z^{commit}` in the separate firmware
-  repository and recorded in this repository's annotated tag message.
+- Current firmware recipe pin after privacy cleanup: `a6364ff4c8161334fdf89b54b8d2eeb4ec55a32c`.
+  This is the sanitized counterpart of the original image's base revision;
+  keep the recipe patch chains through `0010`. Do not substitute the final
+  application commit while retaining already integrated patches.
+- Current sanitized firmware snapshot commit: `f5118424195c9e188354d8c9716feb1bca38f9eb`.
+  The shared tag now selects the privacy-cleaned checkpoint.
 
 Before committing, all **296** captured integration inputs matched their
 recorded content hashes and executable modes. The source archive and complete
@@ -68,3 +67,13 @@ version `0.163.0`. The installed image and its completed installation record
 remain valid; this snapshot itself requires no rebuild or SSD reinstallation.
 `scripts/install-ssd.sh` retains its existing checks, including rejecting a
 build/profile that already has a completed installation record.
+
+## Privacy follow-up
+
+The source identity checks above describe the original preservation task.
+Later address redaction changed documentation/test examples, Git history and
+the companion firmware source pin. Historical private artifacts and measured
+image hashes are retained unchanged. See the
+[privacy record](../../rpi-cam-hailo/docs/security/privacy-cleanup-2026-10-16.md)
+for audit scope and GitHub cache/clone cleanup limits. A future image build
+must use a fresh build ID and the sanitized source history.
