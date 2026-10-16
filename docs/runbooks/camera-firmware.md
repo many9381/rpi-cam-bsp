@@ -464,3 +464,13 @@ rewrote the affected history; the current source pin is the sanitized
 counterpart of the original base. Existing production sources and patch order
 are preserved. Older embedded development clones must not reintroduce the
 original history when pushing changes.
+
+The existing Pi checkout and the build PC's earlier validation/source clones
+and Git download caches were refreshed on 2026-10-16. The Pi keeps the
+sanitized recipe base and its seven applied patches; its installed application
+and settings are unchanged. The unrelated linked worktree's local changes
+were preserved. Existing private images and packages remain historical:
+reinstalling an older image restores its older embedded checkout, which must
+be refreshed before publication. Later builds use the sanitized source pin
+and a fresh build ID. GitHub Support purge was excluded at the user's request;
+see the linked privacy record for the retained server-object boundary.
