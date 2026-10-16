@@ -1,0 +1,25 @@
+From: Ross Burton <ross.burton@arm.com>
+Subject: [PATCH] tests: allow slow ptest servers ten minutes to respond
+
+Preserve OE-Core's target ptest timeout when updating to curl 8.22.0.
+The upstream test harness has reformatted this assignment and removed
+the adjacent httptlssrv variable since the original OE patch.
+
+Upstream-Status: Inappropriate [target ptest timing]
+Signed-off-by: Ross Burton <ross.burton@arm.com>
+---
+ tests/servers.pm | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/servers.pm b/tests/servers.pm
+--- a/tests/servers.pm
++++ b/tests/servers.pm
+@@ -123,7 +123,7 @@ my $sshdverstr;    # for socks server, ssh daemon version string
+ my $sshderror;     # for socks server, ssh daemon version error
+ my %doesntrun;     # servers that do not work, identified by pidfile
+ my %PORT = (nolisten => 47); # port we use for a local non-listening service
+-my $server_response_maxtime = 13;
++my $server_response_maxtime = 600;
+ my %run;           # running server
+ my %runcert;       # cert file currently in use by an SSL running server
+ my $CLIENTIP = "127.0.0.1";  # address which curl uses for incoming connections

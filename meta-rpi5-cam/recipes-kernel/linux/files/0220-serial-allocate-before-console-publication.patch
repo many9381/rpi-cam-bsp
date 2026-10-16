@@ -1,0 +1,69 @@
+From: Kernel security backport review <noreply@example.invalid>
+Subject: [PATCH] serial: core: allocate before console publication
+
+Keep the local kcalloc API while reserving all three group slots before
+port publication and uart_configure_port. No console/state ownership is
+created on either allocation failure.
+
+CVE: CVE-2026-90337
+Upstream-Status: Backport [https://git.kernel.org/stable/c/1a0e4fbce5d9c1bc179a35a2fd9ed142664299e3]
+
+diff --git a/drivers/tty/serial/serial_core.c b/drivers/tty/serial/serial_core.c
+--- a/drivers/tty/serial/serial_core.c
++++ b/drivers/tty/serial/serial_core.c
+@@ -3090,7 +3090,6 @@
+ 	struct uart_state *state;
+ 	struct tty_port *port;
+ 	struct device *tty_dev;
+-	int num_groups;
+ 
+ 	if (uport->line >= drv->nr)
+ 		return -EINVAL;
+@@ -3101,6 +3100,19 @@
+ 	guard(mutex)(&port->mutex);
+ 	if (state->uart_port)
+ 		return -EINVAL;
++
++	uport->name = kasprintf(GFP_KERNEL, "%s%u", drv->dev_name,
++				drv->tty_driver->name_base + uport->line);
++	if (!uport->name)
++		return -ENOMEM;
++
++	/* Configuration may add a driver group and register the console. */
++	uport->tty_groups = kcalloc(3, sizeof(*uport->tty_groups), GFP_KERNEL);
++	if (!uport->tty_groups) {
++		kfree(uport->name);
++		return -ENOMEM;
++	}
++	uport->tty_groups[0] = &tty_dev_attr_group;
+ 
+ 	/* Link the port to the driver state table and vice versa */
+ 	atomic_set(&state->refcount, 1);
+@@ -3118,10 +3130,6 @@
+ 	state->pm_state = UART_PM_STATE_UNDEFINED;
+ 	uart_port_set_cons(uport, drv->cons);
+ 	uport->minor = drv->tty_driver->minor_start + uport->line;
+-	uport->name = kasprintf(GFP_KERNEL, "%s%u", drv->dev_name,
+-				drv->tty_driver->name_base + uport->line);
+-	if (!uport->name)
+-		return -ENOMEM;
+ 
+ 	if (uport->cons && uport->dev)
+ 		of_console_check(uport->dev->of_node, uport->cons->name, uport->line);
+@@ -3136,16 +3144,6 @@
+ 
+ 	port->console = uart_console(uport);
+ 
+-	num_groups = 2;
+-	if (uport->attr_group)
+-		num_groups++;
+-
+-	uport->tty_groups = kcalloc(num_groups, sizeof(*uport->tty_groups),
+-				    GFP_KERNEL);
+-	if (!uport->tty_groups)
+-		return -ENOMEM;
+-
+-	uport->tty_groups[0] = &tty_dev_attr_group;
+ 	if (uport->attr_group)
+ 		uport->tty_groups[1] = uport->attr_group;
+ 

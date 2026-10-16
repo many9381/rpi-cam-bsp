@@ -15,7 +15,7 @@ repos:
 local_conf_header:
   rpi5-minimal: |
     IMAGE_FSTYPES = "wic.bz2 wic.bmap"
-    WKS_FILE = "sdimage-raspberrypi.wks"
+    WKS_FILE = "usb-ssd-raspberrypi.wks"
     BOOT_MEDIA = "usb"
     CMDLINE_ROOT_PARTITION = "/dev/sda2"
     hostname:pn-base-files = "rpi5-minimal"

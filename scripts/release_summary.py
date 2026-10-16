@@ -15,7 +15,7 @@ import yaml
 BUILD_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
-CHECKSUM_PATH_RE = re.compile(r"^images/[A-Za-z0-9][A-Za-z0-9._+-]*$")
+CHECKSUM_PATH_RE = re.compile(r"^(?:images|manifests|provenance)/[A-Za-z0-9][A-Za-z0-9._+-]*$")
 UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
     r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
@@ -30,8 +30,6 @@ CAMERA_EVIDENCE = {
     "rpi5-camera-hailo": "camera-hailo-test",
 }
 COMMON_REQUIRED_MARKERS = (
-    "qemu/COMPLETE",
-    "qemu-test/PASS",
     "rpi5-minimal/COMPLETE",
     "flash/rpi5-minimal-PASS",
     "rpi5-test/PASS",
@@ -269,6 +267,13 @@ def build_record(
         EXPECTED_IMAGES["rpi5-camera"],
     )
 
+    qemu_status = "NOT_RUN"
+    qemu_pass = base / "qemu-test/PASS"
+    if qemu_pass.exists() or qemu_pass.is_symlink():
+        require_regular_file(base / "qemu/COMPLETE", "QEMU build marker")
+        require_regular_file(qemu_pass, "QEMU validation marker")
+        qemu_status = "PASS"
+
     record = {
         "schema_version": 1,
         "build_id": build_id,
@@ -282,7 +287,7 @@ def build_record(
             "rpi5_camera": camera_checksum,
         },
         "validation": {
-            "qemu": "PASS",
+            "qemu": qemu_status,
             "rpi5": "PASS",
             "reboots": 3,
             "camera": "PASS",

@@ -18,6 +18,12 @@ REVISION = "0123456789ab"
 BUILD_ID = f"20990101T000000Z-{REVISION}"
 SAMPLE_CONTENT = b"camera-sample\n"
 SAMPLE_SHA256 = hashlib.sha256(SAMPLE_CONTENT).hexdigest()
+VIDEO_METADATA = {
+    "streams": [{"codec_name": "h264", "width": 1920, "height": 1080,
+                 "r_frame_rate": "30/1", "avg_frame_rate": "30/1",
+                 "nb_read_frames": "300", "duration": "10.000000"}],
+    "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "10.000000"},
+}
 
 
 class CameraAcceptanceContractTest(unittest.TestCase):
@@ -148,6 +154,8 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
             "scripts/discover-rpi5.sh",
             "scripts/lib/common.sh",
             "scripts/lib/remote.sh",
+            "scripts/lib/camera_video.py",
+            "scripts/lib/camera_root_identity.sh",
         ):
             source = REPO_ROOT / relative
             destination = self.root / relative
@@ -227,7 +235,6 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
 
     def _ready_prerequisites(self, profile: str = "rpi5-camera") -> None:
         for relative in (
-            "qemu-test/PASS",
             "rpi5-test/PASS",
             f"{profile}/COMPLETE",
             f"flash/{profile}-PASS",
@@ -256,6 +263,7 @@ class CameraAcceptanceExecutionTest(unittest.TestCase):
             "FAKE_BUILD_ID": BUILD_ID,
             "FAKE_PROFILE": profile or "rpi5-camera",
             "FAKE_SAMPLE_SHA": SAMPLE_SHA256,
+            "FAKE_FFPROBE": json.dumps(VIDEO_METADATA),
         }
         environment.update(extra)
         result = self._run(
@@ -296,8 +304,34 @@ printf 'camera-sample\n' > "$destination"
             """#!/usr/bin/env bash
 printf 'ssh %s\n' "$*" >> "$TEST_CALLS"
 command="${!#}"
+if [[ "${FAKE_CHANGE_HOST_KEY:-0}" == 1 && -f "$CAMERA_CONTROL/boot-index" &&
+      "$*" == *'HostKeyAlias=192.0.2.20'* ]]; then
+  printf 'REMOTE HOST IDENTIFICATION HAS CHANGED\n' >&2
+  exit 255
+fi
 case "$command" in
   true) exit 0 ;;
+  'systemctl show camera-firmware.service --property=ActiveState --value')
+    if [[ -f "$CAMERA_CONTROL/boot-index" && "${FAKE_POST_STATE_QUERY_FAIL:-}" != '' ]]; then
+      if [[ "$FAKE_POST_STATE_QUERY_FAIL" == persistent ||
+            ! -f "$CAMERA_CONTROL/state-query-failed" ]]; then
+        touch "$CAMERA_CONTROL/state-query-failed"
+        exit 81
+      fi
+    fi
+    if [[ ! -f "$CAMERA_CONTROL/service-state" ]]; then
+      printf '%s\n' "${FAKE_INITIAL_SERVICE:-active}" > "$CAMERA_CONTROL/service-state"
+    fi
+    cat "$CAMERA_CONTROL/service-state"
+    ;;
+  'sudo -n /usr/bin/systemctl stop camera-firmware.service')
+    [[ "${FAKE_STOP_FAIL:-0}" != 1 ]] || exit 1
+    printf 'inactive\n' > "$CAMERA_CONTROL/service-state"
+    ;;
+  'sudo -n /usr/bin/systemctl start camera-firmware.service')
+    [[ "${FAKE_START_FAIL:-0}" != 1 ]] || exit 1
+    printf 'active\n' > "$CAMERA_CONTROL/service-state"
+    ;;
   'cat /etc/rpi5-build-id')
     printf '%s\n' "${FAKE_REMOTE_BUILD_ID:-$FAKE_BUILD_ID}"
     ;;
@@ -352,6 +386,17 @@ case "$command" in
     ;;
   'cat /proc/loadavg') printf '0.10 0.20 0.30 1/100 100\n' ;;
   *'rpicam-still --nopreview --autofocus-mode auto --timeout 2s'*)
+    if [[ "${FAKE_ENFORCE_SERVICE:-0}" == 1 ]]; then
+      [[ -f "$CAMERA_CONTROL/service-state" &&
+         "$(<"$CAMERA_CONTROL/service-state")" == inactive ]] || exit 71
+    fi
+    if [[ "${FAKE_POST_CAPTURE_ONLY:-0}" != 1 || -f "$CAMERA_CONTROL/boot-index" ]]; then
+      [[ "${FAKE_CAPTURE_FAIL:-0}" != 1 ]] || exit 72
+      if [[ "${FAKE_CAPTURE_SIGNAL:-}" != '' ]]; then
+        kill -s "$FAKE_CAPTURE_SIGNAL" "$PPID"
+        exit 73
+      fi
+    fi
     printf 'still captured\n'
     ;;
   *'JPEG image data'*) printf 'JPEG image data, JFIF standard 1.01\n' ;;
@@ -359,7 +404,7 @@ case "$command" in
     printf 'video captured\n'
     ;;
   *'ffprobe -v error'*)
-    printf '%s\n' "${FAKE_FFPROBE:-h264,1920,1080,30/1}"
+    printf '%s\n' "$FAKE_FFPROBE"
     ;;
   *'sha256sum '*)
     printf '%s\n' "${FAKE_REMOTE_SHA:-$FAKE_SAMPLE_SHA}"
@@ -370,6 +415,7 @@ case "$command" in
     [[ ! -f "$CAMERA_CONTROL/boot-index" ]] ||
       index="$(<"$CAMERA_CONTROL/boot-index")"
     printf '%s\n' "$((index + 1))" > "$CAMERA_CONTROL/boot-index"
+    printf '%s\n' "${FAKE_REBOOT_SERVICE:-active}" > "$CAMERA_CONTROL/service-state"
     touch "$CAMERA_CONTROL/down-pending"
     ;;
   'sudo -n /usr/bin/journalctl -b --no-pager'|\
@@ -415,7 +461,7 @@ printf '%s\n' "${FAKE_DISCOVERED_HOST:-192.0.2.21}"
                 "SHA256SUMS",
                 "imx708-initial.jpg",
                 "imx708-post-reboot.jpg",
-                "imx708-wide-1080p30.h264",
+                "imx708-wide-1080p30.mp4",
             ],
         )
         checksum_result = subprocess.run(
@@ -457,11 +503,12 @@ printf '%s\n' "${FAKE_DISCOVERED_HOST:-192.0.2.21}"
             "rpicam-hello --list-cameras",
             "rpicam-still --nopreview --autofocus-mode auto --timeout 2s",
             "rpicam-vid --nopreview --timeout 10s --width 1920 --height 1080",
-            "--codec libav --libav-format h264 --libav-video-codec libx264",
+            "--codec libav --libav-format mp4 --libav-video-codec libx264",
             "ffprobe -v error",
             "media-ctl -p",
             "sha256sum",
             "journalctl -b -1 --no-pager",
+            "HostKeyAlias=192.0.2.20",
         ):
             self.assertIn(expected, normalized_calls)
         for diagnostic in (
@@ -473,6 +520,188 @@ printf '%s\n' "${FAKE_DISCOVERED_HOST:-192.0.2.21}"
             "diagnostic-media-topology.log",
         ):
             self.assertTrue((evidence / diagnostic).is_file(), diagnostic)
+
+    def test_active_service_is_released_for_both_captures_and_restored(self) -> None:
+        """Catches captures racing the application, including after reboot."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        result, control, evidence = self._run_ready_acceptance(FAKE_ENFORCE_SERVICE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((control / "service-state").read_text().strip(), "active")
+        calls = self.calls.read_text()
+        self.assertEqual(calls.count("systemctl stop camera-firmware.service"), 2)
+        self.assertEqual(calls.count("systemctl start camera-firmware.service"), 2)
+        self.assertTrue((evidence / "PASS").is_file())
+
+    def test_failed_or_interrupted_capture_restores_initially_active_service(self) -> None:
+        """Catches cleanup omitted on command failure, INT, HUP or TERM."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        cases = [{"FAKE_CAPTURE_FAIL": "1"}, {"FAKE_CAPTURE_SIGNAL": "TERM"},
+                 {"FAKE_CAPTURE_SIGNAL": "INT"}, {"FAKE_CAPTURE_SIGNAL": "HUP"}]
+        cases += [dict(extra, FAKE_POST_CAPTURE_ONLY="1") for extra in cases]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                result, control, evidence = self._run_ready_acceptance(**extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue((control / "service-state").is_file())
+                self.assertEqual((control / "service-state").read_text().strip(), "active")
+                self.assertIn("systemctl start camera-firmware.service", self.calls.read_text())
+                self.assertFalse((evidence / "PASS").exists())
+
+    def test_initially_inactive_service_is_never_started_even_after_autostart(self) -> None:
+        """Catches cleanup or reboot restoration starting an operator-stopped app."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        result, control, evidence = self._run_ready_acceptance(
+            FAKE_INITIAL_SERVICE="inactive", FAKE_ENFORCE_SERVICE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((control / "service-state").read_text().strip(), "inactive")
+        self.assertNotIn("systemctl start camera-firmware.service", self.calls.read_text())
+        self.assertTrue((evidence / "PASS").exists())
+
+    def test_failed_service_restore_prevents_pass(self) -> None:
+        """Catches successful captures concealing a failed service restoration."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        result, _, evidence = self._run_ready_acceptance(FAKE_START_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("camera service restoration failed", result.stderr)
+        self.assertFalse((evidence / "PASS").exists())
+
+    def test_multiline_root_identity_fails_before_service_control(self) -> None:
+        """Catches read consuming a valid first line and hiding trailing identity data."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        result, _, evidence = self._run_ready_acceptance(
+            FAKE_ROOT_INFO="/dev/sda2|/dev/sda|usb|CAMERA-ROOT-UUID\nhidden-data")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((evidence / "PASS").exists())
+        calls = self.calls.read_text()
+        self.assertNotIn("systemctl stop camera-firmware.service", calls)
+        self.assertNotIn("systemctl start camera-firmware.service", calls)
+
+    def test_post_reboot_state_query_failure_keeps_restoration_obligation(self) -> None:
+        """Catches cleanup remaining disarmed if the first post-boot query fails."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        for failure in ("transient", "persistent"):
+            with self.subTest(failure=failure):
+                result, control, evidence = self._run_ready_acceptance(
+                    FAKE_INITIAL_SERVICE="inactive", FAKE_POST_STATE_QUERY_FAIL=failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((evidence / "PASS").exists())
+                self.assertNotIn("systemctl start camera-firmware.service", self.calls.read_text())
+                if failure == "transient":
+                    self.assertEqual((control / "service-state").read_text().strip(), "inactive")
+                    self.assertEqual((evidence / "service.log").read_text().count("restored_state=inactive"), 2)
+                else:
+                    self.assertIn("camera service restoration failed; operator recovery required", result.stderr)
+
+    def test_signal_before_post_reboot_release_restores_initially_inactive_service(self) -> None:
+        """Catches the interruption gap between verified reconnect and release."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        signal_script = self.root / "before-release-signal.sh"
+        signal_script.write_text(
+            "trap 'if [[ \"${BASH_COMMAND:-}\" == release_camera_service && "
+            "-f \"$CAMERA_CONTROL/boot-index\" ]]; then "
+            "kill -\"$FAKE_BEFORE_RELEASE_SIGNAL\" \"$$\"; fi' DEBUG\n", encoding="utf-8")
+        for signal_name, expected_status in (("INT", 130), ("TERM", 143), ("HUP", 129)):
+            with self.subTest(signal=signal_name):
+                result, control, evidence = self._run_ready_acceptance(
+                    FAKE_INITIAL_SERVICE="inactive", FAKE_BEFORE_RELEASE_SIGNAL=signal_name,
+                    BASH_ENV=str(signal_script))
+                self.assertEqual(result.returncode, expected_status, result.stderr)
+                self.assertEqual((control / "service-state").read_text().strip(), "inactive")
+                self.assertNotIn("systemctl start camera-firmware.service", self.calls.read_text())
+                self.assertFalse((evidence / "PASS").exists())
+
+    def test_unverified_recovery_warns_without_service_control(self) -> None:
+        """Catches stale pre-boot identity authorizing cleanup on a different root."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        for extra in ({"FAKE_CHANGE_ROOT_UUID": "1"}, {"FAKE_DISCOVERED_HOST": "not-an-ip"}):
+            with self.subTest(extra=extra):
+                result, control, evidence = self._run_ready_acceptance(
+                    FAKE_INITIAL_SERVICE="inactive", **extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((control / "service-state").read_text().strip(), "active")
+                self.assertIn("camera service restoration failed; operator recovery required", result.stderr)
+                post_reboot_calls = self.calls.read_text().split("systemctl reboot", 1)[1]
+                self.assertNotIn("systemctl stop camera-firmware.service", post_reboot_calls)
+                self.assertNotIn("systemctl start camera-firmware.service", post_reboot_calls)
+                self.assertFalse((evidence / "PASS").exists())
+
+    def test_failed_stop_prevents_direct_capture(self) -> None:
+        """Catches capture proceeding after stop permission or operation failure."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        result, control, evidence = self._run_ready_acceptance(FAKE_STOP_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((control / "service-state").read_text().strip(), "active")
+        self.assertNotIn("rpicam-still --nopreview", self.calls.read_text())
+        self.assertFalse((evidence / "PASS").exists())
+
+    def test_reboot_key_change_cannot_replace_initial_host_identity(self) -> None:
+        """Catches ssh-keyscan silently trusting a replacement device on recovery."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        timewarp = self.root / "timewarp.sh"
+        timewarp.write_text(
+            "set -T\ntrap 'case \"${BASH_COMMAND:-}\" in \"sleep 2\") "
+            "SECONDS=$((SECONDS + 121));; esac' DEBUG\n", encoding="utf-8")
+        result, _, evidence = self._run_ready_acceptance(
+            FAKE_CHANGE_HOST_KEY="1", BASH_ENV=str(timewarp))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pinned SSH identity", result.stderr)
+        self.assertFalse((evidence / "PASS").exists())
+        calls = self.calls.read_text()
+        self.assertEqual(sum(line.startswith("ssh-keyscan ") for line in calls.splitlines()), 2)
+
+    def test_inactive_service_remains_inactive_after_failed_capture(self) -> None:
+        """Catches failure cleanup starting an initially stopped service."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        for post_only in ("0", "1"):
+            with self.subTest(post_reboot=post_only):
+                result, control, evidence = self._run_ready_acceptance(
+                    FAKE_INITIAL_SERVICE="inactive", FAKE_CAPTURE_FAIL="1",
+                    FAKE_POST_CAPTURE_ONLY=post_only)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual((control / "service-state").read_text().strip(), "inactive")
+                self.assertNotIn("systemctl start camera-firmware.service", self.calls.read_text())
+                self.assertFalse((evidence / "PASS").exists())
+
+    def test_invalid_video_metadata_is_rejected_and_service_restored(self) -> None:
+        """Catches absent timestamps, empty streams and unverified video shape."""
+        self._ready_prerequisites()
+        self._install_success_commands()
+        cases = ["not JSON", "{}", '{"streams": []}']
+        for field, value in (("codec_name", "hevc"), ("width", 1280), ("height", 720),
+                             ("r_frame_rate", "0/0"), ("avg_frame_rate", "0/0"),
+                             ("nb_read_frames", "0"), ("nb_read_frames", "N/A"),
+                             ("duration", "N/A"), ("duration", "0"),
+                             ("duration", "1.0"), ("duration", "NaN")):
+            metadata = json.loads(json.dumps(VIDEO_METADATA))
+            metadata["streams"][0][field] = value
+            cases.append(json.dumps(metadata))
+        for field in ("duration", "nb_read_frames", "avg_frame_rate", "r_frame_rate"):
+            metadata = json.loads(json.dumps(VIDEO_METADATA))
+            del metadata["streams"][0][field]
+            cases.append(json.dumps(metadata))
+        for field, value in (("duration", "N/A"), ("duration", "8"),
+                             ("format_name", "h264")):
+            metadata = json.loads(json.dumps(VIDEO_METADATA))
+            metadata["format"][field] = value
+            cases.append(json.dumps(metadata))
+        for value in cases:
+            with self.subTest(metadata=value):
+                result, control, evidence = self._run_ready_acceptance(FAKE_FFPROBE=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid camera video metadata", result.stderr)
+                self.assertEqual((control / "service-state").read_text().strip(), "active")
+                self.assertFalse((evidence / "PASS").exists())
 
     def test_hailo_capture_uses_separate_evidence_and_records_profile(self) -> None:
         """Catches Hailo capture overwriting or consuming normal camera PASS."""
@@ -563,7 +792,7 @@ printf '%s\n' "${FAKE_DISCOVERED_HOST:-192.0.2.21}"
             ("FAKE_CAMERA_LIST", "No cameras available", "not enumerated"),
             ("FAKE_CAMERA_LIST", "0 : imx708", "modes were not listed"),
             ("FAKE_TEMPERATURE", "85000", "temperature reached 85 C"),
-            ("FAKE_FFPROBE", "h264,1280,720,30/1", "not 1920x1080"),
+            ("FAKE_FFPROBE", "{}", "invalid camera video metadata"),
             ("FAKE_REMOTE_SHA", "invalid", "invalid remote checksum"),
             ("FAKE_REMOTE_SHA", "0" * 64, "copy checksum mismatch"),
         )
@@ -666,7 +895,6 @@ printf '%s\n' "${FAKE_DISCOVERED_HOST:-192.0.2.21}"
         self.key.chmod(0o600)
 
         for marker, expected in (
-            ("qemu-test/PASS", "QEMU PASS marker missing"),
             ("rpi5-test/PASS", "phase-1 hardware PASS marker missing"),
             ("rpi5-camera/COMPLETE", "camera image PASS marker missing"),
             ("flash/rpi5-camera-PASS", "camera flash PASS marker missing"),

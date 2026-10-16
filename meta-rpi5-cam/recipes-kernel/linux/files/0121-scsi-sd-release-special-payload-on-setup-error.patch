@@ -1,0 +1,103 @@
+From: Firmware Security Follow-up <security@example.invalid>
+Subject: [PATCH] scsi sd release special payload on setup error
+
+Backport all three setup error paths and idempotent uninit. The local sd_set_special_bvec takes request rather than scsi_cmnd and allocates only sd_page_pool; retain that complete allocation/free pairing without introducing the later large-page pool API.
+
+CVE: CVE-2026-90267
+Upstream-Status: Backport [https://git.kernel.org/stable/c/bb31844d88b77138b67aa20c3600203baff40140]
+
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -892,6 +892,17 @@
+ 		(logical_block_size >> SECTOR_SHIFT);
+ }
+ 
++static void sd_uninit_command(struct scsi_cmnd *cmd)
++{
++	struct request *rq = scsi_cmd_to_rq(cmd);
++
++	if (!(rq->rq_flags & RQF_SPECIAL_PAYLOAD))
++		return;
++
++	mempool_free(rq->special_vec.bv_page, sd_page_pool);
++	rq->rq_flags &= ~RQF_SPECIAL_PAYLOAD;
++}
++
+ static void *sd_set_special_bvec(struct request *rq, unsigned int data_len)
+ {
+ 	struct page *page;
+@@ -914,6 +925,7 @@
+ 	u32 nr_blocks = sectors_to_logical(sdp, blk_rq_sectors(rq));
+ 	unsigned int data_len = 24;
+ 	char *buf;
++	blk_status_t ret;
+ 
+ 	buf = sd_set_special_bvec(rq, data_len);
+ 	if (!buf)
+@@ -932,7 +944,10 @@
+ 	cmd->transfersize = data_len;
+ 	rq->timeout = SD_TIMEOUT;
+ 
+-	return scsi_alloc_sgtables(cmd);
++	ret = scsi_alloc_sgtables(cmd);
++	if (ret != BLK_STS_OK)
++		sd_uninit_command(cmd);
++	return ret;
+ }
+ 
+ static void sd_config_atomic(struct scsi_disk *sdkp, struct queue_limits *lim)
+@@ -1003,6 +1018,7 @@
+ 	u64 lba = sectors_to_logical(sdp, blk_rq_pos(rq));
+ 	u32 nr_blocks = sectors_to_logical(sdp, blk_rq_sectors(rq));
+ 	u32 data_len = sdp->sector_size;
++	blk_status_t ret;
+ 
+ 	if (!sd_set_special_bvec(rq, data_len))
+ 		return BLK_STS_RESOURCE;
+@@ -1018,7 +1034,10 @@
+ 	cmd->transfersize = data_len;
+ 	rq->timeout = unmap ? SD_TIMEOUT : SD_WRITE_SAME_TIMEOUT;
+ 
+-	return scsi_alloc_sgtables(cmd);
++	ret = scsi_alloc_sgtables(cmd);
++	if (ret != BLK_STS_OK)
++		sd_uninit_command(cmd);
++	return ret;
+ }
+ 
+ static blk_status_t sd_setup_write_same10_cmnd(struct scsi_cmnd *cmd,
+@@ -1030,6 +1049,7 @@
+ 	u64 lba = sectors_to_logical(sdp, blk_rq_pos(rq));
+ 	u32 nr_blocks = sectors_to_logical(sdp, blk_rq_sectors(rq));
+ 	u32 data_len = sdp->sector_size;
++	blk_status_t ret;
+ 
+ 	if (!sd_set_special_bvec(rq, data_len))
+ 		return BLK_STS_RESOURCE;
+@@ -1045,7 +1065,10 @@
+ 	cmd->transfersize = data_len;
+ 	rq->timeout = unmap ? SD_TIMEOUT : SD_WRITE_SAME_TIMEOUT;
+ 
+-	return scsi_alloc_sgtables(cmd);
++	ret = scsi_alloc_sgtables(cmd);
++	if (ret != BLK_STS_OK)
++		sd_uninit_command(cmd);
++	return ret;
+ }
+ 
+ static blk_status_t sd_setup_write_zeroes_cmnd(struct scsi_cmnd *cmd)
+@@ -1472,14 +1495,6 @@
+ 		WARN_ON_ONCE(1);
+ 		return BLK_STS_NOTSUPP;
+ 	}
+-}
+-
+-static void sd_uninit_command(struct scsi_cmnd *SCpnt)
+-{
+-	struct request *rq = scsi_cmd_to_rq(SCpnt);
+-
+-	if (rq->rq_flags & RQF_SPECIAL_PAYLOAD)
+-		mempool_free(rq->special_vec.bv_page, sd_page_pool);
+ }
+ 
+ static bool sd_need_revalidate(struct gendisk *disk, struct scsi_disk *sdkp)

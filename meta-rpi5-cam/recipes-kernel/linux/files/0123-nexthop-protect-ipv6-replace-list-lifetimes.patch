@@ -1,0 +1,68 @@
+From: Firmware Security Follow-up <security@example.invalid>
+Subject: [PATCH] nexthop protect ipv6 replace list lifetimes
+
+Backport the complete pair 4787a6d2629b4e8c0b6bacab1f75c1660eca44d9 and 072cd1f21819dedd2252e704d255de3b0cfc61a7. Retain local ipv6_stub calls for module linkage. Replace per-route sernum walking with a netns generation bump after a locked nonempty check, avoiding tb6_lock inversion. Protect both replace-check and notify walks, retaining error unlock and existing group dst-release paths.
+
+CVE: CVE-2026-74561 CVE-2026-74562
+Upstream-Status: Backport [https://git.kernel.org/stable/c/4787a6d2629b4e8c0b6bacab1f75c1660eca44d9]
+
+--- a/net/ipv4/nexthop.c
++++ b/net/ipv4/nexthop.c
+@@ -1600,14 +1600,21 @@
+ 			      struct netlink_ext_ack *extack)
+ {
+ 	struct fib6_info *f6i;
++	int err = 0;
+ 
+ 	if (list_empty(&old->f6i_list))
+ 		return 0;
+ 
++	spin_lock_bh(&old->lock);
+ 	list_for_each_entry(f6i, &old->f6i_list, nh_list) {
+-		if (check_src_addr(&f6i->fib6_src.addr, extack) < 0)
+-			return -EINVAL;
+-	}
++		err = check_src_addr(&f6i->fib6_src.addr, extack);
++		if (err)
++			break;
++	}
++	spin_unlock_bh(&old->lock);
++
++	if (err)
++		return err;
+ 
+ 	return fib6_check_nexthop(new, NULL, extack);
+ }
+@@ -2219,15 +2226,18 @@
+ static void nh_rt_cache_flush(struct net *net, struct nexthop *nh,
+ 			      struct nexthop *replaced_nh)
+ {
+-	struct fib6_info *f6i;
+ 	struct nh_group *nhg;
++	bool have_f6i;
+ 	int i;
+ 
+ 	if (!list_empty(&nh->fi_list))
+ 		rt_cache_flush(net);
+ 
+-	list_for_each_entry(f6i, &nh->f6i_list, nh_list)
+-		ipv6_stub->fib6_update_sernum(net, f6i);
++	spin_lock_bh(&nh->lock);
++	have_f6i = !list_empty(&nh->f6i_list);
++	spin_unlock_bh(&nh->lock);
++	if (have_f6i)
++		rt_genid_bump_ipv6(net);
+ 
+ 	/* if an IPv6 group was replaced, we have to release all old
+ 	 * dsts to make sure all refcounts are released
+@@ -2521,8 +2531,10 @@
+ 			fi->nh_updated = false;
+ 	}
+ 
++	spin_lock_bh(&nh->lock);
+ 	list_for_each_entry(f6i, &nh->f6i_list, nh_list)
+ 		ipv6_stub->fib6_rt_update(net, f6i, info);
++	spin_unlock_bh(&nh->lock);
+ }
+ 
+ /* send RTM_NEWROUTE with REPLACE flag set for all FIB entries

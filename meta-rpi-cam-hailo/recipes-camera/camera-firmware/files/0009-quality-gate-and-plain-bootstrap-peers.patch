@@ -1,0 +1,286 @@
+From: Camera Firmware Integration <noreply@example.invalid>
+Subject: [PATCH] ci: cover new sources and keep bootstrap peers unscoped
+
+Include non-ignored new C++ files in the format and analysis gate, preserving
+whitespace in paths and excluding deleted files. Exercise the real formatter
+against temporary Git repositories and fail if the tool is missing.
+
+Keep bootstrap peer confirmation restricted to plain IP addresses even when
+GLib accepts and discards an IPv6 scope suffix. Extend the existing rejection
+regression to both peer inputs. Include two formatting-only corrections.
+
+Upstream-Status: Pending
+
+diff --git a/src/runtime/ManagedFirmwareRuntime.cpp b/src/runtime/ManagedFirmwareRuntime.cpp
+--- a/src/runtime/ManagedFirmwareRuntime.cpp
++++ b/src/runtime/ManagedFirmwareRuntime.cpp
+@@ -207,7 +207,8 @@
+     for (auto& status : statuses) {
+       status.recovery_attempts = snapshot.recovery_attempts;
+       // A status read can beat the next lifecycle poll. Report pending recovery
+-      // until that poll has stopped the graph, including after the last attempt.
++      // until that poll has stopped the graph, including after the last
++      // attempt.
+       if (snapshot.state == ManagedRuntimeState::kRunning &&
+           (status.capture_error == "E_CAMERA_NO_FRAMES" ||
+            status.capture_error == "E_CAMERA_CAPTURE_STALLED")) {
+diff --git a/tests/unit/security/AuthServiceTest.cpp b/tests/unit/security/AuthServiceTest.cpp
+--- a/tests/unit/security/AuthServiceTest.cpp
++++ b/tests/unit/security/AuthServiceTest.cpp
+@@ -801,33 +801,39 @@
+             1);
+ }
+ 
+-TEST_F(AuthServiceTest, InitialSetupCanSignInAgainAfterIdleExpiryOrForwardClockStep) {
++TEST_F(AuthServiceTest,
++       InitialSetupCanSignInAgainAfterIdleExpiryOrForwardClockStep) {
+   service_.reset();
+   // Characterize the existing wall-clock policy: both ordinary inactivity and
+   // a first-boot NTP correction can invalidate an initial-account session.
+   for (const auto elapsed : {600, 19 * 60}) {
+     SCOPED_TRACE(elapsed);
+     auto service = OpenDefaultStateService();
+-    auto first = service->Login(Login("InitialAccount", "NorthStar!9", "192.0.2.55"));
++    auto first =
++        service->Login(Login("InitialAccount", "NorthStar!9", "192.0.2.55"));
+     ASSERT_TRUE(first.ok()) << first.error().message;
+     const auto old_token = std::span<const unsigned char>(
+         first.value().session_token.data(), first.value().session_token.size());
+     service->WaitForSessionExpiryIdleForTesting();
+     now_seconds_ += elapsed;
+ 
+-    auto expired = service->Verify(old_token, "192.0.2.55", ManagementActivity::kNone);
++    auto expired =
++        service->Verify(old_token, "192.0.2.55", ManagementActivity::kNone);
+     ASSERT_FALSE(expired.ok());
+     EXPECT_EQ(expired.error().code, "E_AUTHENTICATION_FAILED");
+     EXPECT_EQ(default_store_->State().value(), DeviceState::kDefault);
+ 
+-    auto next = service->Login(Login("InitialAccount", "NorthStar!9", "192.0.2.55"));
++    auto next =
++        service->Login(Login("InitialAccount", "NorthStar!9", "192.0.2.55"));
+     ASSERT_TRUE(next.ok()) << next.error().message;
+     auto principal = service->Verify(
+         {next.value().session_token.data(), next.value().session_token.size()},
+         "192.0.2.55", ManagementActivity::kNone);
+     ASSERT_TRUE(principal.ok()) << principal.error().message;
+     EXPECT_EQ(principal.value().username, "InitialAccount");
+-    EXPECT_FALSE(service->Verify(old_token, "192.0.2.55", ManagementActivity::kNone).ok());
++    EXPECT_FALSE(
++        service->Verify(old_token, "192.0.2.55", ManagementActivity::kNone)
++            .ok());
+   }
+ }
+ 
+diff --git a/src/security/BootstrapService.cpp b/src/security/BootstrapService.cpp
+--- a/src/security/BootstrapService.cpp
++++ b/src/security/BootstrapService.cpp
+@@ -51,7 +51,10 @@
+ };
+ 
+ common::Result<std::string> NormalizePeerIp(std::string_view input) {
+-  if (input.empty() || input.find('\0') != std::string_view::npos) {
++  // Confirmation carries a plain address. GLib may accept a scope suffix and
++  // discard it when serializing, so reject it before comparing the two peers.
++  if (input.empty() || input.find('\0') != std::string_view::npos ||
++      input.find('%') != std::string_view::npos) {
+     return BootstrapError<std::string>("E_BOOTSTRAP_PEER",
+                                        "peer address is invalid");
+   }
+diff --git a/tests/unit/security/BootstrapServiceTest.cpp b/tests/unit/security/BootstrapServiceTest.cpp
+--- a/tests/unit/security/BootstrapServiceTest.cpp
++++ b/tests/unit/security/BootstrapServiceTest.cpp
+@@ -370,12 +370,15 @@
+   auto config = BootstrapConfig(state, state / "rtsp.credentials");
+   BootstrapService service(*store.value(), config,
+                            BuildReservedIdentities(config));
+-  const std::array<std::pair<std::string, std::string>, 7> peers = {{
++  const std::array<std::pair<std::string, std::string>, 10> peers = {{
+       {"192.0.2.10", "192.0.2.11"},
+       {"2001:db8::1", "2001:db8::2"},
+       {"192.0.2.10", "::ffff:192.0.2.10"},
+       {"192.0.2.10:443", "192.0.2.10"},
+       {"fe80::1%eth0", "fe80::1"},
++      {"fe80::1", "fe80::1%1"},
++      {"fe80::1%eth0", "fe80::1%eth0"},
++      {"fe80::1%", "fe80::1"},
+       {" 192.0.2.10", "192.0.2.10"},
+       {"forwarded=192.0.2.10", "192.0.2.10"},
+   }};
+diff --git a/tools/ci/check.sh b/tools/ci/check.sh
+--- a/tools/ci/check.sh
++++ b/tools/ci/check.sh
+@@ -6,7 +6,7 @@
+ #   tools/ci/check.sh --lint     format + clang-tidy only
+ #   tools/ci/check.sh --format   format only
+ #
+-# Requirements: clang-format and clang-tidy 18 or newer (Debian: apt install
++# Requirements: Python 3, clang-format and clang-tidy 18 or newer (Debian: apt install
+ # clang-format-18 clang-tidy-18), the firmware build dependencies, and
+ # node/npm for the web. Tool binaries come from CLANG_FORMAT / CLANG_TIDY when
+ # set, else clang-format-18 / clang-tidy-18, else the unsuffixed name when it
+@@ -49,19 +49,31 @@
+ CLANG_FORMAT="$(resolve_tool clang-format "${CLANG_FORMAT:-}")"
+ CLANG_TIDY="$(resolve_tool clang-tidy "${CLANG_TIDY:-}")"
+ 
+-# Tracked C++ sources. A git pathspec '*' matches across directory levels.
++# Existing tracked and non-ignored new C++ sources, separated by NUL so paths
++# with whitespace survive xargs. A git pathspec '*' matches across directories.
+ sources() {
+-  git ls-files -- 'src/*.cpp' 'src/*.hpp' 'include/*.hpp' 'apps/*.cpp' 'apps/*.hpp' \
+-    'plugins/*.cpp' 'plugins/*.hpp' 'tests/*.cpp' 'tests/*.hpp'
++  git ls-files --cached --others --exclude-standard --deduplicate -z -- \
++    'src/*.cpp' 'src/*.hpp' 'include/*.hpp' 'apps/*.cpp' 'apps/*.hpp' \
++    'plugins/*.cpp' 'plugins/*.hpp' 'tests/*.cpp' 'tests/*.hpp' |
++    while IFS= read -r -d '' source; do
++      if [ -f "$source" ]; then
++        printf '%s\0' "$source"
++      fi
++    done
+ }
+ # clang-tidy analyses the product translation units. Tests are format-checked
+ # and compiled but not analysed (docs/security/static-analysis-2026-09-10.md).
+-tidy_sources() { sources | grep -E '^(src|apps|plugins)/.*\.cpp$'; }
++tidy_sources() { sources | grep -zE '^(src|apps|plugins)/.*\.cpp$'; }
+ 
+ step() { printf '\n== %s ==\n' "$1"; }
+ 
++if [ "$MODE" != "--format" ]; then
++  step "quality gate source-selection regression tests"
++  CLANG_FORMAT="$CLANG_FORMAT" python3 "$ROOT/tools/ci/test_check.py"
++fi
++
+ step "clang-format ($CLANG_FORMAT, dry run, deviations are errors)"
+-sources | xargs -r "$CLANG_FORMAT" --dry-run --Werror
++sources | xargs -0 -r "$CLANG_FORMAT" --dry-run --Werror
+ echo "format: ok"
+ [ "$MODE" = "--format" ] && exit 0
+ 
+@@ -83,7 +95,7 @@
+ # One clang-tidy process per file, JOBS at a time. Each file's output goes to
+ # its own log so the report is not interleaved; a non-zero exit (an error-level
+ # finding or a compile error) records the file in "failed".
+-tidy_sources | xargs -r -P "$JOBS" -I{} sh -c \
++tidy_sources | xargs -0 -r -P "$JOBS" -I{} sh -c \
+   '"$1" -p "$2" --quiet --warnings-as-errors="$3" "$4" > "$5/$(echo "$4" | tr / _).log" 2>&1 || echo "$4" >> "$5/failed"' \
+   _ "$CLANG_TIDY" "$BUILD_DIR" "$TIDY_ERRORS" {} "$TIDY_OUT"
+ cat "$TIDY_OUT"/*.log 2>/dev/null \
+diff --git a/tools/ci/test_check.py b/tools/ci/test_check.py
+new file mode 100644
+--- /dev/null
++++ b/tools/ci/test_check.py
+@@ -0,0 +1,114 @@
++"""Exercise source selection through the real format gate in temporary repos."""
++
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++
++
++SCRIPT = Path(__file__).with_name("check.sh")
++FORMATTER_NAME = os.environ.get("CLANG_FORMAT") or shutil.which("clang-format-18") or shutil.which("clang-format")
++FORMATTER_PATH = shutil.which(FORMATTER_NAME) if FORMATTER_NAME else None
++FORMATTER = str(Path(FORMATTER_PATH).resolve()) if FORMATTER_PATH else None
++
++
++class FormatGateTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        (self.root / "tools/ci").mkdir(parents=True)
++        shutil.copy2(SCRIPT, self.root / "tools/ci/check.sh")
++        self.git("init", "-q")
++        self.write(".clang-format", "BasedOnStyle: Google\n")
++        self.write("src/existing.cpp", "int value = 1;\n")
++        self.git("add", ".clang-format", "src/existing.cpp")
++
++    def git(self, *args):
++        return subprocess.run(["git", "-C", str(self.root), *args], check=True,
++                              capture_output=True)
++
++    def write(self, name, contents):
++        path = self.root / name
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(contents)
++        return path
++
++    def run_gate(self):
++        env = dict(os.environ, CLANG_FORMAT=str(FORMATTER), CLANG_TIDY="/bin/false")
++        return subprocess.run(["bash", "tools/ci/check.sh", "--format"],
++                              cwd=self.root, env=env, capture_output=True,
++                              text=True, timeout=20)
++
++    def assert_gate_passes(self):
++        result = self.run_gate()
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_rejects_unformatted_untracked_header(self):
++        self.write("include/example/New.hpp", "int    value=1;\n")
++        result = self.run_gate()
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("New.hpp", result.stderr)
++
++    def test_rejects_unformatted_untracked_test(self):
++        self.write("tests/unit/NewTest.cpp", "int    value=1;\n")
++        self.assertNotEqual(self.run_gate().returncode, 0)
++
++    def test_keeps_rejecting_unformatted_tracked_source(self):
++        self.write("src/existing.cpp", "int    value=1;\n")
++        self.assertNotEqual(self.run_gate().returncode, 0)
++
++    def test_ignores_excluded_generated_source(self):
++        self.write(".gitignore", "src/generated/\n")
++        self.write("src/generated/bad.cpp", "int    value=1;\n")
++        self.assert_gate_passes()
++
++    def test_ignores_deleted_tracked_source(self):
++        (self.root / "src/existing.cpp").unlink()
++        self.write("src/replacement.cpp", "int value = 1;\n")
++        self.assert_gate_passes()
++
++    def test_preserves_whitespace_in_source_names(self):
++        for name in ("src/with space.cpp", "src/with\nnewline.cpp"):
++            with self.subTest(name=name):
++                path = self.write(name, "int value = 1;\n")
++                self.git("add", name)
++                self.assert_gate_passes()
++                path.write_text("int    value=1;\n")
++                self.assertNotEqual(self.run_gate().returncode, 0)
++                path.write_text("int value = 1;\n")
++
++
++class ToolRequirementTests(unittest.TestCase):
++    def test_relative_formatter_paths_survive_fixture_working_directories(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            (root / "bin").mkdir()
++            (root / "bin/clang-format-18").symlink_to(FORMATTER)
++            for override in ("./bin/clang-format-18", "clang-format-18", ""):
++                with self.subTest(override=override):
++                    env = dict(os.environ, CLANG_FORMAT=override,
++                               PATH="bin:" + os.environ.get("PATH", ""))
++                    result = subprocess.run(
++                        [sys.executable, str(Path(__file__).resolve()), "FormatGateTests"],
++                        cwd=root, env=env, capture_output=True, text=True, timeout=20)
++                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++    def test_missing_formatter_fails_instead_of_skipping_gate(self):
++        with tempfile.TemporaryDirectory() as empty_path:
++            env = dict(os.environ, PATH=empty_path, CLANG_FORMAT="")
++            result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
++                                     "FormatGateTests"],
++                                    env=env, capture_output=True, text=True,
++                                    timeout=20)
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("clang-format", result.stderr)
++
++
++if __name__ == "__main__":
++    if not FORMATTER:
++        raise SystemExit("clang-format 18+ is required; set CLANG_FORMAT")
++    unittest.main()

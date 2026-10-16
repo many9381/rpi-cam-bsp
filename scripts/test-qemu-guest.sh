@@ -54,11 +54,11 @@ check_exact build_id "$build_id" 'cat /etc/rpi5-build-id'
 check_exact systemd running 'systemctl is-system-running --wait'
 check_exact networkd active 'systemctl is-active systemd-networkd.service'
 check_exact sshd active 'systemctl is-active sshd.socket'
-check_exact password_authentication no "sudo -n /usr/sbin/sshd -T | awk '\$1 == \"passwordauthentication\" { print \$2 }'"
-check_exact kbd_interactive_authentication no "sudo -n /usr/sbin/sshd -T | awk '\$1 == \"kbdinteractiveauthentication\" { print \$2 }'"
-check_exact permit_root_login no "sudo -n /usr/sbin/sshd -T | awk '\$1 == \"permitrootlogin\" { print \$2 }'"
+check_exact password_authentication no "sudo -n /usr/sbin/sshd -T | awk 'tolower(\$1) == \"passwordauthentication\" { print \$2 }'"
+check_exact kbd_interactive_authentication no "sudo -n /usr/sbin/sshd -T | awk 'tolower(\$1) == \"kbdinteractiveauthentication\" { print \$2 }'"
+check_exact permit_root_login no "sudo -n /usr/sbin/sshd -T | awk 'tolower(\$1) == \"permitrootlogin\" { print \$2 }'"
 check_exact authentication_methods publickey "sudo -n /usr/sbin/sshd -T | awk '
-    \$1 == \"authenticationmethods\" {
+    tolower(\$1) == \"authenticationmethods\" {
         count += 1
         line = \$0
         if (sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, \"\", line) != 1 ||
@@ -75,7 +75,7 @@ check_exact authentication_methods publickey "sudo -n /usr/sbin/sshd -T | awk '
         print value
     }
 '"
-check_exact allow_users rpiadmin "sudo -n /usr/sbin/sshd -T | awk '\$1 == \"allowusers\" { print \$2 }'"
+check_exact allow_users rpiadmin "sudo -n /usr/sbin/sshd -T | awk 'tolower(\$1) == \"allowusers\" { print \$2 }'"
 check_exact account_locked L "passwd -S rpiadmin | awk '\$1 == \"rpiadmin\" { print \$2 }'"
 
 rpi5_remote "ip -4 -o address show scope global | grep -Eq 'inet 10\\.0\\.2\\.'"

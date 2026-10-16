@@ -1,0 +1,70 @@
+From: Firmware Security Follow-up <security@example.invalid>
+Subject: [PATCH] kvm gmem use unsigned binding offset and size
+
+Backport the complete unsigned offset/local/declaration/stub/type-include change using existing u64 rather than upstream uoff_t, which is absent from this 6.18.55 header dependency closure. include/linux/kvm_types.h includes linux/types.h and defines gpa_t/gfn_t as u64; real ARM64 compilation asserts an unsigned 64-bit offset matching the UAPI guest_memfd_offset width. Retain the existing __kvm_set_memory_region unsigned wrap/page-count checks and BUILD_BUG_ON GPA-width check. Preserve local kvm_gmem storage naming. The original host fixture injected uoff_t and masked the missing prerequisite; actual complete KVM translation units and both header branches now compile against captured real ARM64 headers.
+
+CVE: CVE-2026-64283
+Upstream-Status: Backport [https://git.kernel.org/stable/c/eba85fee7fc6cf28fec38a5bf3c378bef9a79ca6]
+
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -560,15 +560,16 @@
+ }
+ 
+ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
+-		  unsigned int fd, loff_t offset)
+-{
+-	loff_t size = slot->npages << PAGE_SHIFT;
++		  unsigned int fd, u64 offset)
++{
++	u64 size = slot->npages << PAGE_SHIFT;
+ 	unsigned long start, end;
+ 	struct kvm_gmem *gmem;
+ 	struct inode *inode;
+ 	struct file *file;
+ 	int r = -EINVAL;
+ 
++	BUILD_BUG_ON(sizeof(gpa_t) != sizeof(offset));
+ 	BUILD_BUG_ON(sizeof(gfn_t) != sizeof(slot->gmem.pgoff));
+ 
+ 	file = fget(fd);
+@@ -584,8 +585,7 @@
+ 
+ 	inode = file_inode(file);
+ 
+-	if (offset < 0 || !PAGE_ALIGNED(offset) ||
+-	    offset + size > i_size_read(inode))
++	if (!PAGE_ALIGNED(offset) || offset + size > i_size_read(inode))
+ 		goto err;
+ 
+ 	filemap_invalidate_lock(inode->i_mapping);
+--- a/virt/kvm/kvm_mm.h
++++ b/virt/kvm/kvm_mm.h
+@@ -2,6 +2,9 @@
+ 
+ #ifndef __KVM_MM_H__
+ #define __KVM_MM_H__ 1
++
++#include <linux/kvm.h>
++#include <linux/kvm_types.h>
+ 
+ /*
+  * Architectures can choose whether to use an rwlock or spinlock
+@@ -71,7 +74,7 @@
+ void kvm_gmem_init(struct module *module);
+ int kvm_gmem_create(struct kvm *kvm, struct kvm_create_guest_memfd *args);
+ int kvm_gmem_bind(struct kvm *kvm, struct kvm_memory_slot *slot,
+-		  unsigned int fd, loff_t offset);
++		  unsigned int fd, u64 offset);
+ void kvm_gmem_unbind(struct kvm_memory_slot *slot);
+ #else
+ static inline void kvm_gmem_init(struct module *module)
+@@ -81,7 +84,7 @@
+ 
+ static inline int kvm_gmem_bind(struct kvm *kvm,
+ 					 struct kvm_memory_slot *slot,
+-					 unsigned int fd, loff_t offset)
++					 unsigned int fd, u64 offset)
+ {
+ 	WARN_ON_ONCE(1);
+ 	return -EIO;

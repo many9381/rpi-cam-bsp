@@ -1,0 +1,22 @@
+From: Camera Firmware Maintainers <maintainers@example.invalid>
+Subject: [PATCH] Select Raspberry Pi compatibility from the target kernel
+
+The Debian archive contains the internal driver layout, including
+common/include. Preserve it, and use target CONFIG_ARCH_BCM2835 instead
+of the build host's uname when selecting Raspberry Pi compatibility.
+
+Upstream-Status: Inappropriate [Yocto cross compilation]
+
+diff --git a/hailort/drivers/linux/pcie/Kbuild b/hailort/drivers/linux/pcie/Kbuild
+--- a/hailort/drivers/linux/pcie/Kbuild
++++ b/hailort/drivers/linux/pcie/Kbuild
+@@ -35,8 +35,7 @@
+ 
+ clean-files := $(hailo_pci-objs)
+ 
+-UNAME_STR=$(shell uname -a)
+-ifneq (,$(findstring raspi, $(UNAME_STR)))
++ifeq ($(CONFIG_ARCH_BCM2835),y)
+     ccflags-y      += -DHAILO_RASBERRY_PIE
+ endif
+ 

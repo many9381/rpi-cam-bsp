@@ -1,0 +1,6 @@
+# short-description: Create a Raspberry Pi USB SSD image
+# Keep Wic's generated /boot fstab entry on the same USB disk selected by
+# CMDLINE_ROOT_PARTITION=/dev/sda2. BOOT_MEDIA does not change Wic's --ondisk.
+
+part /boot --source bootimg-partition --ondisk sda --fstype=vfat --label boot --active --align 4096 --size 100
+part / --source rootfs --ondisk sda --fstype=ext4 --label root --align 4096

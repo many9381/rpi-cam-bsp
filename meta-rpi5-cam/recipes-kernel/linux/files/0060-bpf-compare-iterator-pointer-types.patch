@@ -1,0 +1,20 @@
+From: Firmware Security Follow-up <security@local.invalid>
+Subject: [PATCH] bpf compare iterator pointer types
+
+CVE: CVE-2026-90217
+Upstream-Status: Backport [https://git.kernel.org/linus/83608e303b95d07afba1c15da0b5d9e513c2f15a]
+
+State-pruning code remains in verifier.c in this 6.18 source; upstream split states.c is mapped to that exact implementation.
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -19500,7 +19500,8 @@
+ 			 * infinite loop check triggering, see
+ 			 * iter_active_depths_differ()
+ 			 */
+-			if (old_reg->iter.btf != cur_reg->iter.btf ||
++			if (old_reg->type != cur_reg->type ||
++			    old_reg->iter.btf != cur_reg->iter.btf ||
+ 			    old_reg->iter.btf_id != cur_reg->iter.btf_id ||
+ 			    old_reg->iter.state != cur_reg->iter.state ||
+ 			    /* ignore {old_reg,cur_reg}->iter.depth, see above */

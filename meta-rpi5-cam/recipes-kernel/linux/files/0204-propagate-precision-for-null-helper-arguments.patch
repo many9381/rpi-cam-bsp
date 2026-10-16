@@ -1,0 +1,43 @@
+From: Kernel Security Follow-up <kernel-security@local>
+Subject: [PATCH] propagate precision for null helper arguments
+
+CVE: CVE-2026-98019
+Upstream: https://git.kernel.org/stable/c/69a9ad004ccf5d45e534c7d503f47f643abe64b7
+Upstream-Status: Backport [https://git.kernel.org/stable/c/69a9ad004ccf5d45e534c7d503f47f643abe64b7]
+
+Use retained register_is_null spelling and mark_chain_precision machinery
+in both acceptance paths with error propagation. Keep current selftest
+log expectations unchanged until full kernel verifier logs are observed;
+the bounded regression executes the real backtracker and scalar-pruning
+comparison across parent states and nested frames.
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -9901,11 +9901,15 @@
+ 			return err;
+ 	}
+ 
+-	if (register_is_null(reg) && type_may_be_null(arg_type))
++	if (register_is_null(reg) && type_may_be_null(arg_type)) {
+ 		/* A NULL register has a SCALAR_VALUE type, so skip
+ 		 * type checking.
+ 		 */
++		err = mark_chain_precision(env, regno);
++		if (err)
++			return err;
+ 		goto skip_type_check;
++	}
+ 
+ 	/* arg_btf_id and arg_size are in a union. */
+ 	if (base_type(arg_type) == ARG_PTR_TO_BTF_ID ||
+@@ -11865,6 +11869,9 @@
+ 			verbose(env, "get_local_storage() doesn't support non-zero flags\n");
+ 			return -EINVAL;
+ 		}
++		err = mark_chain_precision(env, BPF_REG_2);
++		if (err)
++			return err;
+ 		break;
+ 	case BPF_FUNC_for_each_map_elem:
+ 		err = push_callback_call(env, insn, insn_idx, meta.subprogno,

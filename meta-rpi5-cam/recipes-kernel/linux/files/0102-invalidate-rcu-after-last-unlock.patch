@@ -1,0 +1,93 @@
+From: Firmware Security Maintenance <security@local.invalid>
+Subject: [PATCH] bpf: invalidate rcu after last unlock
+
+Backport the complete relevant verifier correction to the retained Raspberry Pi
+Linux 6.18.55 API. The retained process_spin_lock uses regno instead of a reg argument. Extract the existing check_kfunc_call RCU invalidation loop into the missing helper, including STACK_SPILL and STACK_ITER and clearing PTR_MAYBE_NULL. Reuse it for explicit RCU unlock without changing existing bool lock state or error guards. The retained five-argument traversal macro is preserved.
+
+CVE: CVE-2026-90317
+Upstream-Status: Backport [https://git.kernel.org/linus/180c7000712db77063b3a26f4c97e7dd9038f449]
+Upstream-Commit: 180c7000712db77063b3a26f4c97e7dd9038f449
+Stable-Commit: 7ae71629357d0a6d0bdadb929c7b296d5b7e61c2
+Stable-Patch-URL: https://git.kernel.org/stable/c/7ae71629357d0a6d0bdadb929c7b296d5b7e61c2
+Stable-Downloaded-Patch-SHA256: ae13c4dd2614710413bd581572b628ae3d66431dcb25ffcfa1ef0b76f06de4dc
+
+---
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -206,6 +206,7 @@
+ static int release_reference_nomark(struct bpf_verifier_state *state, int ref_obj_id);
+ static int release_reference(struct bpf_verifier_env *env, int ref_obj_id);
+ static void invalidate_non_owning_refs(struct bpf_verifier_env *env);
++static void invalidate_rcu_protected_refs(struct bpf_verifier_env *env);
+ static bool in_rbtree_lock_required_cb(struct bpf_verifier_env *env);
+ static int ref_set_non_owning(struct bpf_verifier_env *env,
+ 			      struct bpf_reg_state *reg);
+@@ -8612,6 +8613,7 @@
+ 			return err;
+ 		}
+ 	} else {
++		bool was_in_rcu_cs;
+ 		void *ptr;
+ 		int type;
+ 
+@@ -8639,10 +8641,14 @@
+ 			verbose(env, "%s_unlock cannot be out of order\n", lock_str);
+ 			return -EINVAL;
+ 		}
++		was_in_rcu_cs = in_rcu_cs(env);
+ 		if (release_lock_state(cur, type, reg->id, ptr)) {
+ 			verbose(env, "%s_unlock of different lock\n", lock_str);
+ 			return -EINVAL;
+ 		}
++
++		if (was_in_rcu_cs && !in_rcu_cs(env))
++			invalidate_rcu_protected_refs(env);
+ 
+ 		invalidate_non_owning_refs(env);
+ 	}
+@@ -10577,6 +10583,20 @@
+ 	}));
+ }
+ 
++static void invalidate_rcu_protected_refs(struct bpf_verifier_env *env)
++{
++	struct bpf_func_state *state;
++	struct bpf_reg_state *reg;
++	u32 clear_mask = (1 << STACK_SPILL) | (1 << STACK_ITER);
++
++	bpf_for_each_reg_in_vstate_mask(env->cur_state, state, reg, clear_mask, ({
++		if (reg->type & MEM_RCU) {
++			reg->type &= ~(MEM_RCU | PTR_MAYBE_NULL);
++			reg->type |= PTR_UNTRUSTED;
++		}
++	}));
++}
++
+ static void clear_caller_saved_regs(struct bpf_verifier_env *env,
+ 				    struct bpf_reg_state *regs)
+ {
+@@ -14236,10 +14256,6 @@
+ 	preempt_enable = is_kfunc_bpf_preempt_enable(&meta);
+ 
+ 	if (env->cur_state->active_rcu_lock) {
+-		struct bpf_func_state *state;
+-		struct bpf_reg_state *reg;
+-		u32 clear_mask = (1 << STACK_SPILL) | (1 << STACK_ITER);
+-
+ 		if (in_rbtree_lock_required_cb(env) && (rcu_lock || rcu_unlock)) {
+ 			verbose(env, "Calling bpf_rcu_read_{lock,unlock} in unnecessary rbtree callback\n");
+ 			return -EACCES;
+@@ -14249,12 +14265,7 @@
+ 			verbose(env, "nested rcu read lock (kernel function %s)\n", func_name);
+ 			return -EINVAL;
+ 		} else if (rcu_unlock) {
+-			bpf_for_each_reg_in_vstate_mask(env->cur_state, state, reg, clear_mask, ({
+-				if (reg->type & MEM_RCU) {
+-					reg->type &= ~(MEM_RCU | PTR_MAYBE_NULL);
+-					reg->type |= PTR_UNTRUSTED;
+-				}
+-			}));
++			invalidate_rcu_protected_refs(env);
+ 			env->cur_state->active_rcu_lock = false;
+ 		} else if (sleepable) {
+ 			verbose(env, "kernel func %s is sleepable within rcu_read_lock region\n", func_name);

@@ -1,0 +1,115 @@
+From: Kernel security backport review <noreply@example.invalid>
+Subject: [PATCH] nvme-pci: close iterator DMA and P2P tracking leaks
+
+Adapt both fixes to local blk_dma_unmap/is_p2p and REQ_P2PDMA protocol.
+Bus-address P2P requests own no DMA mappings or PRP tracking array;
+host-bridge mappings use the local dma_map_page/dma_unmap_page pairing.
+Clean initial PRP/data SGL/meta SGL allocation errors using the actual
+iterator mapping mode. Send malformed PRPs through done so dptr fields
+are initialized before descriptor and data mapping cleanup. IOVA cleanup
+uses dma_iova_size: consumed PRP bytes can be shorter than the complete
+IOVA allocation on initial or chained PRP descriptor allocation failure.
+
+CVE: CVE-2026-64019
+CVE: CVE-2026-64020
+Upstream-Status: Backport [https://git.kernel.org/stable/c/1bf86336e4b6cf40873fda47a7fe191446864937]
+Upstream-Status: Backport [https://git.kernel.org/stable/c/85686c72966c5ee637893f124ddb31a1cace7bee]
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -770,6 +770,7 @@
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+ 	struct device *dma_dev = nvmeq->dev->dev;
++	size_t mapped_len;
+ 
+ 	if (iod->flags & IOD_SINGLE_SEGMENT) {
+ 		static_assert(offsetof(union nvme_data_ptr, prp1) ==
+@@ -779,7 +780,10 @@
+ 		return;
+ 	}
+ 
+-	if (!blk_rq_dma_unmap(req, dma_dev, &iod->dma_state, iod->total_len)) {
++	/* IOVA mapping covers the request before PRP construction starts. */
++	mapped_len = dma_use_iova(&iod->dma_state) ?
++		dma_iova_size(&iod->dma_state) : iod->total_len;
++	if (!blk_rq_dma_unmap(req, dma_dev, &iod->dma_state, mapped_len)) {
+ 		if (nvme_pci_cmd_use_sgl(&iod->cmd))
+ 			nvme_free_sgls(req, &iod->cmd.common.dptr.sgl,
+ 				       iod->descriptors[0]);
+@@ -797,7 +801,8 @@
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 
+-	if (dma_use_iova(&iod->dma_state) || !dma_need_unmap(dma_dev))
++	if (dma_use_iova(&iod->dma_state) || !dma_need_unmap(dma_dev) ||
++	    (req->cmd_flags & REQ_P2PDMA))
+ 		return true;
+ 
+ 	if (!iod->nr_dma_vecs) {
+@@ -829,6 +834,17 @@
+ 	return nvme_pci_prp_save_mapping(req, dma_dev, iter);
+ }
+ 
++static void nvme_unmap_iter(struct request *req, struct blk_dma_iter *iter,
++			    struct dma_iova_state *state)
++{
++	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
++	struct device *dev = nvmeq->dev->dev;
++
++	if (!blk_dma_unmap(req, dev, state, iter->len,
++			   iter->p2pdma.map == PCI_P2PDMA_MAP_BUS_ADDR))
++		dma_unmap_page(dev, iter->addr, iter->len, rq_dma_dir(req));
++}
++
+ static blk_status_t nvme_pci_setup_data_prp(struct request *req,
+ 		struct blk_dma_iter *iter)
+ {
+@@ -839,8 +855,10 @@
+ 	unsigned int prp_len, i;
+ 	__le64 *prp_list;
+ 
+-	if (!nvme_pci_prp_save_mapping(req, nvmeq->dev->dev, iter))
++	if (!nvme_pci_prp_save_mapping(req, nvmeq->dev->dev, iter)) {
++		nvme_unmap_iter(req, iter, &iod->dma_state);
+ 		return iter->status;
++	}
+ 
+ 	/*
+ 	 * PRP1 always points to the start of the DMA transfers.
+@@ -945,7 +963,8 @@
+ 	dev_err_once(nvmeq->dev->dev,
+ 		"Incorrectly formed request for payload:%d nents:%d\n",
+ 		blk_rq_payload_bytes(req), blk_rq_nr_phys_segments(req));
+-	return BLK_STS_IOERR;
++	iter->status = BLK_STS_IOERR;
++	goto done;
+ }
+ 
+ static void nvme_pci_sgl_set_data(struct nvme_sgl_desc *sge,
+@@ -988,8 +1007,11 @@
+ 
+ 	sg_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
+ 			&sgl_dma);
+-	if (!sg_list)
++	if (!sg_list) {
++		nvme_unmap_iter(req, iter, &iod->dma_state);
+ 		return BLK_STS_RESOURCE;
++	}
++
+ 	iod->descriptors[iod->nr_descriptors++] = sg_list;
+ 
+ 	do {
+@@ -1121,8 +1143,10 @@
+ 
+ 	sg_list = dma_pool_alloc(nvmeq->descriptor_pools.small, GFP_ATOMIC,
+ 			&sgl_dma);
+-	if (!sg_list)
++	if (!sg_list) {
++		nvme_unmap_iter(req, &iter, &iod->meta_dma_state);
+ 		return BLK_STS_RESOURCE;
++	}
+ 
+ 	iod->meta_descriptor = sg_list;
+ 	iod->meta_dma = sgl_dma;

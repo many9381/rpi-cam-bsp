@@ -1,0 +1,27 @@
+From: Camera firmware maintainers
+Subject: [PATCH] avutil/encryption_info: tolerate absent key array during cleanup
+
+av_encryption_init_info_alloc records num_key_ids before checking whether the
+key_ids allocation succeeded. Its error cleanup must therefore tolerate a
+NULL key_ids pointer with a nonzero count. The allocator also intentionally
+leaves that pointer NULL when key_id_size is zero.
+
+Only walk individual key allocations when the array exists. All other owned
+fields and list nodes are still released. Deterministic allocator failures at
+all six allocation sites and zero-key-size/count controls cover this path.
+This does not change the serialization contract or claim a complete fix for
+the separately tracked MOV CPU-complexity condition.
+
+Upstream-Status: Pending [local allocation-failure cleanup correction]
+
+--- a/libavutil/encryption_info.c
++++ b/libavutil/encryption_info.c
+@@ -221,7 +221,7 @@ void av_encryption_init_info_free(AVEncryptionInitInfo *info)
+         AVEncryptionInitInfo *next = info->next;
+         uint32_t i;
+ 
+-        for (i = 0; i < info->num_key_ids; i++) {
++        for (i = 0; info->key_ids && i < info->num_key_ids; i++) {
+             av_free(info->key_ids[i]);
+         }
+         av_free(info->system_id);

@@ -1,0 +1,3 @@
+# Direct camera acceptance briefly releases the automatic application.
+Cmnd_Alias RPI5_CAMERA_ACCEPTANCE = /usr/bin/systemctl stop camera-firmware.service, /usr/bin/systemctl start camera-firmware.service
+rpiadmin ALL=(root) NOPASSWD: RPI5_CAMERA_ACCEPTANCE

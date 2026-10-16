@@ -1,0 +1,5 @@
+#!/bin/sh
+# Read only this package's table. No arguments, caller paths or shell input.
+set -eu
+[ "$#" -eq 0 ] || exit 64
+exec @SBINDIR@/nft --json list table ip rpi5_security

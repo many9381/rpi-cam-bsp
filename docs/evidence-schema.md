@@ -49,6 +49,12 @@ revision. Exact external source revisions must match the kas lock and collected
 layer revisions. Image checksum files and raw evidence remain in controlled
 external storage under the [artifact retention policy](../artifacts/README.md).
 
+QEMU validation is optional. `validation.qemu` is `PASS` only when both the
+QEMU build and runtime PASS markers exist as regular files for the build ID.
+When no runtime PASS is recorded it is `NOT_RUN`; this does not block a Pi
+release. A runtime PASS without its build marker is rejected as inconsistent
+evidence. Raspberry Pi and camera acceptance remain required.
+
 ## Optional Hailo image
 
 `release_summary.py --profile rpi5-camera-hailo` writes

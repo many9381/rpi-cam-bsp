@@ -1,0 +1,47 @@
+From: Kernel Security Follow-up <kernel-security@local>
+Subject: [PATCH] keep borrowed refcount acquire nullable
+
+CVE: CVE-2026-98038
+Upstream: https://git.kernel.org/stable/c/85074498228a2500ea8b8039c49cc1ab8ad5328f
+Upstream-Status: Backport [https://git.kernel.org/stable/c/85074498228a2500ea8b8039c49cc1ab8ad5328f]
+
+Use the retained acquired_refs model to require a nonzero ref_obj_id
+backed by REF_TYPE_PTR. Do not accept lock or IRQ reference records.
+The generic find_reference_state lacks type filtering and is left intact
+for its existing callers. Preserve the NON_OWN_REF exclusion and existing
+KF_RET_NULL return-state handling.
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1587,6 +1587,21 @@
+ 	return;
+ }
+ 
++static bool reg_is_referenced(struct bpf_verifier_env *env,
++                              const struct bpf_reg_state *reg)
++{
++	struct bpf_verifier_state *state = env->cur_state;
++	int i;
++
++	if (!reg->ref_obj_id)
++		return false;
++	for (i = 0; i < state->acquired_refs; i++)
++		if (state->refs[i].type == REF_TYPE_PTR &&
++		    state->refs[i].id == reg->ref_obj_id)
++			return true;
++	return false;
++}
++
+ static bool find_reference_state(struct bpf_verifier_state *state, int ptr_id)
+ {
+ 	int i;
+@@ -13827,7 +13842,7 @@
+ 				verbose(env, "arg#%d is neither owning or non-owning ref\n", i);
+ 				return -EINVAL;
+ 			}
+-			if (!type_is_non_owning_ref(reg->type))
++			if (!type_is_non_owning_ref(reg->type) && reg_is_referenced(env, reg))
+ 				meta->arg_owning_ref = true;
+ 
+ 			rec = reg_btf_record(reg);

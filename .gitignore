@@ -1,5 +1,9 @@
 .worktrees/
 /rpi-cam-hailo/
+/flash-rpi5-minimal.local.sh
+/collect-boot-log.sh
+/fix-ssd-boot.sh
+/IMG_2954.HEIC
 
 # Worktree-local uv project environment.
 .venv/
@@ -20,6 +24,10 @@ sstate-cache/
 keys/*
 !keys/README.md
 
+# Codex login credentials must never enter source control.
+auth.json
+codex-auth.json
+
 artifacts/*
 !artifacts/README.md
 !artifacts/releases/
@@ -27,3 +35,7 @@ artifacts/releases/*
 !artifacts/releases/*.json
 
 *.log
+
+# Local Hailo vendor packages; never commit Debian binary inputs.
+hailort_*.deb
+hailort-pcie-driver_*.deb

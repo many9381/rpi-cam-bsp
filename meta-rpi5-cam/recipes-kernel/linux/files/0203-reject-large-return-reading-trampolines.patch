@@ -1,0 +1,66 @@
+From: Kernel Security Follow-up <kernel-security@local>
+Subject: [PATCH] reject large return reading trampolines
+
+CVE: CVE-2026-90359
+Upstream: https://git.kernel.org/stable/c/d36ac53fc83baf843c51b7afd6d2471f36b713d8
+Upstream-Status: Backport [https://git.kernel.org/stable/c/d36ac53fc83baf843c51b7afd6d2471f36b713d8]
+
+Apply the check after retained target-model distillation and before
+module/address acquisition, preserving FENTRY and conservative NULL
+prototype handling. This UAPI has no FSESSION or multi attachment
+variants. Add the descriptor check on its existing errout cleanup path.
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -24185,6 +24185,17 @@
+ 	return btf_id_set_contains(&btf_non_sleepable_error_inject, btf_id);
+ }
+ 
++static bool attach_uses_trampoline_retval(enum bpf_attach_type type)
++{
++	switch (type) {
++	case BPF_MODIFY_RETURN:
++	case BPF_TRACE_FEXIT:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ int bpf_check_attach_target(struct bpf_verifier_log *log,
+ 			    const struct bpf_prog *prog,
+ 			    const struct bpf_prog *tgt_prog,
+@@ -24428,6 +24439,14 @@
+ 		ret = btf_distill_func_proto(log, btf, t, tname, &tgt_info->fmodel);
+ 		if (ret < 0)
+ 			return ret;
++
++		if (tgt_info->fmodel.ret_size > 8 &&
++		    attach_uses_trampoline_retval(prog->expected_attach_type)) {
++			bpf_log(log,
++				"Attach to function %s with a >8 byte return value is not supported for this attach type\n",
++				tname);
++			return -EOPNOTSUPP;
++		}
+ 
+ 		if (tgt_prog) {
+ 			if (subprog == 0)
+diff --git a/kernel/bpf/bpf_struct_ops.c b/kernel/bpf/bpf_struct_ops.c
+--- a/kernel/bpf/bpf_struct_ops.c
++++ b/kernel/bpf/bpf_struct_ops.c
+@@ -446,6 +446,14 @@
+ 			goto errout;
+ 		}
+ 
++		/* The trampoline preserves only one 8-byte return register. */
++		if (st_ops->func_models[i].ret_size > 8) {
++			pr_warn("func ptr %s in struct %s has a >8 byte return value, which is not supported\n",
++				mname, st_ops->name);
++			err = -EOPNOTSUPP;
++			goto errout;
++		}
++
+ 		stub_func_addr = *(void **)(st_ops->cfi_stubs + moff);
+ 		err = prepare_arg_info(btf, st_ops->name, mname,
+ 				       func_proto, stub_func_addr,

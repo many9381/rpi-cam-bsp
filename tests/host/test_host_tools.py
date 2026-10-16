@@ -40,7 +40,6 @@ class HostToolsTest(unittest.TestCase):
         for command in (
             "uv",
             "bmaptool",
-            "qemu-system-aarch64",
             "avahi-resolve-host-name",
             "partprobe",
             "ffprobe",
@@ -71,14 +70,12 @@ class HostToolsTest(unittest.TestCase):
                 "ssh-keygen",
                 "ssh-keyscan",
                 "ss",
-                "qemu-system-aarch64",
                 "sha256sum",
                 "setsid",
                 "sort",
                 "awk",
                 "grep",
                 "stat",
-                "df",
                 "nproc",
                 "tr",
                 "tee",
@@ -98,6 +95,15 @@ class HostToolsTest(unittest.TestCase):
                 source = shutil.which(command)
                 self.assertIsNotNone(source, command)
                 (fake_bin / command).symlink_to(source)
+
+            # This checks missing tools, independently of build-cache disk use.
+            fake_df = fake_bin / "df"
+            fake_df.write_text(
+                "#!/usr/bin/bash\n"
+                "printf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' "
+                "'test 200000000 0 200000000 0% /'\n"
+            )
+            fake_df.chmod(0o755)
 
             key = root / "rpi5_admin"
             generated = run(

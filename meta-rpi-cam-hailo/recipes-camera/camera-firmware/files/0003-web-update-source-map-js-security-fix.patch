@@ -1,0 +1,28 @@
+Subject: [PATCH] web: update source-map-js for indexed source map DoS fix
+
+Update the locked build-only dependency to 1.2.2. This prevents attacker
+controlled indexed source map section offsets from blocking the build tool
+runtime's event loop. Runtime camera images do not install node_modules.
+
+CVE: CVE-2026-93749
+Upstream-Status: Pending [firmware repository lockfile update]
+
+diff --git a/web/package-lock.json b/web/package-lock.json
+index 8ede60d..1528cc5 100644
+--- a/web/package-lock.json
++++ b/web/package-lock.json
+@@ -1973,10 +1973,11 @@
+       "dev": true
+     },
+     "node_modules/source-map-js": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+-      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
+       "dev": true,
++      "license": "BSD-3-Clause",
+       "engines": {
+         "node": ">=0.10.0"
+       }

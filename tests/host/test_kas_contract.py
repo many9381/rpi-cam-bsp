@@ -67,17 +67,25 @@ class KasContractTest(unittest.TestCase):
         data = load("rpi5-camera.yml")
         self.assertEqual(
             set(data["repos"]["meta-openembedded"]["layers"]),
-            {"meta-oe", "meta-python", "meta-multimedia"},
+            {"meta-oe", "meta-python", "meta-multimedia", "meta-networking"},
         )
         conf = data["local_conf_header"]["rpi5-camera"]
         for required in (
-            'RASPBERRYPI_CAMERA_V3 = "1"',
+            'INHERIT += "codex-latest"',
+            'RASPBERRYPI_CAMERA_V3 = "0"',
+            'RPI_EXTRA_CONFIG:append = "\\ncamera_auto_detect=1\\n"',
             'PACKAGECONFIG:append:pn-libcamera-apps = " libav"',
             'PACKAGECONFIG:append:pn-rpidistro-ffmpeg = " x264"',
             'PACKAGECONFIG:append:pn-gstreamer1.0-plugins-bad = " srtp"',
             'LICENSE_FLAGS_ACCEPTED += " commercial"',
         ):
             self.assertIn(required, conf)
+
+    def test_only_camera_profiles_resolve_latest_codex(self) -> None:
+        for profile in ("base.yml", "qemuarm64-minimal.yml", "rpi5-minimal.yml"):
+            with self.subTest(profile=profile):
+                self.assertNotIn("codex-latest", str(load(profile)))
+        self.assertIn("kas/rpi5-camera.yml", load("rpi5-camera-hailo.yml")["header"]["includes"])
 
 
 if __name__ == "__main__":

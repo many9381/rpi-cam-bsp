@@ -1,0 +1,20 @@
+From: Firmware Security Follow-up <security@example.invalid>
+Subject: [PATCH] ext4 reject cross superblock donor early
+
+Retain the local scoped-fd ioctl cleanup and reject a different superblock before mnt_want_write_file or ext4_move_extents can acquire locks. This is the complete upstream semantic change.
+
+CVE: CVE-2026-74307
+Upstream-Status: Backport [https://git.kernel.org/stable/c/c143957520c6c9b5cd72e0de8b52b814f0c576fe]
+
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -1664,6 +1664,9 @@
+ 			return -EOPNOTSUPP;
+ 		}
+ 
++		if (file_inode(filp)->i_sb != file_inode(fd_file(donor))->i_sb)
++			return -EXDEV;
++
+ 		err = mnt_want_write_file(filp);
+ 		if (err)
+ 			return err;

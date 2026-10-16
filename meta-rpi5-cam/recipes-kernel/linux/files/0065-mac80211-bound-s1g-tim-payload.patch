@@ -1,0 +1,19 @@
+From: Firmware Security Follow-up <security@local.invalid>
+Subject: [PATCH] mac80211 bound s1g tim payload
+
+CVE: CVE-2026-74336
+Upstream-Status: Backport [https://git.kernel.org/linus/b224d18b1e5d1cddfc67f63f41d80023b2ec8889]
+
+S1G inline helpers remain in ieee80211.h before the upstream header split. The actual parser receives payload length excluding the two-byte element header.
+
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@ -3109,7 +3109,7 @@
+ 	 */
+ 	err = ieee80211_s1g_find_target_block(&enc_blk, &target_aid,
+ 					      tim->virtual_map,
+-					      (const u8 *)tim + tim_len + 2);
++					      (const u8 *)tim + tim_len);
+ 	if (err)
+ 		return false;
+ 

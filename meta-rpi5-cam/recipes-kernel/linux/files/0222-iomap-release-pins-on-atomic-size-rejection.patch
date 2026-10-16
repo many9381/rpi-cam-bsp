@@ -1,0 +1,21 @@
+From: Kernel security backport review <noreply@example.invalid>
+Subject: [PATCH] iomap: release pages on atomic size rejection
+
+Adapt to the older non-bounce iomap_dio_bio_iter. Release successfully
+extracted pages before dropping the rejected atomic bio, preserving the
+existing zero-tail and iterator re-expansion behavior.
+
+CVE: CVE-2026-72370
+Upstream-Status: Backport [https://git.kernel.org/stable/c/681e452683b69a8e1a571cba0f238f8ceacf55d2]
+
+diff --git a/fs/iomap/direct-io.c b/fs/iomap/direct-io.c
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@ -470,6 +470,7 @@
+ 			 * bio_iov_iter_get_pages() returns an error, above.
+ 			 */
+ 			ret = -EINVAL;
++			bio_release_pages(bio, false);
+ 			bio_put(bio);
+ 			goto zero_tail;
+ 		}

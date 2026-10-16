@@ -18,6 +18,12 @@ def verify(root):
                  "brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.txt",
                  "regulatory.db", "regulatory.db.p7s", "LICENCE.cypress"):
         assert (root / "usr/lib/firmware" / file).is_file(), "Missing firmware: " + file
+    workaround = root / "etc/modprobe.d/rpi5-wifi.conf"
+    assert workaround.is_file(), "Missing Broadcom firmware WPA offload workaround"
+    options = [line.split() for line in workaround.read_text().splitlines()
+               if line.strip() and not line.lstrip().startswith("#")]
+    assert options == [["options", "brcmfmac", "feature_disable=0x2000"]], (
+        "Firmware WPA handshake offload must be disabled for the pinned driver")
     unit = root / "usr/lib/systemd/system/rpi5-wifi.service"
     enabled = root / "etc/systemd/system/sys-subsystem-net-devices-wlan0.device.wants/rpi5-wifi.service"
     assert unit.is_file(), "Wi-Fi service missing"
@@ -35,7 +41,7 @@ def verify(root):
     assert config.is_file(), "Provisioned config missing"
     assert stat.S_IMODE(config.stat().st_mode) == 0o600, "Unsafe config mode"
     assert stat.S_IMODE(config.parent.stat().st_mode) == 0o700, "Unsafe config directory mode"
-    print("Wi-Fi rootfs modules, firmware, activation and private config: PASS")
+    print("Wi-Fi rootfs modules, firmware, offload policy, activation and private config: PASS")
 
 
 if __name__ == "__main__":

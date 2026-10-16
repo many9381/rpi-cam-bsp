@@ -1,0 +1,103 @@
+From: Firmware Security Maintenance <security@local.invalid>
+Subject: [PATCH] bpf: reject local storage deletion from NMI
+
+The retained bpf_selem_unlink(selem, reuse_now) is a void no-fail primitive.
+Keep that API and its map teardown caller unchanged. Its four fallible
+helper/syscall callers are the sk, inode, task and cgroup deletion functions;
+reject NMI there after the existing lookup/busy checks and before unlink.
+All current false-reuse unlink callers are covered. Owner destruction uses
+bpf_local_storage_destroy directly; map destruction uses reuse_now=true.
+Both teardown paths remain unconditionally effective.
+
+As upstream documents, this prevents NMI deferred-free deadlocks only.
+Reentrant non-NMI deferred freeing remains outside this partial mitigation.
+
+CVE: CVE-2026-53106
+Upstream-Status: Backport [https://git.kernel.org/linus/350de5b8a9befaa2a68861c51f671d4f5f751ca5]
+Stable-Commit: e84acaf936970b5b0be2c93bbf255295ba9406df
+Stable-Downloaded-Patch-SHA256: b92854468e476992b46cfb36eeb01c9fcd10fc5285eaede3e0e2d7585448ff68
+
+---
+--- a/net/core/bpf_sk_storage.c
++++ b/net/core/bpf_sk_storage.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /* Copyright (c) 2019 Facebook  */
++#include <linux/preempt.h>
+ #include <linux/rculist.h>
+ #include <linux/list.h>
+ #include <linux/hash.h>
+@@ -39,6 +40,10 @@
+ 	sdata = bpf_sk_storage_lookup(sk, map, false);
+ 	if (!sdata)
+ 		return -ENOENT;
++
++	/* RCU deferred free is not safe from NMI context. */
++	if (in_nmi())
++		return -EOPNOTSUPP;
+ 
+ 	bpf_selem_unlink(SELEM(sdata), false);
+ 
+--- a/kernel/bpf/bpf_inode_storage.c
++++ b/kernel/bpf/bpf_inode_storage.c
+@@ -4,6 +4,7 @@
+  * Copyright 2020 Google LLC.
+  */
+ 
++#include <linux/preempt.h>
+ #include <linux/rculist.h>
+ #include <linux/list.h>
+ #include <linux/hash.h>
+@@ -109,6 +110,10 @@
+ 	sdata = inode_storage_lookup(inode, map, false);
+ 	if (!sdata)
+ 		return -ENOENT;
++
++	/* RCU deferred free is not safe from NMI context. */
++	if (in_nmi())
++		return -EOPNOTSUPP;
+ 
+ 	bpf_selem_unlink(SELEM(sdata), false);
+ 
+--- a/kernel/bpf/bpf_task_storage.c
++++ b/kernel/bpf/bpf_task_storage.c
+@@ -4,6 +4,7 @@
+  * Copyright 2020 Google LLC.
+  */
+ 
++#include <linux/preempt.h>
+ #include <linux/pid.h>
+ #include <linux/sched.h>
+ #include <linux/rculist.h>
+@@ -166,6 +167,10 @@
+ 
+ 	if (!nobusy)
+ 		return -EBUSY;
++
++	/* RCU deferred free is not safe from NMI context. */
++	if (in_nmi())
++		return -EOPNOTSUPP;
+ 
+ 	bpf_selem_unlink(SELEM(sdata), false);
+ 
+--- a/kernel/bpf/bpf_cgrp_storage.c
++++ b/kernel/bpf/bpf_cgrp_storage.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
+  */
+ 
++#include <linux/preempt.h>
+ #include <linux/types.h>
+ #include <linux/bpf.h>
+ #include <linux/bpf_local_storage.h>
+@@ -117,6 +118,10 @@
+ 	sdata = cgroup_storage_lookup(cgroup, map, false);
+ 	if (!sdata)
+ 		return -ENOENT;
++
++	/* RCU deferred free is not safe from NMI context. */
++	if (in_nmi())
++		return -EOPNOTSUPP;
+ 
+ 	bpf_selem_unlink(SELEM(sdata), false);
+ 	return 0;

@@ -17,8 +17,8 @@ Jobs invoke exactly one provider-neutral stage:
 Publish ignored `artifacts/BUILD_ID/` only to access-controlled CI artifact
 storage. Never publish `keys/`. Each build job requires empty CI key paths,
 creates one ephemeral SSH key pair, and removes exactly that pair on exit.
-`rpi5-image` intentionally reruns QEMU in the same job so the QEMU gate and
-generated image use the same key, build ID, and Git revision.
+`rpi5-image` builds only the Pi image. The independent `qemu` stage is optional
+and runs only when selected explicitly; it is not a prerequisite for Pi jobs.
 
 Each job allows the pinned Astral uv 0.11.31 installer download, keeps the
 installer under ignored `.state/uv-bin`, runs `uv lock --check` and

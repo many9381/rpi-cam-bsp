@@ -25,7 +25,11 @@ class FirmwarePackagingTest(unittest.TestCase):
         modules = self.source / "web/node_modules"
         modules.mkdir()
         (modules / "build-host-only").write_text("not a target asset")
-        self.recipe_dir = REPO_ROOT / "meta-rpi5-cam/recipes-camera/camera-firmware"
+        self.recipe_dir = REPO_ROOT / "meta-rpi-cam-hailo/recipes-camera/camera-firmware"
+        self.assertTrue(
+            self.recipe_dir.is_dir(),
+            f"dedicated firmware recipe directory is missing: {self.recipe_dir}",
+        )
 
     def install(self) -> subprocess.CompletedProcess:
         recipe = (self.recipe_dir / "camera-firmware-web_git.bb").read_text()

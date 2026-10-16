@@ -1,0 +1,154 @@
+Subject: [PATCH] security: fix web dependency and CycloneDX hash encoding
+
+Update source-map-js to 1.2.2 for the indexed source map denial-of-service
+fix, and decode npm SRI values to validated hexadecimal CycloneDX hashes.
+Include focused regression tests for the source checkout shipped by the
+development image.
+
+CVE: CVE-2026-93749
+Upstream-Status: Pending [firmware repository security updates]
+
+diff --git a/tools/security/generate_sbom.py b/tools/security/generate_sbom.py
+index 09bdf1e..38d51d8 100755
+--- a/tools/security/generate_sbom.py
++++ b/tools/security/generate_sbom.py
+@@ -15,6 +15,8 @@ only inputs that change between runs are the installed package versions and
+ the lockfile, so diffs of these files show exactly what changed.
+ """
+ import argparse
++import base64
++import binascii
+ import datetime
+ import hashlib
+ import json
+@@ -110,8 +112,30 @@ def platform_components():
+     ]
+ 
+ 
++def integrity_hashes(integrity):
++    """Convert npm SRI base64 digests to validated CycloneDX hex digests."""
++    lengths = {"sha1": 20, "sha256": 32, "sha384": 48, "sha512": 64}
++    if not isinstance(integrity, str) or not integrity.split():
++        raise ValueError("invalid npm integrity value")
++    hashes = []
++    for value in integrity.split():
++        algorithm, _, encoded = value.partition("-")
++        if algorithm not in lengths:
++            raise ValueError(f"unsupported npm integrity algorithm: {algorithm}")
++        try:
++            digest = base64.b64decode(encoded, validate=True)
++        except (ValueError, binascii.Error) as error:
++            raise ValueError(f"invalid {algorithm} integrity encoding") from error
++        if len(digest) != lengths[algorithm]:
++            raise ValueError(f"invalid {algorithm} integrity length")
++        hashes.append({"alg": algorithm.upper().replace("SHA", "SHA-"),
++                       "content": digest.hex()})
++    return hashes
++
++
+ def web_components():
+-    lock = json.load(open(os.path.join(ROOT, "web", "package-lock.json")))
++    with open(os.path.join(ROOT, "web", "package-lock.json"), encoding="utf-8") as source:
++        lock = json.load(source)
+     direct = set(lock["packages"][""].get("dependencies", {})) | set(lock["packages"][""].get("devDependencies", {}))
+     comps = []
+     for path, meta in lock["packages"].items():
+@@ -123,8 +147,7 @@ def web_components():
+                 "scope": "excluded" if meta.get("dev") else "required",
+                 "properties": [{"name": "web:dependency-kind", "value": ("direct" if name in direct else "transitive") + (", dev" if meta.get("dev") else "")}]}
+         if meta.get("integrity"):
+-            alg, _, digest = meta["integrity"].partition("-")
+-            comp["hashes"] = [{"alg": alg.upper().replace("SHA", "SHA-"), "content": digest}]
++            comp["hashes"] = integrity_hashes(meta["integrity"])
+         if meta.get("license") and isinstance(meta["license"], str):
+             comp["licenses"] = [{"license": {"id": meta["license"]}}]
+         comps.append(comp)
+diff --git a/web/package-lock.json b/web/package-lock.json
+index 8ede60d..1528cc5 100644
+--- a/web/package-lock.json
++++ b/web/package-lock.json
+@@ -1973,10 +1973,11 @@
+       "dev": true
+     },
+     "node_modules/source-map-js": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+-      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
+       "dev": true,
++      "license": "BSD-3-Clause",
+       "engines": {
+         "node": ">=0.10.0"
+       }
+diff --git a/tools/security/test_generate_sbom.py b/tools/security/test_generate_sbom.py
+new file mode 100644
+index 0000000..1cc88d9
+--- /dev/null
++++ b/tools/security/test_generate_sbom.py
+@@ -0,0 +1,64 @@
++"""Regression tests for npm integrity values in the web CycloneDX SBOM."""
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++
++import generate_sbom
++
++
++class WebIntegrityTests(unittest.TestCase):
++    def components(self, integrity):
++        with tempfile.TemporaryDirectory() as directory:
++            web = Path(directory) / "web"
++            web.mkdir()
++            package = {"version": "1.0.0", "dev": True}
++            if integrity is not None:
++                package["integrity"] = integrity
++            (web / "package-lock.json").write_text(json.dumps({
++                "lockfileVersion": 3,
++                "packages": {"": {}, "node_modules/example": package},
++            }), encoding="utf-8")
++            with patch.object(generate_sbom, "ROOT", directory):
++                return generate_sbom.web_components()
++
++    def test_sri_digests_are_decoded_to_cyclonedx_hex(self):
++        # Known digests of "abc", independently checked against standard vectors.
++        cases = (
++            ("sha1-qZk+NkcGgWq6PiVxeFDCbJzQ2J0=", "SHA-1",
++             "a9993e364706816aba3e25717850c26c9cd0d89d"),
++            ("sha256-ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=", "SHA-256",
++             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
++            ("sha384-ywB1P0WjXou1oD1pmsZQBycsMqsO3tFjGotgWkP/W+2AhgcroefMI1i67KE0yCWn", "SHA-384",
++             "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"),
++            ("sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw==", "SHA-512",
++             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"),
++        )
++        for integrity, algorithm, digest in cases:
++            with self.subTest(algorithm=algorithm):
++                self.assertEqual(self.components(integrity)[0]["hashes"],
++                                 [{"alg": algorithm, "content": digest}])
++
++    def test_multiple_sri_hashes_are_preserved(self):
++        component = self.components(
++            "sha1-qZk+NkcGgWq6PiVxeFDCbJzQ2J0= "
++            "sha256-ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=")[0]
++        self.assertEqual(component["hashes"], [
++            {"alg": "SHA-1", "content": "a9993e364706816aba3e25717850c26c9cd0d89d"},
++            {"alg": "SHA-256", "content": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
++        ])
++
++    def test_invalid_integrity_is_rejected_instead_of_emitting_invalid_hashes(self):
++        for integrity in ("sha512-not!base64", "sha512-YWJj", "sha512-",
++                          "sha999-YWJj", "sha512", "   "):
++            with self.subTest(integrity=integrity):
++                with self.assertRaises(ValueError):
++                    self.components(integrity)
++
++    def test_dependency_without_integrity_has_no_hashes(self):
++        self.assertNotIn("hashes", self.components(None)[0])
++
++
++if __name__ == "__main__":
++    unittest.main()

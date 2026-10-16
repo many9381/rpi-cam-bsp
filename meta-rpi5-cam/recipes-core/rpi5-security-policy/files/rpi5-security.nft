@@ -1,0 +1,13 @@
+# One atomic transaction replaces only this package's table. Keep all other
+# firewall tables intact; reload must not accumulate rules or expose a gap.
+destroy table ip rpi5_security
+table ip rpi5_security {
+    chain input {
+        type filter hook input priority -10; policy accept;
+        icmp type timestamp-request counter drop
+    }
+    chain output {
+        type filter hook output priority -10; policy accept;
+        icmp type timestamp-reply counter drop
+    }
+}

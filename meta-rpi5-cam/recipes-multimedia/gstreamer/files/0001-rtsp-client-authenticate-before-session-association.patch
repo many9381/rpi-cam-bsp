@@ -1,0 +1,82 @@
+From: Camera Firmware Maintainers <firmware@example.invalid>
+Subject: [PATCH] rtsp-client: authorize requests before acquiring sessions
+
+A rejected request must not watch or extend another client's session. Closing
+such an unauthenticated connection otherwise removes the original TCP media.
+Authenticate before session-pool lookup and restrict response messages to the
+connection's existing sessions. Auth policies allowing public methods must
+require authorization when those requests contain session selectors.
+
+Covered by the firmware's GstRtspDigestAuthTest and live TLS session-isolation
+integration tests, including unsolicited responses and normal playback/teardown.
+
+Upstream-Status: Pending
+
+--- a/gst/rtsp-server/rtsp-client.c
++++ b/gst/rtsp-server/rtsp-client.c
+@@ -4080,6 +4080,18 @@
+     }
+   }
+ 
++  /* Authenticate before looking up a session: pool_find() touches its
++   * lifetime and watching it allows disconnect cleanup to remove its media.
++   * No unauthenticated request may acquire either side effect. URL auth
++   * implementations must inspect session selectors in the request headers. */
++  if (uri)
++    sanitize_uri (uri);
++  ctx->uri = uri;
++  ctx->session = NULL;
++
++  if (!gst_rtsp_auth_check (GST_RTSP_AUTH_CHECK_URL))
++    goto not_authorized;
++
+   /* get the session if there is any */
+   res = gst_rtsp_message_get_header (request, GST_RTSP_HDR_PIPELINED_REQUESTS,
+       &pipelined_request_id, 0);
+@@ -4109,14 +4121,7 @@
+     client_watch_session (client, session);
+   }
+ 
+-  /* sanitize the uri */
+-  if (uri)
+-    sanitize_uri (uri);
+-  ctx->uri = uri;
+   ctx->session = session;
+-
+-  if (!gst_rtsp_auth_check (GST_RTSP_AUTH_CHECK_URL))
+-    goto not_authorized;
+ 
+   /* handle any 'Require' headers */
+   if (!check_request_requirements (ctx, &unsupported_reqs))
+@@ -4265,14 +4270,24 @@
+     if (priv->session_pool == NULL)
+       goto no_pool;
+ 
+-    /* we had a session in the request, find it again */
+-    if (!(session = gst_rtsp_session_pool_find (priv->session_pool, sessid)))
++    GList *walk;
++
++    /* Responses have no request authentication step. They may refer only to
++     * sessions already associated with this connection by an accepted request,
++     * never attach or touch another client's session from the global pool. */
++    g_mutex_lock (&priv->lock);
++    for (walk = priv->sessions; walk; walk = g_list_next (walk)) {
++      GstRTSPSession *candidate = walk->data;
++
++      if (g_strcmp0 (gst_rtsp_session_get_sessionid (candidate), sessid) == 0) {
++        session = g_object_ref (candidate);
++        break;
++      }
++    }
++    g_mutex_unlock (&priv->lock);
++    if (!session)
+       goto session_not_found;
+-
+-    /* we add the session to the client list of watched sessions. When a session
+-     * disappears because it times out, we will be notified. If all sessions are
+-     * gone, we will close the connection */
+-    client_watch_session (client, session);
++    gst_rtsp_session_touch (session);
+   }
+ 
+   ctx->session = session;

@@ -1,0 +1,219 @@
+From: Kernel security backport review <noreply@example.invalid>
+Subject: [PATCH] fbdev: serialize and validate user mode updates
+
+Backport the complete helper/caller and sysfs serialization pair. Keep
+fbcon_update_vcs and fbcon_modechange_possible exports available for existing
+modules while adding fb_set_var_from_user. Preserve existing modelist
+bounds/deleted-mode fixes and console_lock before lock_fb_info ordering.
+
+CVE: CVE-2026-80785
+CVE: CVE-2026-80786
+Upstream-Status: Backport [https://git.kernel.org/stable/c/6f611e5e5f3327cf2e2daabe6ee5acac58cc784e]
+Upstream-Status: Backport [https://git.kernel.org/stable/c/061db6b7a910b8378f3b2df64f8c0a3ddc6e85f2]
+
+diff --git a/drivers/video/fbdev/core/fb_chrdev.c b/drivers/video/fbdev/core/fb_chrdev.c
+--- a/drivers/video/fbdev/core/fb_chrdev.c
++++ b/drivers/video/fbdev/core/fb_chrdev.c
+@@ -110,11 +110,7 @@
+ 		var.activate &= ~FB_ACTIVATE_KD_TEXT;
+ 		console_lock();
+ 		lock_fb_info(info);
+-		ret = fbcon_modechange_possible(info, &var);
+-		if (!ret)
+-			ret = fb_set_var(info, &var);
+-		if (!ret)
+-			fbcon_update_vcs(info, var.activate & FB_ACTIVATE_ALL);
++		ret = fb_set_var_from_user(info, &var);
+ 		unlock_fb_info(info);
+ 		console_unlock();
+ 		if (!ret && copy_to_user(argp, &var, sizeof(var)))
+diff --git a/drivers/video/fbdev/core/fbmem.c b/drivers/video/fbdev/core/fbmem.c
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@ -350,6 +350,19 @@
+ }
+ EXPORT_SYMBOL(fb_set_var);
+ 
++int fb_set_var_from_user(struct fb_info *info, struct fb_var_screeninfo *var)
++{
++	int ret = fbcon_modechange_possible(info, var);
++
++	if (!ret)
++		ret = fb_set_var(info, var);
++	if (!ret)
++		fbcon_update_vcs(info, var->activate & FB_ACTIVATE_ALL);
++
++	return ret;
++}
++EXPORT_SYMBOL(fb_set_var_from_user);
++
+ static void fb_lcd_notify_blank(struct fb_info *info)
+ {
+ 	int power;
+diff --git a/drivers/video/fbdev/core/fbsysfs.c b/drivers/video/fbdev/core/fbsysfs.c
+--- a/drivers/video/fbdev/core/fbsysfs.c
++++ b/drivers/video/fbdev/core/fbsysfs.c
+@@ -13,21 +13,24 @@
+ #include "fb_internal.h"
+ #include "fbcon.h"
+ 
++static int activate_locked(struct fb_info *fb_info,
++			    struct fb_var_screeninfo *var)
++{
++	var->activate |= FB_ACTIVATE_FORCE;
++	return fb_set_var_from_user(fb_info, var);
++}
++
+ static int activate(struct fb_info *fb_info, struct fb_var_screeninfo *var)
+ {
+ 	int err;
+ 
+-	var->activate |= FB_ACTIVATE_FORCE;
+ 	console_lock();
+ 	lock_fb_info(fb_info);
+-	err = fb_set_var(fb_info, var);
+-	if (!err)
+-		fbcon_update_vcs(fb_info, var->activate & FB_ACTIVATE_ALL);
++	err = activate_locked(fb_info, var);
+ 	unlock_fb_info(fb_info);
+ 	console_unlock();
+-	if (err)
+-		return err;
+-	return 0;
++
++	return err;
+ }
+ 
+ static int mode_string(char *buf, size_t size, unsigned int offset,
+@@ -68,6 +71,9 @@
+ 
+ 	memset(&var, 0, sizeof(var));
+ 
++	console_lock();
++	lock_fb_info(fb_info);
++
+ 	list_for_each_entry(modelist, &fb_info->modelist, list) {
+ 		mode = &modelist->mode;
+ 		i = mode_string(mstr, sizeof(mstr), 0, mode);
+@@ -75,12 +81,22 @@
+ 
+ 			var = fb_info->var;
+ 			fb_videomode_to_var(&var, mode);
+-			if ((err = activate(fb_info, &var)))
++			err = activate_locked(fb_info, &var);
++			if (err) {
++				unlock_fb_info(fb_info);
++				console_unlock();
+ 				return err;
++			}
+ 			fb_info->mode = mode;
++			unlock_fb_info(fb_info);
++			console_unlock();
+ 			return count;
+ 		}
+ 	}
++
++	unlock_fb_info(fb_info);
++	console_unlock();
++
+ 	return -EINVAL;
+ }
+ 
+@@ -88,11 +104,20 @@
+ 			 char *buf)
+ {
+ 	struct fb_info *fb_info = dev_get_drvdata(device);
+-
+-	if (!fb_info->mode)
++	struct fb_videomode mode;
++	bool have_mode = false;
++
++	lock_fb_info(fb_info);
++	if (fb_info->mode) {
++		mode = *fb_info->mode;
++		have_mode = true;
++	}
++	unlock_fb_info(fb_info);
++
++	if (!have_mode)
+ 		return 0;
+ 
+-	return mode_string(buf, PAGE_SIZE, 0, fb_info->mode);
++	return mode_string(buf, PAGE_SIZE, 0, &mode);
+ }
+ 
+ static ssize_t store_modes(struct device *device,
+@@ -140,12 +165,15 @@
+ 	const struct fb_videomode *mode;
+ 
+ 	i = 0;
++	lock_fb_info(fb_info);
+ 	list_for_each_entry(modelist, &fb_info->modelist, list) {
+ 		mode = &modelist->mode;
+ 		i += mode_string(buf, PAGE_SIZE, i, mode);
+ 		if (i >= PAGE_SIZE - 1)
+ 			break;
+ 	}
++	unlock_fb_info(fb_info);
++
+ 	return i;
+ }
+ 
+diff --git a/drivers/video/fbdev/ps3fb.c b/drivers/video/fbdev/ps3fb.c
+--- a/drivers/video/fbdev/ps3fb.c
++++ b/drivers/video/fbdev/ps3fb.c
+@@ -29,7 +29,6 @@
+ #include <linux/freezer.h>
+ #include <linux/uaccess.h>
+ #include <linux/fb.h>
+-#include <linux/fbcon.h>
+ #include <linux/init.h>
+ 
+ #include <asm/cell-regs.h>
+@@ -830,9 +829,7 @@
+ 				/* Force, in case only special bits changed */
+ 				var.activate |= FB_ACTIVATE_FORCE;
+ 				par->new_mode_id = val;
+-				retval = fb_set_var(info, &var);
+-				if (!retval)
+-					fbcon_update_vcs(info, var.activate & FB_ACTIVATE_ALL);
++				retval = fb_set_var_from_user(info, &var);
+ 				console_unlock();
+ 			}
+ 			break;
+diff --git a/drivers/video/fbdev/sh_mobile_lcdcfb.c b/drivers/video/fbdev/sh_mobile_lcdcfb.c
+--- a/drivers/video/fbdev/sh_mobile_lcdcfb.c
++++ b/drivers/video/fbdev/sh_mobile_lcdcfb.c
+@@ -15,7 +15,6 @@
+ #include <linux/ctype.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/delay.h>
+-#include <linux/fbcon.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/ioctl.h>
+@@ -1765,11 +1764,9 @@
+ 	var.height = ch->display.height;
+ 	var.activate = FB_ACTIVATE_NOW;
+ 
+-	if (fb_set_var(info, &var) < 0)
++	if (fb_set_var_from_user(info, &var) < 0)
+ 		/* Couldn't reconfigure, hopefully, can continue as before */
+ 		return;
+-
+-	fbcon_update_vcs(info, true);
+ }
+ 
+ /*
+diff --git a/include/linux/fb.h b/include/linux/fb.h
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -542,6 +542,8 @@
+ extern int fb_pan_display(struct fb_info *info, struct fb_var_screeninfo *var);
+ extern int fb_blank(struct fb_info *info, int blank);
+ 
++int fb_set_var_from_user(struct fb_info *info, struct fb_var_screeninfo *var);
++
+ /*
+  * Helpers for framebuffers in I/O memory
+  */

@@ -47,7 +47,7 @@ class ReleaseSummaryTest(unittest.TestCase):
         )
 
         base = root / "artifacts" / BUILD_ID
-        for marker in release_summary.REQUIRED_MARKERS:
+        for marker in (*release_summary.REQUIRED_MARKERS, "qemu/COMPLETE", "qemu-test/PASS"):
             path = base / marker
             path.parent.mkdir(parents=True, exist_ok=True)
             path.touch()
@@ -138,6 +138,39 @@ class ReleaseSummaryTest(unittest.TestCase):
             },
             "validation_completed_at": COMPLETED_AT,
         }
+
+    def test_release_without_qemu_is_allowed_and_does_not_claim_qemu_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            base = root / "artifacts" / BUILD_ID
+            shutil.rmtree(base / "qemu")
+            shutil.rmtree(base / "qemu-test")
+            record = self.build(root)
+            self.assertEqual(record["validation"]["qemu"], "NOT_RUN")
+            self.assertEqual(record["validation"]["rpi5"], "PASS")
+
+    def test_qemu_build_without_runtime_test_is_not_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            (root / "artifacts" / BUILD_ID / "qemu-test/PASS").unlink()
+            self.assertEqual(self.build(root)["validation"]["qemu"], "NOT_RUN")
+
+    def test_qemu_pass_requires_regular_build_and_test_markers(self) -> None:
+        for mode in ("missing_build", "symlink_build", "symlink_test"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.fixture(root)
+                base = root / "artifacts" / BUILD_ID
+                marker = base / ("qemu-test/PASS" if mode == "symlink_test" else "qemu/COMPLETE")
+                marker.unlink()
+                if mode.startswith("symlink"):
+                    target = root / "marker-target"
+                    target.touch()
+                    marker.symlink_to(target)
+                with self.assertRaisesRegex(ValueError, "QEMU .* marker"):
+                    self.build(root)
 
     def test_builds_exact_sanitized_record_from_complete_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,6 +330,26 @@ class ReleaseSummaryTest(unittest.TestCase):
 
                     with self.assertRaises(ValueError):
                         self.build(root)
+
+    def test_checksum_accepts_collected_manifest_and_provenance_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "SHA256SUMS"
+            path.write_text(f"{'b' * 64}  images/{CAMERA_IMAGE}\n"
+                            f"{'c' * 64}  manifests/camera-integrity-public.pem\n"
+                            f"{'d' * 64}  manifests/image.spdx.json\n"
+                            f"{'e' * 64}  provenance/sources.tar\n")
+            self.assertEqual(release_summary.image_checksum(path, CAMERA_IMAGE)["sha256"], "b" * 64)
+            for unsafe in ("manifests/../escape", "provenance/nested/escape", "security/PASS",
+                           "manifests/.secret", "provenance/another.wic.bz2"):
+                with self.subTest(unsafe=unsafe):
+                    path.write_text(f"{'b' * 64}  images/{CAMERA_IMAGE}\n{'c' * 64}  {unsafe}\n")
+                    with self.assertRaisesRegex(ValueError, "checksum"):
+                        release_summary.image_checksum(path, CAMERA_IMAGE)
+            path.write_text(f"{'b' * 64}  images/{CAMERA_IMAGE}\n"
+                            f"{'c' * 64}  manifests/image.spdx.json\n"
+                            f"{'d' * 64}  manifests/image.spdx.json\n")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                release_summary.image_checksum(path, CAMERA_IMAGE)
 
     def test_requires_profile_specific_wic_checksum(self) -> None:
         cases = (

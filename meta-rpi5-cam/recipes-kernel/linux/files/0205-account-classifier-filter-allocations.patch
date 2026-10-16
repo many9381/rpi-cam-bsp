@@ -1,0 +1,229 @@
+From: Kernel Security Follow-up <kernel-security@local>
+Subject: [PATCH] account classifier filter allocations
+
+CVE: CVE-2026-90099
+Upstream: https://git.kernel.org/stable/c/18c68c8f3d3ff0a4def1391021b439c4333a6c71
+Upstream-Status: Backport [https://git.kernel.org/stable/c/18c68c8f3d3ff0a4def1391021b439c4333a6c71]
+
+Use retained kzalloc/kcalloc APIs rather than newer object-allocation
+wrappers; carry GFP_KERNEL_ACCOUNT through all upstream filter and aux
+sites, including u32 replace. Use existing percpu GFP variants. Roll
+back a newly inserted basic IDR entry when percpu allocation fails while
+preserving an existing replacement handle.
+
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -3373,7 +3373,7 @@
+ 	 */
+ 	exts->net = net;
+ 	exts->actions = kcalloc(TCA_ACT_MAX_PRIO, sizeof(struct tc_action *),
+-				GFP_KERNEL);
++				GFP_KERNEL_ACCOUNT);
+ 	if (!exts->actions)
+ 		return -ENOMEM;
+ #endif
+diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -193,7 +193,7 @@
+ 			return -EINVAL;
+ 	}
+ 
+-	fnew = kzalloc(sizeof(*fnew), GFP_KERNEL);
++	fnew = kzalloc(sizeof(*fnew), GFP_KERNEL_ACCOUNT);
+ 	if (!fnew)
+ 		return -ENOBUFS;
+ 
+@@ -212,9 +212,11 @@
+ 	if (err)
+ 		goto errout;
+ 	fnew->handle = handle;
+-	fnew->pf = alloc_percpu(struct tc_basic_pcnt);
++	fnew->pf = alloc_percpu_gfp(struct tc_basic_pcnt, GFP_KERNEL_ACCOUNT);
+ 	if (!fnew->pf) {
+ 		err = -ENOMEM;
++		if (!fold)
++			idr_remove(&head->handle_idr, fnew->handle);
+ 		goto errout;
+ 	}
+ 
+diff --git a/net/sched/cls_bpf.c b/net/sched/cls_bpf.c
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -352,7 +352,7 @@
+ 	if (bpf_size != nla_len(tb[TCA_BPF_OPS]))
+ 		return -EINVAL;
+ 
+-	bpf_ops = kmemdup(nla_data(tb[TCA_BPF_OPS]), bpf_size, GFP_KERNEL);
++	bpf_ops = kmemdup(nla_data(tb[TCA_BPF_OPS]), bpf_size, GFP_KERNEL_ACCOUNT);
+ 	if (bpf_ops == NULL)
+ 		return -ENOMEM;
+ 
+@@ -403,7 +403,7 @@
+ 	}
+ 
+ 	if (tb[TCA_BPF_NAME]) {
+-		name = nla_memdup(tb[TCA_BPF_NAME], GFP_KERNEL);
++		name = nla_memdup(tb[TCA_BPF_NAME], GFP_KERNEL_ACCOUNT);
+ 		if (!name) {
+ 			bpf_prog_put(fp);
+ 			return -ENOMEM;
+@@ -443,7 +443,7 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	prog = kzalloc(sizeof(*prog), GFP_KERNEL);
++	prog = kzalloc(sizeof(*prog), GFP_KERNEL_ACCOUNT);
+ 	if (!prog)
+ 		return -ENOBUFS;
+ 
+diff --git a/net/sched/cls_cgroup.c b/net/sched/cls_cgroup.c
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -95,7 +95,7 @@
+ 	if (head && handle != head->handle)
+ 		return -ENOENT;
+ 
+-	new = kzalloc(sizeof(*head), GFP_KERNEL);
++	new = kzalloc(sizeof(*head), GFP_KERNEL_ACCOUNT);
+ 	if (!new)
+ 		return -ENOBUFS;
+ 
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -438,7 +438,7 @@
+ 			return -EOPNOTSUPP;
+ 	}
+ 
+-	fnew = kzalloc(sizeof(*fnew), GFP_KERNEL);
++	fnew = kzalloc(sizeof(*fnew), GFP_KERNEL_ACCOUNT);
+ 	if (!fnew)
+ 		return -ENOBUFS;
+ 
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -2237,7 +2237,7 @@
+ 	struct fl_flow_mask *newmask;
+ 	int err;
+ 
+-	newmask = kzalloc(sizeof(*newmask), GFP_KERNEL);
++	newmask = kzalloc(sizeof(*newmask), GFP_KERNEL_ACCOUNT);
+ 	if (!newmask)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -2398,7 +2398,7 @@
+ 		goto errout_tb;
+ 	}
+ 
+-	fnew = kzalloc(sizeof(*fnew), GFP_KERNEL);
++	fnew = kzalloc(sizeof(*fnew), GFP_KERNEL_ACCOUNT);
+ 	if (!fnew) {
+ 		err = -ENOBUFS;
+ 		goto errout_tb;
+diff --git a/net/sched/cls_fw.c b/net/sched/cls_fw.c
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@ -276,7 +276,7 @@
+ 		if (f->id != handle && handle)
+ 			return -EINVAL;
+ 
+-		fnew = kzalloc(sizeof(struct fw_filter), GFP_KERNEL);
++		fnew = kzalloc(sizeof(struct fw_filter), GFP_KERNEL_ACCOUNT);
+ 		if (!fnew)
+ 			return -ENOBUFS;
+ 
+@@ -330,7 +330,7 @@
+ 		rcu_assign_pointer(tp->root, head);
+ 	}
+ 
+-	f = kzalloc(sizeof(struct fw_filter), GFP_KERNEL);
++	f = kzalloc(sizeof(struct fw_filter), GFP_KERNEL_ACCOUNT);
+ 	if (f == NULL)
+ 		return -ENOBUFS;
+ 
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -189,7 +189,7 @@
+ 			return -EINVAL;
+ 	}
+ 
+-	new = kzalloc(sizeof(*new), GFP_KERNEL);
++	new = kzalloc(sizeof(*new), GFP_KERNEL_ACCOUNT);
+ 	if (!new)
+ 		return -ENOBUFS;
+ 
+@@ -201,7 +201,7 @@
+ 		handle = 1;
+ 	new->handle = handle;
+ 	new->flags = userflags;
+-	new->pf = alloc_percpu(struct tc_matchall_pcnt);
++	new->pf = alloc_percpu_gfp(struct tc_matchall_pcnt, GFP_KERNEL_ACCOUNT);
+ 	if (!new->pf) {
+ 		err = -ENOMEM;
+ 		goto err_alloc_percpu;
+diff --git a/net/sched/cls_route.c b/net/sched/cls_route.c
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -449,7 +449,7 @@
+ 	h1 = to_hash(nhandle);
+ 	b = rtnl_dereference(head->table[h1]);
+ 	if (!b) {
+-		b = kzalloc(sizeof(struct route4_bucket), GFP_KERNEL);
++		b = kzalloc(sizeof(struct route4_bucket), GFP_KERNEL_ACCOUNT);
+ 		if (b == NULL)
+ 			return -ENOBUFS;
+ 
+@@ -524,7 +524,7 @@
+ 			return -EINVAL;
+ 
+ 	err = -ENOBUFS;
+-	f = kzalloc(sizeof(struct route4_filter), GFP_KERNEL);
++	f = kzalloc(sizeof(struct route4_filter), GFP_KERNEL_ACCOUNT);
+ 	if (!f)
+ 		goto errout;
+ 
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -841,7 +841,7 @@
+ 	struct tc_u32_sel *s = &n->sel;
+ 	struct tc_u_knode *new;
+ 
+-	new = kzalloc(struct_size(new, sel.keys, s->nkeys), GFP_KERNEL);
++	new = kzalloc(struct_size(new, sel.keys, s->nkeys), GFP_KERNEL_ACCOUNT);
+ 	if (!new)
+ 		return NULL;
+ 
+@@ -1132,15 +1132,16 @@
+ 		goto erridr;
+ 	}
+ 
+-	n = kzalloc(struct_size(n, sel.keys, s->nkeys), GFP_KERNEL);
++	n = kzalloc(struct_size(n, sel.keys, s->nkeys), GFP_KERNEL_ACCOUNT);
+ 	if (n == NULL) {
+ 		err = -ENOBUFS;
+ 		goto erridr;
+ 	}
+ 
+ #ifdef CONFIG_CLS_U32_PERF
+-	n->pf = __alloc_percpu(struct_size(n->pf, kcnts, s->nkeys),
+-			       __alignof__(struct tc_u32_pcnt));
++	n->pf = __alloc_percpu_gfp(struct_size(n->pf, kcnts, s->nkeys),
++				   __alignof__(struct tc_u32_pcnt),
++				   GFP_KERNEL_ACCOUNT);
+ 	if (!n->pf) {
+ 		err = -ENOBUFS;
+ 		goto errfree;
+@@ -1162,7 +1163,7 @@
+ 		goto errout;
+ 
+ #ifdef CONFIG_CLS_U32_MARK
+-	n->pcpu_success = alloc_percpu(u32);
++	n->pcpu_success = alloc_percpu_gfp(u32, GFP_KERNEL_ACCOUNT);
+ 	if (!n->pcpu_success) {
+ 		err = -ENOMEM;
+ 		goto errout;

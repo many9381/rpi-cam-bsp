@@ -1,0 +1,189 @@
+From: Firmware Security Follow-up <security@example.invalid>
+Subject: [PATCH] net sched reject qdisc redirect verdicts
+
+Complete upstream stable patch with all qdisc and qevent callers, line offsets plus the older HFSC root lookup context (the classification call itself is identical). Verified the complete prerequisite 3f4920d165b29052255527d8ae7619e7ec132ece already exists locally: all three bpf_redirect helpers reject absent task network context before dereference, and qevent drops direct REDIRECT. Preserve tc/clsact redirect support; convert unsupported qdisc-chain REDIRECT to SHOT.
+
+CVE: CVE-2026-68441
+Upstream-Status: Backport [https://git.kernel.org/stable/c/c8fd74445e86f88096d2f6cf0f9e4d54d8ed1781]
+
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -156,8 +156,20 @@
+ {
+ 	return TC_ACT_UNSPEC;
+ }
+-
+-#endif
++#endif
++static inline int tcf_classify_qdisc(struct sk_buff *skb,
++				     const struct tcf_proto *tp,
++				     struct tcf_result *res, bool compat_mode)
++{
++	int ret = tcf_classify(skb, NULL, tp, res, compat_mode);
++
++	/* TC_ACT_REDIRECT from qdisc filter chains is not supported.
++	 * Use BPF via tcx or mirred redirect instead.
++	 */
++	if (unlikely(ret == TC_ACT_REDIRECT))
++		ret = TC_ACT_SHOT;
++	return ret;
++}
+ 
+ static inline unsigned long
+ __cls_set_class(unsigned long *clp, unsigned long cl)
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -4069,9 +4069,7 @@
+ 
+ 	fl = rcu_dereference_bh(qe->filter_chain);
+ 
+-	switch (tcf_classify(skb, NULL, fl, &cl_res, false)) {
+-	case TC_ACT_REDIRECT:
+-		fallthrough;
++	switch (tcf_classify_qdisc(skb, fl, &cl_res, false)) {
+ 	case TC_ACT_SHOT:
+ 		qdisc_qstats_drop(sch);
+ 		__qdisc_drop(skb, to_free);
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -1709,7 +1709,7 @@
+ 		goto hash;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	result = tcf_classify(skb, NULL, filter, &res, false);
++	result = tcf_classify_qdisc(skb, filter, &res, false);
+ 
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -313,7 +313,7 @@
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	fl = rcu_dereference_bh(q->filter_list);
+-	result = tcf_classify(skb, NULL, fl, &res, false);
++	result = tcf_classify_qdisc(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+--- a/net/sched/sch_dualpi2.c
++++ b/net/sched/sch_dualpi2.c
+@@ -367,7 +367,7 @@
+ 	if (!fl)
+ 		return NET_XMIT_SUCCESS;
+ 
+-	result = tcf_classify(skb, NULL, fl, &res, false);
++	result = tcf_classify_qdisc(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+--- a/net/sched/sch_ets.c
++++ b/net/sched/sch_ets.c
+@@ -389,7 +389,7 @@
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	if (TC_H_MAJ(skb->priority) != sch->handle) {
+ 		fl = rcu_dereference_bh(q->filter_list);
+-		err = tcf_classify(skb, NULL, fl, &res, false);
++		err = tcf_classify_qdisc(skb, fl, &res, false);
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (err) {
+ 		case TC_ACT_STOLEN:
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -91,7 +91,7 @@
+ 		return fq_codel_hash(q, skb) + 1;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	result = tcf_classify(skb, NULL, filter, &res, false);
++	result = tcf_classify_qdisc(skb, filter, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+--- a/net/sched/sch_fq_pie.c
++++ b/net/sched/sch_fq_pie.c
+@@ -96,7 +96,7 @@
+ 		return fq_pie_hash(q, skb) + 1;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	result = tcf_classify(skb, NULL, filter, &res, false);
++	result = tcf_classify_qdisc(skb, filter, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -1154,7 +1154,7 @@
+ 	head = &q->root;
+ 	drift = HFSC_CLASSIFY_MAX_DRIFT;
+ 	tcf = rcu_dereference_bh(q->root.filter_list);
+-	while (tcf && (result = tcf_classify(skb, NULL, tcf, &res, false)) >= 0) {
++	while (tcf && (result = tcf_classify_qdisc(skb, tcf, &res, false)) >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -243,7 +243,7 @@
+ 	}
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	while (tcf && (result = tcf_classify(skb, NULL, tcf, &res, false)) >= 0) {
++	while (tcf && (result = tcf_classify_qdisc(skb, tcf, &res, false)) >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -36,7 +36,7 @@
+ 	int err;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	err = tcf_classify(skb, NULL, fl, &res, false);
++	err = tcf_classify_qdisc(skb, fl, &res, false);
+ #ifdef CONFIG_NET_CLS_ACT
+ 	switch (err) {
+ 	case TC_ACT_STOLEN:
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -39,7 +39,7 @@
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	if (TC_H_MAJ(skb->priority) != sch->handle) {
+ 		fl = rcu_dereference_bh(q->filter_list);
+-		err = tcf_classify(skb, NULL, fl, &res, false);
++		err = tcf_classify_qdisc(skb, fl, &res, false);
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (err) {
+ 		case TC_ACT_STOLEN:
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -709,7 +709,7 @@
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	fl = rcu_dereference_bh(q->filter_list);
+-	result = tcf_classify(skb, NULL, fl, &res, false);
++	result = tcf_classify_qdisc(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -260,7 +260,7 @@
+ 	struct tcf_result res;
+ 	int result;
+ 
+-	result = tcf_classify(skb, NULL, fl, &res, false);
++	result = tcf_classify_qdisc(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -171,7 +171,7 @@
+ 		return sfq_hash(q, skb) + 1;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	result = tcf_classify(skb, NULL, fl, &res, false);
++	result = tcf_classify_qdisc(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {

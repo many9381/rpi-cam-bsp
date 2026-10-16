@@ -1,0 +1,120 @@
+From: many9381 <many9381@gmail.com>
+Date: Wed, 14 Oct 2026 13:00:00 +0000
+Subject: [PATCH] nvme: bound FDP status and configuration response parsing
+
+Upstream-Status: Pending [Defensive FDP response bounds]
+
+NVMe Base 2.1 section 7.3 allows I/O Management Receive to transfer only
+the requested prefix of a larger structure. NRUHSD describes the full
+list, so bound placement registration to the 126 descriptors requested.
+Keep valid partial replies and the existing unpublished-head ownership.
+
+Validate configuration log sizes before allocation and after fetching the
+body, accepting a complete smaller log and skipping an incomplete larger
+one. Require a complete fixed header and declared descriptor body for
+every skipped or selected descriptor. Use remaining-byte subtraction and
+the specified eight-byte descriptor alignment before advancing the walk.
+Malformed logs retain an ordinary namespace without FDP streams.
+
+This is a separate defensive response-bound correction; no additional
+CVE association is assigned.
+
+Signed-off-by: many9381 <many9381@gmail.com>
+---
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -2193,8 +2193,8 @@
+ {
+ 	struct nvme_fdp_config_log hdr, *h;
+ 	struct nvme_fdp_config_desc *desc;
+-	size_t size = sizeof(hdr);
+-	void *log, *end;
++	size_t size = sizeof(hdr), log_size, left;
++	void *log;
+ 	int i, n, ret;
+ 
+ 	ret = nvme_get_log_lsi(ctrl, 0, NVME_LOG_FDP_CONFIGS, 0,
+@@ -2207,8 +2207,9 @@
+ 	}
+ 
+ 	size = le32_to_cpu(hdr.sze);
+-	if (size > PAGE_SIZE * MAX_ORDER_NR_PAGES) {
+-		dev_warn(ctrl->device, "FDP config size too large:%zu\n",
++	if (size < sizeof(hdr) || (size & 3) ||
++	    size > PAGE_SIZE * MAX_ORDER_NR_PAGES) {
++		dev_warn(ctrl->device, "FDP config size invalid:%zu\n",
+ 			 size);
+ 		return 0;
+ 	}
+@@ -2226,6 +2227,15 @@
+ 		goto out;
+ 	}
+ 
++	/* The log size may have changed since the header was read. */
++	log_size = le32_to_cpu(h->sze);
++	if (log_size < sizeof(*h) || log_size > size || (log_size & 3)) {
++		dev_warn(ctrl->device, "FDP config log size invalid:%zu\n",
++			 log_size);
++		ret = 0;
++		goto out;
++	}
++
+ 	n = le16_to_cpu(h->numfdpc) + 1;
+ 	if (fdp_idx >= n) {
+ 		dev_warn(ctrl->device, "FDP index:%d out of range:%d\n",
+@@ -2236,19 +2246,21 @@
+ 	}
+ 
+ 	log = h + 1;
+-	desc = log;
+-	end = log + size - sizeof(*h);
+-	for (i = 0; i < fdp_idx; i++) {
+-		u16 dsze = le16_to_cpu(desc->dsze);
+-
+-		if (!dsze || log + dsze > end) {
+-			dev_warn(ctrl->device,
+-				 "FDP invalid config descriptor at index %d\n", i);
+-			ret = 0;
+-			goto out;
+-		}
++	left = log_size - sizeof(*h);
++	for (i = 0; i <= fdp_idx; i++) {
++		u16 dsze;
++
++		/* Check the fixed header before reading any descriptor fields. */
++		if (left < sizeof(*desc))
++			goto invalid_desc;
++		desc = log;
++		dsze = le16_to_cpu(desc->dsze);
++		if (dsze < sizeof(*desc) || (dsze & 7) || dsze > left)
++			goto invalid_desc;
++		if (i == fdp_idx)
++			break;
+ 		log += dsze;
+-		desc = log;
++		left -= dsze;
+ 	}
+ 
+ 	if (le32_to_cpu(desc->nrg) > 1) {
+@@ -2258,6 +2270,10 @@
+ 	}
+ 
+ 	info->runs = le64_to_cpu(desc->runs);
++	goto out;
++invalid_desc:
++	dev_warn(ctrl->device, "FDP invalid config descriptor at index %d\n", i);
++	ret = 0;
+ out:
+ 	kvfree(h);
+ 	return ret;
+@@ -2302,7 +2318,8 @@
+ 		goto free;
+ 	}
+ 
+-	head->nr_plids = le16_to_cpu(ruhs->nruhsd);
++	/* NRUHSD describes the full list even when only a prefix is transferred. */
++	head->nr_plids = min_t(u16, le16_to_cpu(ruhs->nruhsd), S8_MAX - 1);
+ 	if (!head->nr_plids)
+ 		goto free;
+ 

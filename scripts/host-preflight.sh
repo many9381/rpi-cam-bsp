@@ -54,7 +54,6 @@ locale -a | grep -Eiq '^en_US\.(utf-?8|UTF-?8)$' || \
 required_commands=(
     git tar make gcc chrpath diffstat python3 uv
     ssh scp ssh-keygen ssh-keyscan ss
-    qemu-system-aarch64
     sha256sum setsid sort awk grep stat df nproc tr tee
 )
 if [[ "$container_mode" == "0" ]]; then

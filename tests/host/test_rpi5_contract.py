@@ -204,7 +204,6 @@ class RaspberryPiAcceptanceExecutionTest(unittest.TestCase):
 
     def _ready_prerequisites(self) -> None:
         for relative in (
-            "qemu-test/PASS",
             "rpi5-minimal/COMPLETE",
             "flash/rpi5-minimal-PASS",
         ):
@@ -534,7 +533,6 @@ fi
         self.key.chmod(0o600)
 
         for marker, expected in (
-            ("qemu-test/PASS", "QEMU PASS marker missing"),
             ("rpi5-minimal/COMPLETE", "minimal image PASS marker missing"),
             ("flash/rpi5-minimal-PASS", "minimal flash PASS marker missing"),
         ):

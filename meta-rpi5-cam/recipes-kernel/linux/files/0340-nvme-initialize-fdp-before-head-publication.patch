@@ -1,0 +1,145 @@
+Subject: [PATCH] nvme: initialize immutable FDP data before head publication
+
+CVE: CVE-2026-98153
+Upstream-Status: Backport [https://git.kernel.org/stable/c/56e1c6bbe4bb084d7ecf61698afdf70be23dd35f]
+
+Adapt the upstream FDP lifetime fix to the retained constructor API: pass
+ns and the explicit unpublished head, retain ctrl through ns, and initialize
+placement IDs and cached granularity before publishing the shared head.
+Remove per-path FDP queries and free placement data on both query failure
+and later multipath allocation failure. Keep ns->head assignment at the
+existing successful attach point. The retained request initializer also
+reads ns->head for passthrough logging; default this to quiet while the
+head is still unattached, preserving normal published and admin behavior.
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -721,7 +721,8 @@
+ 	if (req->q->queuedata) {
+ 		struct nvme_ns *ns = req->q->disk->private_data;
+ 
+-		logging_enabled = ns->head->passthru_err_log_enabled;
++		/* FDP discovery can issue commands before the head is attached. */
++		logging_enabled = ns->head && ns->head->passthru_err_log_enabled;
+ 		req->timeout = NVME_IO_TIMEOUT;
+ 	} else { /* no queuedata implies admin queue */
+ 		logging_enabled = nr->ctrl->passthru_err_log_enabled;
+@@ -2262,23 +2263,15 @@
+ 	return ret;
+ }
+ 
+-static int nvme_query_fdp_info(struct nvme_ns *ns, struct nvme_ns_info *info)
+-{
+-	struct nvme_ns_head *head = ns->head;
++static int nvme_query_fdp_info(struct nvme_ns *ns, struct nvme_ns_head *head,
++		struct nvme_ns_info *info)
++{
+ 	struct nvme_ctrl *ctrl = ns->ctrl;
+ 	struct nvme_fdp_ruh_status *ruhs;
+ 	struct nvme_fdp_config fdp;
+ 	struct nvme_command c = {};
+ 	size_t size;
+ 	int i, ret;
+-
+-	/*
+-	 * The FDP configuration is static for the lifetime of the namespace,
+-	 * so return immediately if we've already registered this namespace's
+-	 * streams.
+-	 */
+-	if (head->nr_plids)
+-		return 0;
+ 
+ 	ret = nvme_get_features(ctrl, NVME_FEAT_FDP, info->endgid, NULL, 0,
+ 				&fdp);
+@@ -2326,6 +2319,7 @@
+ 
+ 	for (i = 0; i < head->nr_plids; i++)
+ 		head->plids[i] = le16_to_cpu(ruhs->ruhsd[i].pid);
++	head->write_stream_granularity = min(info->runs, U32_MAX);
+ free:
+ 	kfree(ruhs);
+ 	return ret;
+@@ -2364,12 +2358,6 @@
+ 	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
+ 	    ns->head->ids.csi == NVME_CSI_ZNS) {
+ 		ret = nvme_query_zone_info(ns, lbaf, &zi);
+-		if (ret < 0)
+-			goto out;
+-	}
+-
+-	if (ns->ctrl->ctratt & NVME_CTRL_ATTR_FDPS) {
+-		ret = nvme_query_fdp_info(ns, info);
+ 		if (ret < 0)
+ 			goto out;
+ 	}
+@@ -2425,10 +2413,7 @@
+ 		capacity = 0;
+ 
+ 	lim.max_write_streams = ns->head->nr_plids;
+-	if (lim.max_write_streams)
+-		lim.write_stream_granularity = min(info->runs, U32_MAX);
+-	else
+-		lim.write_stream_granularity = 0;
++	lim.write_stream_granularity = ns->head->write_stream_granularity;
+ 
+ 	/*
+ 	 * Only set the DEAC bit if the device guarantees that reads from
+@@ -3907,9 +3892,10 @@
+ 			     ns->ctrl->ops->module);
+ }
+ 
+-static struct nvme_ns_head *nvme_alloc_ns_head(struct nvme_ctrl *ctrl,
++static struct nvme_ns_head *nvme_alloc_ns_head(struct nvme_ns *ns,
+ 		struct nvme_ns_info *info)
+ {
++	struct nvme_ctrl *ctrl = ns->ctrl;
+ 	struct nvme_ns_head *head;
+ 	size_t size = sizeof(*head);
+ 	int ret = -ENOMEM;
+@@ -3945,15 +3931,24 @@
+ 	} else
+ 		head->effects = ctrl->effects;
+ 
++	/* Initialize immutable FDP data before publishing the shared head. */
++	if (ctrl->ctratt & NVME_CTRL_ATTR_FDPS) {
++		ret = nvme_query_fdp_info(ns, head, info);
++		if (ret < 0)
++			goto out_cleanup_fdp;
++	}
++
+ 	ret = nvme_mpath_alloc_disk(ctrl, head);
+ 	if (ret)
+-		goto out_cleanup_srcu;
++		goto out_cleanup_fdp;
+ 
+ 	list_add_tail(&head->entry, &ctrl->subsys->nsheads);
+ 
+ 	kref_get(&ctrl->subsys->ref);
+ 
+ 	return head;
++out_cleanup_fdp:
++	kfree(head->plids);
+ out_cleanup_srcu:
+ 	cleanup_srcu_struct(&head->srcu);
+ out_ida_remove:
+@@ -4046,7 +4041,7 @@
+ 				info->nsid);
+ 			goto out_unlock;
+ 		}
+-		head = nvme_alloc_ns_head(ctrl, info);
++		head = nvme_alloc_ns_head(ns, info);
+ 		if (IS_ERR(head)) {
+ 			ret = PTR_ERR(head);
+ 			goto out_unlock;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -560,6 +560,7 @@
+ 
+ 	u16			nr_plids;
+ 	u16			*plids;
++	u32			write_stream_granularity;
+ #ifdef CONFIG_NVME_MULTIPATH
+ 	struct bio_list		requeue_list;
+ 	spinlock_t		requeue_lock;

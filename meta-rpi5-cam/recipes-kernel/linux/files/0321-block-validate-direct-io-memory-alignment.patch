@@ -1,0 +1,167 @@
+From: Kernel maintenance <maintenance@localhost>
+Subject: [PATCH] block: validate memory alignment across direct IO callers
+
+Adapt the complete ownership/caller contract to the retained 6.18 APIs.
+
+CVE: CVE-2026-89584
+Upstream-Status: Backport [https://git.kernel.org/stable/c/d44a97a3b1c00cc571245124e23e5ceb0a0225a0]
+
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1210,7 +1210,25 @@
+  * For a multi-segment *iter, this function only adds pages from the next
+  * non-empty segment of the iov iterator.
+  */
+-static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
++/* Validate the next extracted segment without pinning any of its pages. */
++static bool bio_iov_iter_mem_aligned(const struct iov_iter *iter,
++				     unsigned mem_align_mask)
++{
++	struct iov_iter next = *iter;
++
++	if (!mem_align_mask || !iov_iter_count(&next))
++		return true;
++
++	/* The page extractor skips empty iovecs before pinning. */
++	if (iter_is_iovec(&next) || iov_iter_is_kvec(&next)) {
++		iov_iter_advance(&next, 0);
++		iov_iter_truncate(&next, iter_iov_len(&next));
++	}
++	return !(iov_iter_alignment(&next) & mem_align_mask);
++}
++
++static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
++				    unsigned mem_align_mask)
+ {
+ 	iov_iter_extraction_t extraction_flags = 0;
+ 	unsigned short nr_pages = bio->bi_max_vecs - bio->bi_vcnt;
+@@ -1221,6 +1239,9 @@
+ 	unsigned int num_pages, i = 0;
+ 	size_t offset, folio_offset, left, len;
+ 	int ret = 0;
++
++	if (!bio_iov_iter_mem_aligned(iter, mem_align_mask))
++		return -EINVAL;
+ 
+ 	/*
+ 	 * Move page array up in the allocated memory for the bio vecs as far as
+@@ -1321,6 +1342,7 @@
+  * bio_iov_iter_get_pages - add user or kernel pages to a bio
+  * @bio: bio to add pages to
+  * @iter: iov iterator describing the region to be added
++ * @mem_align_mask: the source address and segment length alignment mask
+  * @len_align_mask: the mask to align the total size to, 0 for any length
+  *
+  * This takes either an iterator pointing to user memory, or one pointing to
+@@ -1336,17 +1358,22 @@
+  * The function tries, but does not guarantee, to pin as many pages as
+  * fit into the bio, or are requested in @iter, whatever is smaller. If
+  * MM encounters an error pinning the requested pages, it stops. Error
+- * is returned only if 0 pages could be pinned.
++ * is returned only if 0 pages could be pinned, except that a misaligned
++ * segment fails the entire bio and releases all pages pinned for it.
+  */
+ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
+-			   unsigned len_align_mask)
+-{
++			   unsigned mem_align_mask, unsigned len_align_mask)
++{
++	size_t count = iov_iter_count(iter);
+ 	int ret = 0;
+ 
+ 	if (WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED)))
+ 		return -EIO;
+ 
+ 	if (iov_iter_is_bvec(iter)) {
++		/* Includes the user-controlled offset of registered buffers. */
++		if (count && (iov_iter_alignment(iter) & mem_align_mask))
++			return -EINVAL;
+ 		bio_iov_bvec_set(bio, iter);
+ 		iov_iter_advance(iter, bio->bi_iter.bi_size);
+ 		return 0;
+@@ -1355,9 +1382,18 @@
+ 	if (iov_iter_extract_will_pin(iter))
+ 		bio_set_flag(bio, BIO_PAGE_PINNED);
+ 	do {
+-		ret = __bio_iov_iter_get_pages(bio, iter);
++		ret = __bio_iov_iter_get_pages(bio, iter, mem_align_mask);
+ 	} while (!ret && iov_iter_count(iter) && !bio_full(bio, 0));
+ 
++	/* Alignment errors must never submit vectors pinned by earlier calls. */
++	if (ret == -EINVAL) {
++		bio_release_pages(bio, false);
++		bio_clear_flag(bio, BIO_PAGE_PINNED);
++		bio->bi_vcnt = 0;
++		bio->bi_iter.bi_size = 0;
++		iov_iter_revert(iter, count - iov_iter_count(iter));
++		return ret;
++	}
+ 	if (bio->bi_vcnt)
+ 		return bio_iov_iter_align_down(bio, iter, len_align_mask);
+ 	return ret;
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@ -287,7 +287,7 @@
+ 	 * No alignment requirements on our part to support arbitrary
+ 	 * passthrough commands.
+ 	 */
+-	ret = bio_iov_iter_get_pages(bio, iter, 0);
++	ret = bio_iov_iter_get_pages(bio, iter, 0, 0);
+ 	if (ret)
+ 		goto out_put;
+ 	ret = blk_rq_append_bio(rq, bio);
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -46,7 +46,7 @@
+ static inline int blkdev_iov_iter_get_pages(struct bio *bio,
+ 		struct iov_iter *iter, struct block_device *bdev)
+ {
+-	return bio_iov_iter_get_pages(bio, iter,
++	return bio_iov_iter_get_pages(bio, iter, bdev_dma_alignment(bdev),
+ 			bdev_logical_block_size(bdev) - 1);
+ }
+ 
+@@ -347,19 +347,9 @@
+ 	bio->bi_end_io = blkdev_bio_end_io_async;
+ 	bio->bi_ioprio = iocb->ki_ioprio;
+ 
+-	if (iov_iter_is_bvec(iter)) {
+-		/*
+-		 * Users don't rely on the iterator being in any particular
+-		 * state for async I/O returning -EIOCBQUEUED, hence we can
+-		 * avoid expensive iov_iter_advance(). Bypass
+-		 * bio_iov_iter_get_pages() and set the bvec directly.
+-		 */
+-		bio_iov_bvec_set(bio, iter);
+-	} else {
+-		ret = blkdev_iov_iter_get_pages(bio, iter, bdev);
+-		if (unlikely(ret))
+-			goto out_bio_put;
+-	}
++	ret = blkdev_iov_iter_get_pages(bio, iter, bdev);
++	if (unlikely(ret))
++		goto out_bio_put;
+ 	dio->size = bio->bi_iter.bi_size;
+ 
+ 	if (is_read) {
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@ -449,6 +449,7 @@
+ 		bio->bi_end_io = iomap_dio_bio_end_io;
+ 
+ 		ret = bio_iov_iter_get_pages(bio, dio->submit.iter,
++					     bdev_dma_alignment(bio->bi_bdev),
+ 				bdev_logical_block_size(iomap->bdev) - 1);
+ 		if (unlikely(ret)) {
+ 			/*
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -459,7 +459,7 @@
+ 		size_t len, enum req_op op);
+ 
+ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
+-		unsigned len_align_mask);
++		unsigned mem_align_mask, unsigned len_align_mask);
+ 
+ void bio_iov_bvec_set(struct bio *bio, const struct iov_iter *iter);
+ void __bio_release_pages(struct bio *bio, bool mark_dirty);

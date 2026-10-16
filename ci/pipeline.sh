@@ -91,7 +91,6 @@ case "$stage" in
     rpi5-image)
         ensure_test_key
         build_id="$("$repo_root/scripts/new-build-id.sh")"
-        run_qemu_for_build_id "$build_id"
         "$repo_root/scripts/build.sh" \
             --build-id "$build_id" rpi5-minimal build
         printf 'BUILD_ID=%s\n' "$build_id"

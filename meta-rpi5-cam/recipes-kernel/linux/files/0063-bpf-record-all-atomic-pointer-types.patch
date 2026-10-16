@@ -1,0 +1,25 @@
+From: Firmware Security Follow-up <security@local.invalid>
+Subject: [PATCH] bpf record all atomic pointer types
+
+CVE: CVE-2026-90177
+Upstream-Status: Backport [https://git.kernel.org/linus/4bc49ae344d65cfcef738f281ac575cf73ca2fc5]
+
+The 6.18 implementation uses register numbers rather than the newer dst_reg local; obtain the actual destination type via existing reg_state().
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -8058,11 +8058,9 @@
+ 	if (err)
+ 		return err;
+ 
+-	if (is_arena_reg(env, insn->dst_reg)) {
+-		err = save_aux_ptr_type(env, PTR_TO_ARENA, false);
+-		if (err)
+-			return err;
+-	}
++	err = save_aux_ptr_type(env, reg_state(env, insn->dst_reg)->type, false);
++	if (err)
++		return err;
+ 	/* Check whether we can write into the same memory. */
+ 	err = check_mem_access(env, env->insn_idx, insn->dst_reg, insn->off,
+ 			       BPF_SIZE(insn->code), BPF_WRITE, -1, true, false);

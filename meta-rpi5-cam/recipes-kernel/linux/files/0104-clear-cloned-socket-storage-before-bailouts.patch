@@ -1,0 +1,37 @@
+From: Firmware Security Maintenance <security@local.invalid>
+Subject: [PATCH] bpf: clear cloned socket storage before early bailouts
+
+Move storage initialization immediately after sock_copy, before the filter
+charge and XFRM clone failures can enter sk_free. Remove the redundant late
+initialization from bpf_sk_storage_clone. This tree calls the function
+sk_clone_lock rather than sk_clone; both complete upstream hunks are kept.
+
+CVE: CVE-2026-68399
+Upstream-Status: Backport [https://git.kernel.org/linus/7cbd0c4cebe4c9f678d15e6b9ba975e1155a107f]
+Stable-Commit: 14b49b5ab29979552c219a09e569b424fbbf4a6e
+Stable-Downloaded-Patch-SHA256: e8ea31abf56d3afa0a37152d179547a8a396fd5cef5cb716bb84ec536000ed83
+
+---
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -2468,6 +2468,9 @@
+ 	sock_copy(newsk, sk);
+ 
+ 	newsk->sk_prot_creator = prot;
++#ifdef CONFIG_BPF_SYSCALL
++	RCU_INIT_POINTER(newsk->sk_bpf_storage, NULL);
++#endif
+ 
+ 	/* SANITY */
+ 	if (likely(newsk->sk_net_refcnt)) {
+--- a/net/core/bpf_sk_storage.c
++++ b/net/core/bpf_sk_storage.c
+@@ -158,8 +158,6 @@
+ 	struct bpf_local_storage *sk_storage;
+ 	struct bpf_local_storage_elem *selem;
+ 	int ret = 0;
+-
+-	RCU_INIT_POINTER(newsk->sk_bpf_storage, NULL);
+ 
+ 	migrate_disable();
+ 	rcu_read_lock();

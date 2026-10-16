@@ -115,7 +115,6 @@ current_revision="$(git -C "$repo_root" rev-parse --short=12 HEAD)"
 [[ "$build_id" == *"-$current_revision" ]] ||
     rpi5_die "build ID revision does not match HEAD $current_revision"
 rpi5_validate_key_pair "$key"
-rpi5_require_pass "$repo_root/artifacts/$build_id/qemu-test/PASS" "QEMU"
 rpi5_require_pass \
     "$repo_root/artifacts/$build_id/rpi5-minimal/COMPLETE" "minimal image"
 rpi5_require_pass \
@@ -287,16 +286,16 @@ check_boot() {
 
     remote_exact password_authentication no \
         "sudo -n /usr/sbin/sshd -T | awk \
-        '\$1 == \"passwordauthentication\" { print \$2 }'" "$log"
+        'tolower(\$1) == \"passwordauthentication\" { print \$2 }'" "$log"
     remote_exact kbd_interactive_authentication no \
         "sudo -n /usr/sbin/sshd -T | awk \
-        '\$1 == \"kbdinteractiveauthentication\" { print \$2 }'" "$log"
+        'tolower(\$1) == \"kbdinteractiveauthentication\" { print \$2 }'" "$log"
     remote_exact permit_root_login no \
         "sudo -n /usr/sbin/sshd -T | awk \
-        '\$1 == \"permitrootlogin\" { print \$2 }'" "$log"
+        'tolower(\$1) == \"permitrootlogin\" { print \$2 }'" "$log"
     remote_exact authentication_methods publickey \
         "sudo -n /usr/sbin/sshd -T | awk '
-        \$1 == \"authenticationmethods\" {
+        tolower(\$1) == \"authenticationmethods\" {
             count += 1
             line = \$0
             if (sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, \"\", line) != 1 ||
@@ -315,7 +314,7 @@ check_boot() {
         '" "$log"
     remote_exact allow_users rpiadmin \
         "sudo -n /usr/sbin/sshd -T | awk \
-        '\$1 == \"allowusers\" { print \$2 }'" "$log"
+        'tolower(\$1) == \"allowusers\" { print \$2 }'" "$log"
     remote_exact account_locked L \
         "passwd -S rpiadmin | awk \
         '\$1 == \"rpiadmin\" { print \$2 }'" "$log"

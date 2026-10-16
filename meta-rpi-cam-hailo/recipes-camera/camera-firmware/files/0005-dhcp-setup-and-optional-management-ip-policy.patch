@@ -1,0 +1,2839 @@
+Subject: [PATCH] security: support DHCP setup and optional management IP policy
+
+Validate direct HTTPS origins against the local TLS socket, retain explicit
+origins, and make IP admission optional for new web setup. Preserve existing
+restrictions during the transactional revision-6 migration. Retain password,
+role, lockout, CSRF, session binding and single-session protections. Include
+backend and web regressions and the administrator policy controls.
+
+Upstream-Status: Pending [firmware repository integration]
+
+diff --git a/include/camera_firmware/security/BootstrapService.hpp b/include/camera_firmware/security/BootstrapService.hpp
+index b601b2e..7b02c70 100644
+--- a/include/camera_firmware/security/BootstrapService.hpp
++++ b/include/camera_firmware/security/BootstrapService.hpp
+@@ -22,6 +22,7 @@ struct BootstrapRequest {
+   // setup. `confirmed_peer_ip` is registered whatever this holds, including
+   // when it is empty: see Initialize.
+   std::vector<std::string> management_ips;
++  bool management_ip_restriction_enabled{true};
+ };
+ 
+ struct BootstrapResult {
+diff --git a/include/camera_firmware/security/SecurityStore.hpp b/include/camera_firmware/security/SecurityStore.hpp
+index 50af07c..20e0771 100644
+--- a/include/camera_firmware/security/SecurityStore.hpp
++++ b/include/camera_firmware/security/SecurityStore.hpp
+@@ -23,7 +23,7 @@ class AuditLogService;
+ class AuditLogServiceTestAccess;
+ class UserManagementService;
+ 
+-inline constexpr int kSecuritySchemaRevision = 5;
++inline constexpr int kSecuritySchemaRevision = 6;
+ 
+ enum class DeviceState { kDefault, kOperational };
+ 
+@@ -44,6 +44,7 @@ struct BootstrapRecord {
+   // an entry repeating the peer is redundant rather than harmful, and an empty
+   // vector still leaves the device reachable.
+   std::vector<std::string> additional_management_ips;
++  bool management_ip_restriction_enabled{true};
+ };
+ 
+ using CredentialInstaller = std::function<common::Result<void>()>;
+@@ -128,6 +129,7 @@ class SecurityStore {
+   common::Result<void> InitializeDevice(
+       BootstrapRecord record, const CredentialInstaller& install_credential);
+   common::Result<DeviceState> State() const;
++  common::Result<bool> ManagementIpRestrictionEnabled() const;
+   common::Result<void> CheckHealth() const;
+   common::Result<bool> IsManagementPeer(std::string_view normalized_peer_ip);
+   [[nodiscard]] const std::filesystem::path& state_directory() const noexcept;
+@@ -239,13 +241,15 @@ class SecurityStore {
+ 
+   explicit SecurityStore(std::shared_ptr<Impl> impl) noexcept;
+   common::Result<void> InitializeSchema();
+-  common::Result<void> MigrateToRevisionFive(int source_revision);
++  common::Result<void> MigrateToRevisionSix(int source_revision);
+   common::Result<void> RollbackSchemaTransaction();
+   common::Result<Transaction> BeginReadTransaction() const;
+   common::Result<AuditStatusSnapshot> ReadAuditStatus() const;
+   common::Result<AuditEventQueryResult> ReadAuditEvents(
+       const AuditEventQuery& query) const;
+   common::Result<DeviceState> StateUnderConnectionLease() const;
++  common::Result<bool> ManagementIpRestrictionEnabledUnderConnectionLease()
++      const;
+   common::Result<AuthenticationContext> ReadAuthenticationContext(
+       Transaction& transaction, std::string_view canonical_username,
+       std::string_view normalized_peer_ip) const;
+@@ -325,6 +329,9 @@ class SecurityStore {
+       std::int64_t user_id, std::int64_t now_seconds,
+       const SecurityMutationContext& context);
+   common::Result<std::vector<StoredManagementIp>> ReadManagementIps() const;
++  common::Result<CommittedRevocation> SetManagementIpRestrictionEnabled(
++      bool enabled, std::int64_t now_seconds,
++      const SecurityMutationContext& context);
+   common::Result<StoredManagementIp> InsertManagementIp(
+       UserRole role, std::string normalized_ip, std::int64_t now_seconds,
+       const SecurityMutationContext& context);
+diff --git a/include/camera_firmware/security/UserManagementService.hpp b/include/camera_firmware/security/UserManagementService.hpp
+index c6e5742..58d0ab9 100644
+--- a/include/camera_firmware/security/UserManagementService.hpp
++++ b/include/camera_firmware/security/UserManagementService.hpp
+@@ -68,6 +68,9 @@ class UserManagementService {
+                         UserManagementDependencies dependencies = {});
+ 
+   common::Result<std::vector<ManagedUser>> ListUsers() const;
++  common::Result<bool> ManagementIpRestrictionEnabled() const;
++  common::Result<void> SetManagementIpRestrictionEnabled(
++      bool enabled, const UserMutationContext& context);
+   common::Result<ManagedUser> CreateViewer(std::string username,
+                                            common::SecureBytes password,
+                                            const UserMutationContext& context);
+diff --git a/include/camera_firmware/service/SecurityRequestGate.hpp b/include/camera_firmware/service/SecurityRequestGate.hpp
+index 26c9ac5..8aef444 100644
+--- a/include/camera_firmware/service/SecurityRequestGate.hpp
++++ b/include/camera_firmware/service/SecurityRequestGate.hpp
+@@ -25,6 +25,10 @@ struct SecurityRequestContext {
+   bool peer_is_management{false};
+   std::string origin;
+   std::string expected_origin;
++  // Trusted transport metadata, never Host or X-Forwarded-* headers.
++  std::string local_ip;
++  std::uint16_t local_port{0};
++  bool local_tls{false};
+   bool has_management_header{false};
+   std::optional<security::Principal> principal;
+ };
+@@ -62,10 +66,14 @@ struct ParsedSetupRequest {
+   // empty when the key is absent. These are candidates, not the whole answer:
+   // `confirmed_peer_ip` is registered whatever this contains.
+   std::vector<std::string> management_ips;
++  bool management_ip_restriction_enabled{true};
+ };
+ 
+ [[nodiscard]] common::Result<void> AuthorizeSecurityRequest(
+     const SecurityRequestContext& context);
++[[nodiscard]] std::string SocketHttpsOrigin(std::string_view local_ip,
++                                            std::uint16_t local_port,
++                                            bool local_tls);
+ [[nodiscard]] bool RouteRefreshesManagementDeadline(std::string_view path,
+                                                     std::string_view method);
+ [[nodiscard]] common::Result<std::string> NormalizePeerIp(
+diff --git a/src/config/AppConfig.cpp b/src/config/AppConfig.cpp
+index 41431ba..4ad996f 100644
+--- a/src/config/AppConfig.cpp
++++ b/src/config/AppConfig.cpp
+@@ -341,7 +341,8 @@ common::Result<void> ValidateSecuritySemantics(const AppConfig& config) {
+     return common::Result<void>::Err(
+         {"E_SECURITY_TLS", "security requires enabled HTTPS"});
+   }
+-  if (!config.http.public_base_url.starts_with("https://")) {
++  if (!config.http.public_base_url.empty() &&
++      !config.http.public_base_url.starts_with("https://")) {
+     return common::Result<void>::Err(
+         {"E_SECURITY_PUBLIC_URL", "security requires an https public URL"});
+   }
+diff --git a/src/security/BootstrapService.cpp b/src/security/BootstrapService.cpp
+index 5ae933d..19eaeb9 100644
+--- a/src/security/BootstrapService.cpp
++++ b/src/security/BootstrapService.cpp
+@@ -373,7 +373,8 @@ common::Result<BootstrapResult> BootstrapService::Initialize(
+                            std::move(password_record).value(),
+                            std::move(confirmed).value(),
+                            now,
+-                           std::move(additional_management_ips)};
++                           std::move(additional_management_ips),
++                           request.management_ip_restriction_enabled};
+     auto initialized =
+         store_.InitializeDevice(std::move(record), [this, &request] {
+           return store_.InstallBootstrapRtspCredential(
+diff --git a/src/security/SecurityStore.cpp b/src/security/SecurityStore.cpp
+index b6d8109..ad0d007 100644
+--- a/src/security/SecurityStore.cpp
++++ b/src/security/SecurityStore.cpp
+@@ -33,6 +33,7 @@ constexpr int kBusyTimeoutMilliseconds = 1000;
+ constexpr int kRevisionTwoSecuritySchema = 2;
+ constexpr int kRevisionThreeSecuritySchema = 3;
+ constexpr int kRevisionFourSecuritySchema = 4;
++constexpr int kRevisionFiveSecuritySchema = 5;
+ 
+ enum class ForeignKeyValidation {
+   kStrict,
+@@ -1193,11 +1194,9 @@ WHERE NOT (
+   if (schema_revision == kRevisionThreeSecuritySchema) {
+     unexpected_object_count = kRevisionThreeUnexpectedObjectCount;
+     expected_count = 19;
+-  } else if (schema_revision == kRevisionFourSecuritySchema ||
+-             schema_revision == kSecuritySchemaRevision) {
+-    // Revision 5 only adds a column to `sessions`; the named table/index
+-    // inventory introduced at revision 4 is unchanged, so the same
+-    // allowlist applies to both revisions.
++  } else if (schema_revision >= kRevisionFourSecuritySchema) {
++    // Revisions 5 and 6 add columns; the named table/index inventory
++    // introduced at revision 4 is unchanged.
+     unexpected_object_count = kRevisionFourUnexpectedObjectCount;
+     expected_count = 20;
+   }
+@@ -1214,7 +1213,7 @@ bool HasValidCommittedState(sqlite3* database, int schema_revision,
+   const bool allow_legacy_audit_actor_orphans =
+       foreign_key_validation ==
+           ForeignKeyValidation::kAllowLegacyAuditActorOrphans &&
+-      schema_revision < kSecuritySchemaRevision;
++      schema_revision < kRevisionFiveSecuritySchema;
+   const char* foreign_key_check =
+       allow_legacy_audit_actor_orphans
+           ? "SELECT COUNT(*) FROM pragma_foreign_key_check "
+@@ -1352,8 +1351,7 @@ FROM device_state
+ WHERE id = 1;
+ )sql";
+   const bool revision_four_or_later_state =
+-      schema_revision == kRevisionFourSecuritySchema ||
+-      schema_revision == kSecuritySchemaRevision;
++      schema_revision >= kRevisionFourSecuritySchema;
+   const char* state_invariant = revision_four_or_later_state
+                                     ? kRevisionFourStateInvariant
+                                     : kLegacyStateInvariant;
+@@ -1382,6 +1380,7 @@ common::Result<void> ValidateSchema(
+   if (schema_revision != kRevisionTwoSecuritySchema &&
+       schema_revision != kRevisionThreeSecuritySchema &&
+       schema_revision != kRevisionFourSecuritySchema &&
++      schema_revision != kRevisionFiveSecuritySchema &&
+       schema_revision != kSecuritySchemaRevision) {
+     return StoreError("E_SECURITY_DB_SCHEMA",
+                       "security database schema is invalid");
+@@ -1391,7 +1390,8 @@ common::Result<void> ValidateSchema(
+   // unapproved trigger cannot run from the destructive constraint probes.
+   const bool revision_three_or_later =
+       schema_revision >= kRevisionThreeSecuritySchema;
+-  const bool revision_five = schema_revision == kSecuritySchemaRevision;
++  const bool revision_five = schema_revision >= kRevisionFiveSecuritySchema;
++  const bool revision_six = schema_revision == kSecuritySchemaRevision;
+   const bool revision_four = schema_revision == kRevisionFourSecuritySchema;
+   const int expected_table_count =
+       (revision_four || revision_five) ? 9 : (revision_three_or_later ? 8 : 7);
+@@ -1555,11 +1555,19 @@ common::Result<void> ValidateSchema(
+           std::vector<ColumnInfo>{{"version", "INTEGER", 1, 0}} ||
+       !ReadColumns(database, "device_state", device_state_columns) ||
+       device_state_columns !=
+-          std::vector<ColumnInfo>{
+-              {"id", "INTEGER", 0, 1},
+-              {"state", "TEXT", 1, 0},
+-              {"schema_revision", "INTEGER", 1, 0},
+-              {"setup_completed_at_seconds", "INTEGER", 0, 0}} ||
++          (revision_six
++               ? std::vector<ColumnInfo>{{"id", "INTEGER", 0, 1},
++                                         {"state", "TEXT", 1, 0},
++                                         {"schema_revision", "INTEGER", 1, 0},
++                                         {"setup_completed_at_seconds",
++                                          "INTEGER", 0, 0},
++                                         {"management_ip_restriction_enabled",
++                                          "INTEGER", 1, 0}}
++               : std::vector<ColumnInfo>{{"id", "INTEGER", 0, 1},
++                                         {"state", "TEXT", 1, 0},
++                                         {"schema_revision", "INTEGER", 1, 0},
++                                         {"setup_completed_at_seconds",
++                                          "INTEGER", 0, 0}}) ||
+       !ReadColumns(database, "users", users_columns) ||
+       users_columns !=
+           std::vector<ColumnInfo>{
+@@ -1675,7 +1683,9 @@ common::Result<void> ValidateSchema(
+               {"lease_token", "BLOB", 0, 0},
+               {"lease_expires_at_seconds", "INTEGER", 0, 0}} ||
+       !QuerySingleInt(database,
+-                      revision_five   ? "SELECT COUNT(*) FROM schema_version "
++                      revision_six    ? "SELECT COUNT(*) FROM schema_version "
++                                        "WHERE version = 6;"
++                      : revision_five ? "SELECT COUNT(*) FROM schema_version "
+                                         "WHERE version = 5;"
+                       : revision_four ? "SELECT COUNT(*) FROM schema_version "
+                                         "WHERE version = 4;"
+@@ -1691,7 +1701,15 @@ common::Result<void> ValidateSchema(
+       value != 1 ||
+       !QuerySingleInt(
+           database,
+-          revision_five
++          revision_six
++              ? "SELECT COUNT(*) FROM device_state "
++                "WHERE id = 1 AND schema_revision = 6 AND "
++                "typeof(management_ip_restriction_enabled) = 'integer' AND "
++                "management_ip_restriction_enabled IN (0, 1) AND "
++                "((state = 'default' AND setup_completed_at_seconds IS NULL) "
++                "OR (state = 'operational' AND setup_completed_at_seconds >= "
++                "0));"
++          : revision_five
+               ? "SELECT COUNT(*) FROM device_state "
+                 "WHERE id = 1 AND schema_revision = 5 AND "
+                 "((state = 'default' AND setup_completed_at_seconds IS NULL) "
+@@ -1739,6 +1757,24 @@ CREATE TABLE schema_version (
+   constexpr std::string_view kRevisionFiveSchemaVersionSql = R"sql(
+ CREATE TABLE schema_version (
+   version INTEGER NOT NULL CHECK (version = 5)
++))sql";
++  constexpr std::string_view kRevisionSixSchemaVersionSql = R"sql(
++CREATE TABLE schema_version (
++  version INTEGER NOT NULL CHECK (version = 6)
++))sql";
++  constexpr std::string_view kRevisionSixDeviceStateSql = R"sql(
++CREATE TABLE device_state (
++  id INTEGER PRIMARY KEY CHECK (id = 1),
++  state TEXT NOT NULL CHECK (state IN ('default', 'operational')),
++  schema_revision INTEGER NOT NULL CHECK (schema_revision = 6),
++  setup_completed_at_seconds INTEGER,
++  management_ip_restriction_enabled INTEGER NOT NULL DEFAULT 1
++    CHECK (management_ip_restriction_enabled IN (0, 1)),
++  CHECK (
++    (state = 'default' AND setup_completed_at_seconds IS NULL) OR
++    (state = 'operational' AND setup_completed_at_seconds IS NOT NULL AND
++     setup_completed_at_seconds >= 0)
++  )
+ ))sql";
+   constexpr std::string_view kRevisionTwoDeviceStateSql = R"sql(
+ CREATE TABLE device_state (
+@@ -1906,12 +1942,14 @@ CREATE TABLE sessions (
+ 
+   const std::array<std::pair<const char*, std::string_view>, 7>
+       expected_table_definitions = {{
+-          {"schema_version", revision_five   ? kRevisionFiveSchemaVersionSql
++          {"schema_version", revision_six    ? kRevisionSixSchemaVersionSql
++                             : revision_five ? kRevisionFiveSchemaVersionSql
+                              : revision_four ? kRevisionFourSchemaVersionSql
+                              : revision_three_or_later
+                                  ? kRevisionThreeSchemaVersionSql
+                                  : kRevisionTwoSchemaVersionSql},
+-          {"device_state", revision_five   ? kRevisionFiveDeviceStateSql
++          {"device_state", revision_six    ? kRevisionSixDeviceStateSql
++                           : revision_five ? kRevisionFiveDeviceStateSql
+                            : revision_four ? kRevisionFourDeviceStateSql
+                            : revision_three_or_later
+                                ? kRevisionThreeDeviceStateSql
+@@ -2017,11 +2055,20 @@ CREATE TABLE firmware_log_outbox (
+   const bool prepared = preparation.ok();
+   const bool constraints_valid =
+       prepared &&
++      (!revision_six ||
++       (StatementIsRejectedByConstraint(
++            database,
++            "UPDATE device_state SET management_ip_restriction_enabled = 2;") &&
++        StatementIsRejectedByConstraint(
++            database,
++            "UPDATE device_state SET management_ip_restriction_enabled = "
++            "NULL;"))) &&
+       StatementIsRejectedByConstraint(
+           database, "INSERT INTO schema_version (version) VALUES (NULL);") &&
+       StatementIsRejectedByConstraint(
+           database,
+-          revision_five   ? "INSERT INTO schema_version (version) VALUES (4);"
++          revision_six    ? "INSERT INTO schema_version (version) VALUES (5);"
++          : revision_five ? "INSERT INTO schema_version (version) VALUES (4);"
+           : revision_four ? "INSERT INTO schema_version (version) VALUES (3);"
+           : revision_three_or_later
+               ? "INSERT INTO schema_version (version) VALUES (2);"
+@@ -2029,7 +2076,10 @@ CREATE TABLE firmware_log_outbox (
+                 "VALUES (3);") &&
+       StatementIsRejectedByConstraint(
+           database,
+-          revision_five
++          revision_six
++              ? "INSERT INTO device_state "
++                "(id, state, schema_revision) VALUES (2, 'default', 6);"
++          : revision_five
+               ? "INSERT INTO device_state "
+                 "(id, state, schema_revision) VALUES (2, 'default', 5);"
+           : revision_four
+@@ -2481,6 +2531,36 @@ FROM audit_events_revision_three AS old;)sql",
+ );)sql",
+     "INSERT INTO audit_state (id) VALUES (1);"};
+ 
++// Revision 6 preserves the restrictions of every existing device. These
++// statements run inside MigrateToRevisionSix's rollback-protected transaction.
++constexpr const char* kRevisionSixMigrationStatements[] = {
++    "ALTER TABLE schema_version RENAME TO schema_version_revision_five;",
++    R"sql(CREATE TABLE schema_version (
++  version INTEGER NOT NULL CHECK (version = 6)
++);)sql",
++    "INSERT INTO schema_version (version) VALUES (6);",
++    "DROP TABLE schema_version_revision_five;",
++    "ALTER TABLE device_state RENAME TO device_state_revision_five;",
++    R"sql(CREATE TABLE device_state (
++  id INTEGER PRIMARY KEY CHECK (id = 1),
++  state TEXT NOT NULL CHECK (state IN ('default', 'operational')),
++  schema_revision INTEGER NOT NULL CHECK (schema_revision = 6),
++  setup_completed_at_seconds INTEGER,
++  management_ip_restriction_enabled INTEGER NOT NULL DEFAULT 1
++    CHECK (management_ip_restriction_enabled IN (0, 1)),
++  CHECK (
++    (state = 'default' AND setup_completed_at_seconds IS NULL) OR
++    (state = 'operational' AND setup_completed_at_seconds IS NOT NULL AND
++     setup_completed_at_seconds >= 0)
++  )
++);)sql",
++    R"sql(INSERT INTO device_state
++      (id, state, schema_revision, setup_completed_at_seconds,
++       management_ip_restriction_enabled)
++      SELECT id, state, 6, setup_completed_at_seconds, 1
++      FROM device_state_revision_five;)sql",
++    "DROP TABLE device_state_revision_five;"};
++
+ constexpr const char* kRevisionFiveMigrationStatements[] = {
+     "ALTER TABLE schema_version RENAME TO schema_version_revision_four;",
+     R"sql(CREATE TABLE schema_version (
+@@ -2796,23 +2876,26 @@ common::Result<void> SecurityStore::InitializeSchema() {
+                         source_revision) ||
+         (source_revision != kRevisionTwoSecuritySchema &&
+          source_revision != kRevisionThreeSecuritySchema &&
+-         source_revision != kRevisionFourSecuritySchema)) {
++         source_revision != kRevisionFourSecuritySchema &&
++         source_revision != kRevisionFiveSecuritySchema)) {
+       return StoreError("E_SECURITY_DB_SCHEMA",
+                         "security database schema is invalid");
+     }
+-    return MigrateToRevisionFive(source_revision);
++    return MigrateToRevisionSix(source_revision);
+   }
+ 
+   constexpr const char* kSchema = R"sql(
+ CREATE TABLE schema_version (
+-  version INTEGER NOT NULL CHECK (version = 5)
++  version INTEGER NOT NULL CHECK (version = 6)
+ );
+-INSERT INTO schema_version (version) VALUES (5);
++INSERT INTO schema_version (version) VALUES (6);
+ CREATE TABLE device_state (
+   id INTEGER PRIMARY KEY CHECK (id = 1),
+   state TEXT NOT NULL CHECK (state IN ('default', 'operational')),
+-  schema_revision INTEGER NOT NULL CHECK (schema_revision = 5),
++  schema_revision INTEGER NOT NULL CHECK (schema_revision = 6),
+   setup_completed_at_seconds INTEGER,
++  management_ip_restriction_enabled INTEGER NOT NULL DEFAULT 1
++    CHECK (management_ip_restriction_enabled IN (0, 1)),
+   CHECK (
+     (state = 'default' AND setup_completed_at_seconds IS NULL) OR
+     (state = 'operational' AND setup_completed_at_seconds IS NOT NULL AND
+@@ -2820,7 +2903,7 @@ CREATE TABLE device_state (
+   )
+ );
+ INSERT INTO device_state (id, state, schema_revision)
+-VALUES (1, 'default', 5);
++VALUES (1, 'default', 6);
+ 
+ CREATE TABLE users (
+   id INTEGER PRIMARY KEY,
+@@ -2992,7 +3075,7 @@ common::Result<void> SecurityStore::RollbackSchemaTransaction() {
+   return rollback;
+ }
+ 
+-common::Result<void> SecurityStore::MigrateToRevisionFive(int source_revision) {
++common::Result<void> SecurityStore::MigrateToRevisionSix(int source_revision) {
+   auto begin =
+       Execute(impl_->database.get(), "BEGIN IMMEDIATE;", "E_SECURITY_DB_SCHEMA",
+               "failed to migrate security database");
+@@ -3061,7 +3144,24 @@ common::Result<void> SecurityStore::MigrateToRevisionFive(int source_revision) {
+     }
+   }
+ 
+-  for (const char* statement : kRevisionFiveMigrationStatements) {
++  if (source_revision < kRevisionFiveSecuritySchema) {
++    for (const char* statement : kRevisionFiveMigrationStatements) {
++      auto migrated =
++          Execute(impl_->database.get(), statement, "E_SECURITY_DB_SCHEMA",
++                  "failed to migrate security database");
++      if (!migrated.ok()) {
++        (void)RollbackSchemaTransaction();
++        return migrated;
++      }
++    }
++  }
++  auto revision_five_validated =
++      ValidateSchema(impl_->database.get(), kRevisionFiveSecuritySchema);
++  if (!revision_five_validated.ok()) {
++    (void)RollbackSchemaTransaction();
++    return revision_five_validated;
++  }
++  for (const char* statement : kRevisionSixMigrationStatements) {
+     auto migrated =
+         Execute(impl_->database.get(), statement, "E_SECURITY_DB_SCHEMA",
+                 "failed to migrate security database");
+@@ -3071,11 +3171,11 @@ common::Result<void> SecurityStore::MigrateToRevisionFive(int source_revision) {
+     }
+   }
+ 
+-  auto revision_five_validated =
++  auto revision_six_validated =
+       ValidateSchema(impl_->database.get(), kSecuritySchemaRevision);
+-  if (!revision_five_validated.ok()) {
++  if (!revision_six_validated.ok()) {
+     (void)RollbackSchemaTransaction();
+-    return revision_five_validated;
++    return revision_six_validated;
+   }
+ 
+   auto commit =
+@@ -3797,7 +3897,9 @@ common::Result<void> SecurityStore::InitializeDevice(
+     sqlite3_stmt* raw_state = nullptr;
+     constexpr const char* kSetOperational =
+         "UPDATE device_state SET state = 'operational', "
+-        "setup_completed_at_seconds = ?1 WHERE id = 1 AND state = 'default';";
++        "setup_completed_at_seconds = ?1, management_ip_restriction_enabled = "
++        "?2 "
++        "WHERE id = 1 AND state = 'default';";
+     if (::sqlite3_prepare_v2(impl_->database.get(), kSetOperational, -1,
+                              &raw_state, nullptr) != SQLITE_OK) {
+       return fail("E_BOOTSTRAP_STORE", "bootstrap transaction failed");
+@@ -3806,6 +3908,9 @@ common::Result<void> SecurityStore::InitializeDevice(
+                                                                       finalize);
+     if (::sqlite3_bind_int64(state_statement.get(), 1,
+                              record.completed_at_seconds) != SQLITE_OK ||
++        ::sqlite3_bind_int(state_statement.get(), 2,
++                           record.management_ip_restriction_enabled ? 1 : 0) !=
++            SQLITE_OK ||
+         ::sqlite3_step(state_statement.get()) != SQLITE_DONE ||
+         ::sqlite3_changes(impl_->database.get()) != 1) {
+       return fail("E_BOOTSTRAP_STORE", "bootstrap transaction failed");
+@@ -3844,6 +3949,10 @@ SecurityStore::ReadAuthenticationContext(
+     return failure();
+   }
+   context.state = state.value();
++  auto restriction = ManagementIpRestrictionEnabledUnderConnectionLease();
++  if (!restriction.ok()) {
++    return failure();
++  }
+ 
+   const auto finalize = [](sqlite3_stmt* statement) {
+     if (statement != nullptr) {
+@@ -3851,8 +3960,11 @@ SecurityStore::ReadAuthenticationContext(
+     }
+   };
+   const auto read_peer_for_role =
+-      [this, normalized_peer_ip, &failure,
++      [this, normalized_peer_ip, restricted = restriction.value(), &failure,
+        &finalize](std::string_view role_scope) -> common::Result<bool> {
++    if (!restricted) {
++      return common::Result<bool>::Ok(true);
++    }
+     sqlite3_stmt* raw_peer = nullptr;
+     constexpr const char* kReadPeer =
+         "SELECT EXISTS(SELECT 1 FROM management_ips "
+@@ -3956,6 +4068,41 @@ SecurityStore::ReadAuthenticationContext(
+   return common::Result<AuthenticationContext>::Ok(std::move(context));
+ }
+ 
++common::Result<bool>
++SecurityStore::ManagementIpRestrictionEnabledUnderConnectionLease() const {
++  const auto failure = [] {
++    return StoreError<bool>("E_SECURITY_DB_SCHEMA",
++                            "management IP policy is invalid");
++  };
++  PreparedStatement policy(impl_->database.get(),
++                           "SELECT management_ip_restriction_enabled FROM "
++                           "device_state WHERE id = 1;");
++  if (!policy.valid() || ::sqlite3_step(policy.get()) != SQLITE_ROW ||
++      ::sqlite3_column_type(policy.get(), 0) != SQLITE_INTEGER) {
++    return failure();
++  }
++  const auto enabled = ::sqlite3_column_int64(policy.get(), 0);
++  if ((enabled != 0 && enabled != 1) ||
++      ::sqlite3_step(policy.get()) != SQLITE_DONE) {
++    return failure();
++  }
++  return common::Result<bool>::Ok(enabled == 1);
++}
++
++common::Result<bool> SecurityStore::ManagementIpRestrictionEnabled() const {
++  auto started = BeginReadTransaction();
++  if (!started.ok()) {
++    return common::Result<bool>::Err(started.error());
++  }
++  auto transaction = std::move(started).value();
++  auto policy = ManagementIpRestrictionEnabledUnderConnectionLease();
++  if (!policy.ok()) {
++    return policy;
++  }
++  auto committed = transaction.Commit();
++  return committed.ok() ? policy : common::Result<bool>::Err(committed.error());
++}
++
+ common::Result<bool> SecurityStore::IsManagementPeer(
+     std::string_view normalized_peer_ip) {
+   const auto failure = [] {
+@@ -3967,6 +4114,14 @@ common::Result<bool> SecurityStore::IsManagementPeer(
+     return failure();
+   }
+   auto transaction = std::move(started).value();
++  auto restriction = ManagementIpRestrictionEnabledUnderConnectionLease();
++  if (!restriction.ok()) {
++    return failure();
++  }
++  if (!restriction.value()) {
++    auto committed = transaction.Commit();
++    return committed.ok() ? common::Result<bool>::Ok(true) : failure();
++  }
+   sqlite3_stmt* raw_peer = nullptr;
+   constexpr const char* kReadPeer =
+       "SELECT EXISTS(SELECT 1 FROM management_ips "
+@@ -4628,22 +4783,17 @@ SecurityStore::ReadSessionByTokenHash(Transaction& transaction,
+       impl_->database == nullptr) {
+     return failure();
+   }
+-  // The management_ips join is what stops a session that is still inside its
+-  // idle deadline from being used once its peer has stopped being a management
+-  // peer for that role. An uninitialized device has no management_ips row at
+-  // all — the first one is written by InitializeDevice — so on that device
+-  // the join can only ever fail, which is what made the initial account's
+-  // session unusable for auth/me and auth/logout.
+-  //
+-  // The state is read from this same transaction, so the operational statement
+-  // is selected from the instant InitializeDevice commits. That is the same
+-  // transaction that deletes the initial account, and sessions.user_id is
+-  // ON DELETE CASCADE, so there is no session left for the default-state
+-  // statement to find even if it could be selected.
++  // Read state and policy in this transaction so a policy change applies to
++  // every session validation immediately. Both query variants retain the
++  // account, role, expiry and exact peer binding checks.
+   auto state = StateUnderConnectionLease();
+   if (!state.ok()) {
+     return failure();
+   }
++  auto restriction = ManagementIpRestrictionEnabledUnderConnectionLease();
++  if (!restriction.ok()) {
++    return failure();
++  }
+   sqlite3_stmt* statement = nullptr;
+   static constexpr auto kOperationalSql = StoredSessionSql(
+       "JOIN management_ips ON "
+@@ -4652,17 +4802,14 @@ SecurityStore::ReadSessionByTokenHash(Transaction& transaction,
+       "management_ips.enabled = 1 WHERE sessions.token_hash = ?1 AND "
+       "sessions.peer_ip = ?2 AND sessions.expires_at_seconds > ?3 AND "
+       "users.enabled = 1 AND users.role = sessions.role;");
+-  // Identical apart from the join it cannot satisfy — the shared column list
+-  // makes that literal rather than a claim. Same bind parameters, and every
+-  // other restriction intact: the session is still bound to the one peer that
+-  // created it, to an enabled user, and to a role that matches that user's.
+-  static constexpr auto kDefaultStateSql = StoredSessionSql(
++  static constexpr auto kUnrestrictedSql = StoredSessionSql(
+       "WHERE sessions.token_hash = ?1 AND "
+       "sessions.peer_ip = ?2 AND sessions.expires_at_seconds > ?3 AND "
+       "users.enabled = 1 AND users.role = sessions.role;");
+-  const char* const kSql = state.value() == DeviceState::kOperational
+-                               ? kOperationalSql.data()
+-                               : kDefaultStateSql.data();
++  const char* const kSql =
++      state.value() == DeviceState::kOperational && restriction.value()
++          ? kOperationalSql.data()
++          : kUnrestrictedSql.data();
+   if (::sqlite3_prepare_v2(impl_->database.get(), kSql, -1, &statement,
+                            nullptr) != SQLITE_OK ||
+       ::sqlite3_bind_blob(statement, 1, token_hash.data(),
+@@ -5939,6 +6086,112 @@ common::Result<CommittedRevocation> SecurityStore::DeleteManagementIp(
+   }
+ }
+ 
++common::Result<CommittedRevocation>
++SecurityStore::SetManagementIpRestrictionEnabled(
++    bool enabled, std::int64_t now_seconds,
++    const SecurityMutationContext& context) {
++  auto started = BeginTransaction();
++  if (!started.ok()) {
++    return StoreError<CommittedRevocation>(
++        "E_USER_MANAGEMENT_STORE", "user management transaction failed");
++  }
++  auto transaction = std::move(started).value();
++  try {
++    const auto reject = [&](std::string code, std::string detail) {
++      auto audited = InsertAuditEvent(
++          transaction, now_seconds, "management_ip_policy_changed", "failure",
++          context.actor_user_id, context.normalized_peer_ip, detail,
++          "management_ip_policy", enabled ? "enabled" : "disabled");
++      if (!audited.ok() || !transaction.Commit().ok()) {
++        return UserMutationUnavailable<CommittedRevocation>(transaction);
++      }
++      return StoreError<CommittedRevocation>(
++          std::move(code), "management IP policy change was rejected");
++    };
++    if (context.actor_role != UserRole::kAdministrator) {
++      return reject("E_MANAGEMENT_IP_FORBIDDEN", "role_forbidden");
++    }
++    auto state = StateUnderConnectionLease();
++    auto current = ManagementIpRestrictionEnabledUnderConnectionLease();
++    if (!state.ok() || state.value() != DeviceState::kOperational ||
++        !current.ok()) {
++      return UserMutationUnavailable<CommittedRevocation>(transaction);
++    }
++    if (enabled) {
++      PreparedStatement peer(
++          impl_->database.get(),
++          "SELECT EXISTS(SELECT 1 FROM management_ips WHERE normalized_ip = ?1 "
++          "AND role_scope = 'administrator' AND enabled = 1);");
++      if (!peer.valid() ||
++          ::sqlite3_bind_text(
++              peer.get(), 1, context.normalized_peer_ip.data(),
++              static_cast<int>(context.normalized_peer_ip.size()),
++              SQLITE_TRANSIENT) != SQLITE_OK ||
++          ::sqlite3_step(peer.get()) != SQLITE_ROW) {
++        return UserMutationUnavailable<CommittedRevocation>(transaction);
++      }
++      if (::sqlite3_column_int(peer.get(), 0) != 1) {
++        return reject("E_MANAGEMENT_IP_LOCKOUT",
++                      "current_peer_not_allowlisted");
++      }
++    }
++    if (current.value() == enabled) {
++      if (!transaction.Commit().ok()) {
++        return UserMutationUnavailable<CommittedRevocation>(transaction);
++      }
++      return common::Result<CommittedRevocation>::Ok({{}});
++    }
++    std::vector<SessionIdentity> identities;
++    {
++      PreparedStatement sessions(
++          impl_->database.get(),
++          "SELECT token_hash FROM sessions ORDER BY id;");
++      if (!sessions.valid()) {
++        return UserMutationUnavailable<CommittedRevocation>(transaction);
++      }
++      int step = SQLITE_ROW;
++      while ((step = ::sqlite3_step(sessions.get())) == SQLITE_ROW) {
++        const auto* bytes = static_cast<const unsigned char*>(
++            ::sqlite3_column_blob(sessions.get(), 0));
++        if (bytes == nullptr || ::sqlite3_column_bytes(sessions.get(), 0) !=
++                                    static_cast<int>(kSessionIdentityBytes)) {
++          return UserMutationUnavailable<CommittedRevocation>(transaction);
++        }
++        SessionIdentity identity;
++        std::copy_n(bytes, kSessionIdentityBytes, identity.bytes.begin());
++        identities.emplace_back(std::move(identity));
++      }
++      if (step != SQLITE_DONE) {
++        return UserMutationUnavailable<CommittedRevocation>(transaction);
++      }
++    }
++    PreparedStatement policy(
++        impl_->database.get(),
++        "UPDATE device_state SET management_ip_restriction_enabled = ?1 WHERE "
++        "id = 1;");
++    if (!policy.valid() ||
++        ::sqlite3_bind_int(policy.get(), 1, enabled ? 1 : 0) != SQLITE_OK ||
++        ::sqlite3_step(policy.get()) != SQLITE_DONE ||
++        ::sqlite3_changes(impl_->database.get()) != 1 ||
++        !Execute(impl_->database.get(), "DELETE FROM sessions;",
++                 "E_USER_MANAGEMENT_STORE", "session revocation failed")
++             .ok()) {
++      return UserMutationUnavailable<CommittedRevocation>(transaction);
++    }
++    auto audited = InsertAuditEvent(
++        transaction, now_seconds, "management_ip_policy_changed", "success",
++        context.actor_user_id, context.normalized_peer_ip,
++        enabled ? "enabled" : "disabled", "management_ip_policy",
++        enabled ? "enabled" : "disabled");
++    if (!audited.ok() || !transaction.Commit().ok()) {
++      return UserMutationUnavailable<CommittedRevocation>(transaction);
++    }
++    return common::Result<CommittedRevocation>::Ok({std::move(identities)});
++  } catch (...) {
++    return UserMutationUnavailable<CommittedRevocation>(transaction);
++  }
++}
++
+ common::Result<void> SecurityStore::InstallBootstrapRtspCredential(
+     const std::filesystem::path& configured_path, std::string_view username,
+     std::string_view realm, std::span<const unsigned char> password) const {
+diff --git a/src/security/UserManagementService.cpp b/src/security/UserManagementService.cpp
+index 867c6a4..b887ec4 100644
+--- a/src/security/UserManagementService.cpp
++++ b/src/security/UserManagementService.cpp
+@@ -124,6 +124,7 @@ bool IsSemanticUserError(std::string_view code) {
+ 
+ bool IsSemanticManagementIpError(std::string_view code) {
+   return code == "E_MANAGEMENT_IP_FORBIDDEN" ||
++         code == "E_MANAGEMENT_IP_LOCKOUT" ||
+          code == "E_MANAGEMENT_IP_DUPLICATE" ||
+          code == "E_MANAGEMENT_IP_LIMIT" ||
+          code == "E_MANAGEMENT_IP_NOT_FOUND" ||
+@@ -614,6 +615,35 @@ common::Result<void> UserManagementService::ChangeOwnPassword(
+   }
+ }
+ 
++common::Result<bool> UserManagementService::ManagementIpRestrictionEnabled()
++    const {
++  auto policy = store_.ManagementIpRestrictionEnabled();
++  return policy.ok() ? policy : Unavailable<bool>();
++}
++
++common::Result<void> UserManagementService::SetManagementIpRestrictionEnabled(
++    bool enabled, const UserMutationContext& context) {
++  try {
++    const std::int64_t now_seconds = dependencies_.now_seconds();
++    if (now_seconds < 0) {
++      return UnavailableVoid();
++    }
++    auto changed = store_.SetManagementIpRestrictionEnabled(
++        enabled, now_seconds, StoreContext(context));
++    if (!changed.ok()) {
++      return IsSemanticManagementIpError(changed.error().code)
++                 ? common::Result<void>::Err(changed.error())
++                 : UnavailableVoid();
++    }
++    auto identities = std::move(changed).value().session_identities;
++    PublishSessionRevocations(identities, dependencies_.revoke_sessions,
++                              dependencies_.revoke_all_streams);
++    return common::Result<void>::Ok();
++  } catch (...) {
++    return UnavailableVoid();
++  }
++}
++
+ common::Result<std::vector<ManagementIpEntry>>
+ UserManagementService::ListManagementIps() const {
+   auto stored = store_.ReadManagementIps();
+diff --git a/src/service/SecurityRequestGate.cpp b/src/service/SecurityRequestGate.cpp
+index 3bee48d..2119fc6 100644
+--- a/src/service/SecurityRequestGate.cpp
++++ b/src/service/SecurityRequestGate.cpp
+@@ -111,6 +111,11 @@ std::optional<RoutePolicy> ClassifySecurityRoute(std::string_view path,
+     return std::nullopt;
+   }
+ 
++  if (path == "/api/v1/security/management-ip-policy") {
++    return method == "GET" || method == "PUT"
++               ? std::optional<RoutePolicy>(RoutePolicy::kAdministrator)
++               : std::nullopt;
++  }
+   if (path == "/api/v1/security/management-ips") {
+     return method == "GET"
+                ? std::optional<RoutePolicy>(RoutePolicy::kAdministrator)
+@@ -187,6 +192,9 @@ std::optional<RoutePolicy> ClassifySecurityRoute(std::string_view path,
+ 
+ bool RouteRefreshesManagementDeadlineImpl(std::string_view path,
+                                           std::string_view method) {
++  if (path == "/api/v1/security/management-ip-policy") {
++    return method == "GET" || method == "PUT";
++  }
+   if (path == "/api/v1/security/users") {
+     return method == "GET" || method == "POST";
+   }
+@@ -309,6 +317,13 @@ bool SameOrigin(std::string_view actual, std::string_view expected) {
+          actual_origin.value() == expected_origin.value();
+ }
+ 
++bool TrustedRequestOrigin(const SecurityRequestContext& context) {
++  return SameOrigin(context.origin, context.expected_origin) ||
++         SameOrigin(context.origin,
++                    SocketHttpsOrigin(context.local_ip, context.local_port,
++                                      context.local_tls));
++}
++
+ bool IsJsonContentType(std::string_view content_type) {
+   std::string normalized(content_type);
+   std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+@@ -349,12 +364,11 @@ class InSituCredentialParser {
+  public:
+   explicit InSituCredentialParser(common::SecureBytes& body) : body_(body) {}
+ 
+-  // `management_ips` is the one key whose value is not a string. Passing
+-  // nullptr for it keeps the key rejected outright, which is what every caller
+-  // but setup wants: an unrecognized key still fails the whole parse.
++  // Setup-only array and boolean fields stay rejected by other callers.
+   bool Parse(bool require_peer, std::string& username,
+              common::SecureBytes& password, std::string& peer_ip,
+-             std::vector<std::string>* management_ips = nullptr) {
++             std::vector<std::string>* management_ips = nullptr,
++             bool* management_ip_restriction_enabled = nullptr) {
+     if (body_.size() == 0U ||
+         !g_utf8_validate(reinterpret_cast<const char*>(body_.data()),
+                          static_cast<gssize>(body_.size()), nullptr)) {
+@@ -373,6 +387,7 @@ class InSituCredentialParser {
+     bool have_password = false;
+     bool have_peer = false;
+     bool have_management_ips = false;
++    bool have_ip_policy = false;
+     for (;;) {
+       DecodedJsonString key_slice;
+       bool key_was_escaped = false;
+@@ -392,6 +407,22 @@ class InSituCredentialParser {
+           return false;
+         }
+         have_management_ips = true;
++      } else if (management_ip_restriction_enabled != nullptr &&
++                 key == "management_ip_restriction_enabled" &&
++                 !have_ip_policy) {
++        const auto remaining = std::string_view(
++            reinterpret_cast<const char*>(body_.data() + position_),
++            body_.size() - position_);
++        if (remaining.starts_with("true")) {
++          *management_ip_restriction_enabled = true;
++          position_ += 4;
++        } else if (remaining.starts_with("false")) {
++          *management_ip_restriction_enabled = false;
++          position_ += 5;
++        } else {
++          return false;
++        }
++        have_ip_policy = true;
+       } else {
+         DecodedJsonString value;
+         if (!ParseString(value)) {
+@@ -681,6 +712,29 @@ common::Result<common::SecureBytes> SecureRequestBody(std::string_view body) {
+ 
+ }  // namespace
+ 
++std::string SocketHttpsOrigin(std::string_view local_ip,
++                              std::uint16_t local_port, bool local_tls) {
++  if (!local_tls || local_port == 0 || local_ip.empty() ||
++      local_ip.find('\0') != std::string_view::npos) {
++    return {};
++  }
++  const std::string text(local_ip);
++  std::unique_ptr<GInetAddress, GObjectDeleter> address(
++      g_inet_address_new_from_string(text.c_str()));
++  if (!address || g_inet_address_get_is_any(address.get()) ||
++      g_inet_address_get_is_multicast(address.get())) {
++    return {};
++  }
++  auto normalized = NormalizePeerIp(local_ip);
++  if (!normalized.ok()) {
++    return {};
++  }
++  const auto& ip = normalized.value();
++  return "https://" +
++         (ip.find(':') == std::string::npos ? ip : "[" + ip + "]") + ":" +
++         std::to_string(local_port);
++}
++
+ common::Result<void> AuthorizeSecurityRequest(
+     const SecurityRequestContext& context) {
+   const std::string method = UpperMethod(context.method);
+@@ -721,7 +775,7 @@ common::Result<void> AuthorizeSecurityRequest(
+     // CSRF risk, so only they require a same-origin check and the
+     // management header. The two GET routes above are safe reads.
+     if (IsStateChanging(method)) {
+-      if (!SameOrigin(context.origin, context.expected_origin)) {
++      if (!TrustedRequestOrigin(context)) {
+         return GateError("E_REQUEST_ORIGIN", "request denied");
+       }
+       if (!context.has_management_header) {
+@@ -746,7 +800,7 @@ common::Result<void> AuthorizeSecurityRequest(
+     return GateError("E_AUTHENTICATION_REQUIRED", "authentication required");
+   }
+   if (IsStateChanging(method)) {
+-    if (!SameOrigin(context.origin, context.expected_origin)) {
++    if (!TrustedRequestOrigin(context)) {
+       return GateError("E_REQUEST_ORIGIN", "request denied");
+     }
+     if (!context.has_management_header) {
+@@ -924,7 +978,8 @@ common::Result<ParsedSetupRequest> ParseSetupJson(
+   ParsedSetupRequest parsed;
+   InSituCredentialParser parser(body);
+   if (!parser.Parse(true, parsed.username, parsed.password,
+-                    parsed.confirmed_peer_ip, &parsed.management_ips) ||
++                    parsed.confirmed_peer_ip, &parsed.management_ips,
++                    &parsed.management_ip_restriction_enabled) ||
+       parsed.username.empty() ||
+       parsed.username.size() > kMaximumUsernameBytes ||
+       parsed.password.size() == 0U ||
+diff --git a/src/service/ServiceApp.cpp b/src/service/ServiceApp.cpp
+index f43efc4..d0c1b58 100644
+--- a/src/service/ServiceApp.cpp
++++ b/src/service/ServiceApp.cpp
+@@ -987,6 +987,9 @@ std::mutex& StateMutex() {
+ }
+ 
+ bool IsRegisteredApiRoute(std::string_view path, drogon::HttpMethod method) {
++  if (path == "/api/v1/security/management-ip-policy") {
++    return method == drogon::Get || method == drogon::Put;
++  }
+   if (path == "/api/v1/audit/status" || path == "/api/v1/audit/events") {
+     return method == drogon::Get;
+   }
+@@ -1800,6 +1803,9 @@ void AuthorizeRequest(const drogon::HttpRequestPtr& request,
+     context.normalized_peer_ip = std::move(normalized_peer).value();
+     context.origin = request->getHeader("origin");
+     context.expected_origin = dependencies.expected_origin;
++    context.local_ip = request->localAddr().toIp();
++    context.local_port = request->localAddr().toPort();
++    context.local_tls = request->isOnSecureConnection();
+     context.has_management_header =
+         request->getHeader("x-camera-request") == "management";
+     std::shared_ptr<common::SecureBytes> session_token;
+@@ -2377,6 +2383,8 @@ void RegisterHandlers() {
+                   bootstrap_request.actual_peer_ip = actual_peer;
+                   bootstrap_request.management_ips =
+                       std::move(parsed_request->management_ips);
++                  bootstrap_request.management_ip_restriction_enabled =
++                      parsed_request->management_ip_restriction_enabled;
+                   bool transition_allowed = false;
+                   {
+                     std::scoped_lock lock(StateMutex());
+@@ -3153,6 +3161,90 @@ void RegisterHandlers() {
+       },
+       {Delete});
+ 
++  app().registerHandler(
++      "/api/v1/security/management-ip-policy",
++      [](const HttpRequestPtr& request, DrogonCallback&& callback) {
++        AuthorizeRequest(
++            request, std::move(callback),
++            [request](AuthorizedRequest authorized_request,
++                      HttpCallback callback) {
++              try {
++                auto context =
++                    BuildUserMutationContext(request, authorized_request);
++                if (!context.ok()) {
++                  callback(BuildUserManagementErrorResponse(context.error()));
++                  return;
++                }
++                std::optional<bool> requested;
++                if (request->method() == Put) {
++                  // Same strict one-field boolean object as viewer enablement.
++                  auto parsed = ParseSetViewerEnabledJson(
++                      request->getBody(), request->getHeader("content-type"));
++                  if (!parsed.ok()) {
++                    callback(BuildUserManagementErrorResponse(parsed.error()));
++                    return;
++                  }
++                  requested = parsed.value().enabled;
++                } else {
++                  auto empty = ValidateEmptyRequestBody(request->getBody());
++                  if (!empty.ok()) {
++                    callback(BuildUserManagementErrorResponse(empty.error()));
++                    return;
++                  }
++                }
++                const auto dependencies = CopyAdministratorUserDependencies();
++                if (dependencies.shutting_down || !dependencies.service ||
++                    !dependencies.worker) {
++                  callback(SecurityUnavailableResponse());
++                  return;
++                }
++                auto submitted = dependencies.worker->Submit(
++                    [service = dependencies.service, requested,
++                     context = std::move(context).value(), callback,
++                     event_loop = app().getLoop()]() mutable {
++                      try {
++                        bool enabled = false;
++                        if (requested.has_value()) {
++                          auto updated =
++                              service->SetManagementIpRestrictionEnabled(
++                                  *requested, context);
++                          if (!updated.ok()) {
++                            QueueResponse(event_loop, std::move(callback),
++                                          BuildUserManagementErrorResponse(
++                                              updated.error()));
++                            return;
++                          }
++                          enabled = *requested;
++                        } else {
++                          auto current =
++                              service->ManagementIpRestrictionEnabled();
++                          if (!current.ok()) {
++                            QueueResponse(event_loop, std::move(callback),
++                                          BuildUserManagementErrorResponse(
++                                              current.error()));
++                            return;
++                          }
++                          enabled = current.value();
++                        }
++                        Json::Value body(Json::objectValue);
++                        body["enabled"] = enabled;
++                        QueueResponse(event_loop, std::move(callback),
++                                      JsonResponse(std::move(body)));
++                      } catch (...) {
++                        QueueResponse(event_loop, std::move(callback),
++                                      SecurityUnavailableResponse());
++                      }
++                    });
++                if (!submitted.ok()) {
++                  callback(BuildUserManagementErrorResponse(submitted.error()));
++                }
++              } catch (...) {
++                callback(SecurityUnavailableResponse());
++              }
++            });
++      },
++      {Get, Put});
++
+   app().registerHandler(
+       "/api/v1/security/management-ips",
+       [](const HttpRequestPtr& request, DrogonCallback&& callback) {
+@@ -4361,7 +4453,7 @@ void RegisterHandlers() {
+       [](const HttpRequestPtr& request, DrogonCallback&& callback) {
+         AuthorizeRequest(
+             request, std::move(callback),
+-            [](AuthorizedRequest, HttpCallback callback) {
++            [request](AuthorizedRequest, HttpCallback callback) {
+               const config::AppConfig* config = nullptr;
+               std::string public_base_url;
+               SecureStreamDiagnosticsProvider diagnostics_provider;
+@@ -4372,6 +4464,11 @@ void RegisterHandlers() {
+                 diagnostics_provider =
+                     GlobalState().args.secure_stream_diagnostics_provider;
+               }
++              if (public_base_url.empty()) {
++                public_base_url = SocketHttpsOrigin(
++                    request->localAddr().toIp(), request->localAddr().toPort(),
++                    request->isOnSecureConnection());
++              }
+               if (config == nullptr) {
+                 Json::Value body(Json::objectValue);
+                 body["code"] = "E_CONFIG";
+diff --git a/src/service/UserManagementHttp.cpp b/src/service/UserManagementHttp.cpp
+index d83c410..39f27b2 100644
+--- a/src/service/UserManagementHttp.cpp
++++ b/src/service/UserManagementHttp.cpp
+@@ -396,12 +396,12 @@ bool ContainsCode(const std::array<std::string_view, Size>& codes,
+ }
+ 
+ bool IsConflictCode(std::string_view code) {
+-  constexpr std::array<std::string_view, 9> kCodes = {
+-      "E_USER_DUPLICATE",         "E_VIEWER_LIMIT",
+-      "E_USER_PROTECTED",         "E_USER_CONFLICT",
+-      "E_PASSWORD_REUSE",         "E_MANAGEMENT_IP_DUPLICATE",
+-      "E_MANAGEMENT_IP_LIMIT",    "E_MANAGEMENT_IP_ROLE_MISMATCH",
+-      "E_MANAGEMENT_IP_PROTECTED"};
++  constexpr std::array<std::string_view, 10> kCodes = {
++      "E_USER_DUPLICATE",          "E_VIEWER_LIMIT",
++      "E_USER_PROTECTED",          "E_USER_CONFLICT",
++      "E_PASSWORD_REUSE",          "E_MANAGEMENT_IP_DUPLICATE",
++      "E_MANAGEMENT_IP_LIMIT",     "E_MANAGEMENT_IP_ROLE_MISMATCH",
++      "E_MANAGEMENT_IP_PROTECTED", "E_MANAGEMENT_IP_LOCKOUT"};
+   return ContainsCode(kCodes, code);
+ }
+ 
+diff --git a/tests/integration/HttpsAuthIntegrationTest.cpp b/tests/integration/HttpsAuthIntegrationTest.cpp
+index e90718f..b594772 100644
+--- a/tests/integration/HttpsAuthIntegrationTest.cpp
++++ b/tests/integration/HttpsAuthIntegrationTest.cpp
+@@ -6759,6 +6759,113 @@ TEST(HttpsAuthIntegrationTest,
+   service.Stop();
+ }
+ 
++TEST(HttpsAuthIntegrationTest, DhcpSocketOriginAndOptionalIpPolicy) {
++  TemporaryDirectory directory;
++  const std::uint16_t port = ReserveLoopbackPort();
++  const std::string origin = "https://127.0.0.1:" + std::to_string(port);
++  auto config = MakePersistenceConfig(directory.path(), port);
++  config.http.public_base_url.clear();
++  camera_firmware::service::ServiceInitArgs args;
++  args.app_config = &config;
++  args.provider = &TestCryptoProvider();
++  args.document_root = config.http.web_root;
++  args.public_base_url.clear();
++  args.runtime_start_callback = [] {
++    return camera_firmware::common::Result<void>::Ok();
++  };
++  camera_firmware::service::ServiceApp service;
++  ASSERT_TRUE(service.Init(args).ok());
++  auto client = NewClient(port);
++  auto changed_address_client = NewClient(port, "127.0.0.2");
++  const std::string initial_cookie = InitialAccountCookie(client, origin);
++  ASSERT_FALSE(initial_cookie.empty());
++
++  // Arbitrary Host/forwarded metadata cannot grant an Origin permission.
++  auto hostile = Send(client, drogon::Post, "/api/v1/auth/login", "{}",
++                      "https://attacker.example", {}, true, 15.0,
++                      {{"Host", "attacker.example"},
++                       {"X-Forwarded-Host", "attacker.example"},
++                       {"X-Forwarded-Proto", "https"}});
++  ExpectStatus(hostile, drogon::k403Forbidden);
++  ASSERT_NE(hostile.response->getJsonObject(), nullptr);
++  EXPECT_EQ((*hostile.response->getJsonObject())["code"].asString(),
++            "E_REQUEST_ORIGIN");
++
++  ExpectStatus(
++      Send(
++          client, drogon::Post, "/api/v1/setup/initialize",
++          R"({"username":"owner1","password":"StrongPass9!","peer_ip":"127.0.0.1","management_ips":[],"management_ip_restriction_enabled":false})",
++          origin, initial_cookie, true),
++      drogon::k200OK);
++  constexpr const char* credentials =
++      R"({"username":"owner1","password":"StrongPass9!"})";
++  auto first_login = Send(client, drogon::Post, "/api/v1/auth/login",
++                          credentials, origin, {}, true);
++  ExpectStatus(first_login, drogon::k200OK);
++  const std::string cookie =
++      "camera_session=" +
++      first_login.response->getCookie("camera_session").value();
++  auto policy = Send(client, drogon::Get,
++                     "/api/v1/security/management-ip-policy", {}, {}, cookie);
++  ExpectStatus(policy, drogon::k200OK);
++  ASSERT_NE(policy.response->getJsonObject(), nullptr);
++  EXPECT_FALSE((*policy.response->getJsonObject())["enabled"].asBool());
++  auto stream = Send(client, drogon::Get, "/api/v1/stream", {}, {}, cookie);
++  ExpectStatus(stream, drogon::k200OK);
++  ASSERT_NE(stream.response->getJsonObject(), nullptr);
++  EXPECT_EQ((*stream.response->getJsonObject())["url"].asString(),
++            "rtsps://127.0.0.1:8555/imx708/main");
++
++  // A changed PC address may sign in, but cannot replay the old IP-bound
++  // session.
++  ExpectStatus(Send(changed_address_client, drogon::Get, "/api/v1/auth/me", {},
++                    {}, cookie),
++               drogon::k401Unauthorized);
++  // Keep the one-active-session policy: sign out before changing the PC IP.
++  ExpectStatus(Send(client, drogon::Post, "/api/v1/auth/logout", {}, origin,
++                    cookie, true),
++               drogon::k200OK);
++  ExpectStatus(Send(changed_address_client, drogon::Post, "/api/v1/auth/login",
++                    R"({"username":"owner1","password":"WrongPass9!"})", origin,
++                    {}, true),
++               drogon::k401Unauthorized);
++  auto changed_login =
++      Send(changed_address_client, drogon::Post, "/api/v1/auth/login",
++           credentials, origin, {}, true);
++  ExpectStatus(changed_login, drogon::k200OK);
++  const std::string changed_cookie =
++      "camera_session=" +
++      changed_login.response->getCookie("camera_session").value();
++  ExpectStatus(Send(changed_address_client, drogon::Put,
++                    "/api/v1/security/management-ip-policy",
++                    R"({"enabled":true})", origin, changed_cookie, true),
++               drogon::k409Conflict);
++  ExpectStatus(Send(changed_address_client, drogon::Post, "/api/v1/auth/logout",
++                    {}, origin, changed_cookie, true),
++               drogon::k200OK);
++  auto registered_login = Send(client, drogon::Post, "/api/v1/auth/login",
++                               credentials, origin, {}, true);
++  ExpectStatus(registered_login, drogon::k200OK);
++  const std::string registered_cookie =
++      "camera_session=" +
++      registered_login.response->getCookie("camera_session").value();
++  ExpectStatus(
++      Send(client, drogon::Put, "/api/v1/security/management-ip-policy",
++           R"({"enabled":"false"})", origin, registered_cookie, true),
++      drogon::k400BadRequest);
++  ExpectStatus(
++      Send(client, drogon::Put, "/api/v1/security/management-ip-policy",
++           R"({"enabled":true})", origin, registered_cookie, true),
++      drogon::k200OK);
++  ExpectStatus(
++      Send(client, drogon::Get, "/api/v1/auth/me", {}, {}, registered_cookie),
++      drogon::k401Unauthorized);
++  ExpectStatus(Send(changed_address_client, drogon::Post, "/api/v1/auth/login",
++                    credentials, origin, {}, true),
++               drogon::k403Forbidden);
++  service.Stop();
++}
++
+ TEST(HttpsAuthIntegrationTest, SetupLoginSessionCsrfLogoutAndOverflowFlow) {
+   TemporaryDirectory directory;
+   const std::uint16_t port = ReserveLoopbackPort();
+diff --git a/tests/unit/config/AppConfigTest.cpp b/tests/unit/config/AppConfigTest.cpp
+index 1cb5858..4b64c3c 100644
+--- a/tests/unit/config/AppConfigTest.cpp
++++ b/tests/unit/config/AppConfigTest.cpp
+@@ -485,6 +485,15 @@ TEST(AppConfigTest, RejectsSecurityWithoutHttpsOrSha256RtspAuth) {
+       "E_SECURITY_CREDENTIAL_PATH");
+ }
+ 
++TEST(AppConfigTest,
++     SecurityModeAllowsAutomaticSocketOriginWithoutStaticPublicUrl) {
++  auto config = LoadInlineConfig(SecurityConfigWithPublicUrl("''"));
++  ASSERT_TRUE(config.ok()) << config.error().code;
++  EXPECT_TRUE(config.value().http.public_base_url.empty());
++  EXPECT_TRUE(config.value().security.enabled);
++  EXPECT_TRUE(config.value().http.tls.enabled);
++}
++
+ TEST(AppConfigTest, AcceptsSecurityWithSha256AndMd5RtspAuth) {
+   // Security mode requires SHA-256 but MAY additionally offer MD5 so that
+   // MD5-only RTSP clients (GStreamer/FFmpeg/live555) can authenticate; the
+diff --git a/tests/unit/security/AuthServiceTest.cpp b/tests/unit/security/AuthServiceTest.cpp
+index 0c315e1..4f18361 100644
+--- a/tests/unit/security/AuthServiceTest.cpp
++++ b/tests/unit/security/AuthServiceTest.cpp
+@@ -577,6 +577,100 @@ class AuthServiceTest : public ::testing::Test {
+   int random_calls_{0};
+ };
+ 
++TEST_F(AuthServiceTest,
++       UnrestrictedBootstrapAdmitsUnknownPeerWithValidCredentials) {
++  TemporaryDirectory root;
++  auto opened = SecurityStore::Open({root.path() / "security"});
++  ASSERT_TRUE(opened.ok());
++  auto record = AdministratorRecord();
++  record.management_ip_restriction_enabled = false;
++  ASSERT_TRUE(opened.value()
++                  ->InitializeDevice(std::move(record),
++                                     [] { return common::Result<void>::Ok(); })
++                  .ok());
++  auto service = AuthServiceTestAccess::Create(*opened.value(), Dependencies());
++  auto rejected =
++      service->Login(Login("Operator.One", "BadSecret!9", "198.51.100.44"));
++  ExpectAuthenticationFailure(rejected);
++  auto unknown =
++      service->Login(Login("missing.user", "NorthStar!9", "198.51.100.44"));
++  ExpectAuthenticationFailure(unknown);
++  auto admitted = opened.value()->IsManagementPeer("198.51.100.44");
++  ASSERT_TRUE(admitted.ok());
++  EXPECT_TRUE(admitted.value());
++  auto login =
++      service->Login(Login("Operator.One", "NorthStar!9", "198.51.100.44"));
++  ASSERT_TRUE(login.ok()) << login.error().message;
++  const auto token = std::span<const unsigned char>(
++      login.value().session_token.data(), login.value().session_token.size());
++  auto principal =
++      service->Verify(token, "198.51.100.44", ManagementActivity::kNone);
++  ASSERT_TRUE(principal.ok()) << principal.error().message;
++  EXPECT_EQ(principal.value().role, UserRole::kAdministrator);
++  EXPECT_FALSE(
++      service->Verify(token, "198.51.100.45", ManagementActivity::kNone).ok());
++  EXPECT_FALSE(
++      service->Reauthenticate(token, "198.51.100.44", Bytes("BadSecret!9"))
++          .ok());
++  EXPECT_TRUE(
++      service->Reauthenticate(token, "198.51.100.44", Bytes("NorthStar!9"))
++          .ok());
++  now_seconds_ += 600;
++  EXPECT_FALSE(
++      service->Verify(token, "198.51.100.44", ManagementActivity::kNone).ok());
++}
++
++TEST_F(AuthServiceTest,
++       UnrestrictedAuthenticationRetainsViewerRoleAndAccountLockout) {
++  ExecuteSql(store_->database_path(),
++             "UPDATE device_state SET management_ip_restriction_enabled = 0;");
++  InsertUser(store_->database_path(), "monitor.east", "Monitor.East", "viewer");
++  auto viewer =
++      service_->Login(Login("Monitor.East", "NorthStar!9", "198.51.100.44"));
++  ASSERT_TRUE(viewer.ok()) << viewer.error().message;
++  const auto token = std::span<const unsigned char>(
++      viewer.value().session_token.data(), viewer.value().session_token.size());
++  auto principal =
++      service_->Verify(token, "198.51.100.44", ManagementActivity::kNone);
++  ASSERT_TRUE(principal.ok());
++  EXPECT_EQ(principal.value().role, UserRole::kViewer);
++  ExecuteSql(store_->database_path(),
++             "UPDATE users SET enabled = 0 WHERE role = 'viewer';");
++  EXPECT_FALSE(
++      service_->Verify(token, "198.51.100.44", ManagementActivity::kNone).ok());
++  for (int attempt = 0; attempt < 5; ++attempt) {
++    ExpectAuthenticationFailure(
++        service_->Login(Login("Operator.One", "BadSecret!9", "198.51.100.45")));
++  }
++  EXPECT_EQ(
++      QueryInt(
++          store_->database_path(),
++          "SELECT failed_login_count FROM users WHERE role = 'administrator';"),
++      5);
++  ExpectAuthenticationFailure(
++      service_->Login(Login("Operator.One", "NorthStar!9", "198.51.100.45")));
++}
++
++TEST_F(AuthServiceTest, CorruptIpPolicyFailsClosedForExistingSessionsAndPeers) {
++  auto login = service_->Login(Login());
++  ASSERT_TRUE(login.ok());
++  const auto token = std::span<const unsigned char>(
++      login.value().session_token.data(), login.value().session_token.size());
++  ExecuteSql(store_->database_path(),
++             "PRAGMA ignore_check_constraints=ON; "
++             "UPDATE device_state SET management_ip_restriction_enabled = 2;");
++  EXPECT_FALSE(store_->ManagementIpRestrictionEnabled().ok());
++  EXPECT_FALSE(store_->IsManagementPeer("192.0.2.10").ok());
++  EXPECT_FALSE(
++      service_->Verify(token, "192.0.2.10", ManagementActivity::kNone).ok());
++  EXPECT_FALSE(
++      service_->Reauthenticate(token, "192.0.2.10", Bytes("NorthStar!9")).ok());
++  EXPECT_FALSE(service_->Login(Login()).ok());
++  const auto reopened = SecurityStore::Open({store_->state_directory()});
++  ASSERT_FALSE(reopened.ok());
++  EXPECT_EQ(reopened.error().code, "E_SECURITY_DB_SCHEMA");
++}
++
+ TEST_F(AuthServiceTest, UnknownAndWrongPasswordUseSameKdfAndError) {
+   const auto unknown = service_->Login(Login("missing.user", "BadSecret!9"));
+   const int unknown_kdf_calls = kdf_calls_;
+diff --git a/tests/unit/security/BootstrapServiceTest.cpp b/tests/unit/security/BootstrapServiceTest.cpp
+index 5713342..db6f641 100644
+--- a/tests/unit/security/BootstrapServiceTest.cpp
++++ b/tests/unit/security/BootstrapServiceTest.cpp
+@@ -886,6 +886,30 @@ TEST(BootstrapServiceTest, StoreFailureDuringSetupKeepsTheInitialAccount) {
+   EXPECT_TRUE(verified.value());
+ }
+ 
++TEST(BootstrapServiceTest,
++     ExplicitUnrestrictedSetupPersistsWithoutAdditionalAddresses) {
++  TemporaryDirectory root;
++  const auto state = root.Path("security");
++  {
++    auto store = SecurityStore::Open({state});
++    ASSERT_TRUE(store.ok());
++    auto config = BootstrapConfig(state, state / "rtsp.credentials");
++    BootstrapService service(*store.value(), config,
++                             BuildReservedIdentities(config));
++    auto request =
++        Request("Operator.One", "NorthStar!9", "192.0.2.10", "192.0.2.10");
++    request.management_ip_restriction_enabled = false;
++    auto result = service.Initialize(std::move(request));
++    ASSERT_TRUE(result.ok()) << result.error().message;
++    EXPECT_FALSE(store.value()->ManagementIpRestrictionEnabled().value());
++    EXPECT_TRUE(store.value()->IsManagementPeer("198.51.100.44").value());
++  }
++  auto reopened = SecurityStore::Open({state});
++  ASSERT_TRUE(reopened.ok()) << reopened.error().message;
++  EXPECT_FALSE(reopened.value()->ManagementIpRestrictionEnabled().value());
++  EXPECT_TRUE(reopened.value()->IsManagementPeer("198.51.100.45").value());
++}
++
+ TEST(BootstrapServiceTest, RegistersEverySubmittedManagementIpAtSetup) {
+   TemporaryDirectory root;
+   const auto state = root.Path("security");
+diff --git a/tests/unit/security/SecurityStoreTest.cpp b/tests/unit/security/SecurityStoreTest.cpp
+index bb93e14..85c625f 100644
+--- a/tests/unit/security/SecurityStoreTest.cpp
++++ b/tests/unit/security/SecurityStoreTest.cpp
+@@ -2246,7 +2246,7 @@ TEST(SecurityStoreTest, CommitFailureRetainsLeaseUntilRollback) {
+   EXPECT_EQ(released_state.value(), DeviceState::kDefault);
+ }
+ 
+-TEST(SecurityStoreTest, CreatesExactRevisionFiveSchemaAndConfiguresConnection) {
++TEST(SecurityStoreTest, CreatesExactRevisionSixSchemaAndConfiguresConnection) {
+   ResetSqliteHooks();
+   TemporaryDirectory root;
+   auto store = SecurityStore::Open({root.Path("security")});
+@@ -2271,9 +2271,10 @@ TEST(SecurityStoreTest, CreatesExactRevisionFiveSchemaAndConfiguresConnection) {
+           last_opened_database,
+           "SELECT name || ':' || type || ':' || \"notnull\" || ':' || pk "
+           "FROM pragma_table_info('device_state') ORDER BY cid;"),
+-      std::vector<std::string>({"id:INTEGER:0:1", "state:TEXT:1:0",
+-                                "schema_revision:INTEGER:1:0",
+-                                "setup_completed_at_seconds:INTEGER:0:0"}));
++      std::vector<std::string>(
++          {"id:INTEGER:0:1", "state:TEXT:1:0", "schema_revision:INTEGER:1:0",
++           "setup_completed_at_seconds:INTEGER:0:0",
++           "management_ip_restriction_enabled:INTEGER:1:0"}));
+   EXPECT_EQ(
+       QueryTextRows(
+           last_opened_database,
+@@ -2370,10 +2371,10 @@ TEST(SecurityStoreTest, CreatesExactRevisionFiveSchemaAndConfiguresConnection) {
+       QueryInt(last_opened_database, "SELECT COUNT(*) FROM schema_version;"),
+       1);
+   EXPECT_EQ(
+-      QueryInt(last_opened_database, "SELECT version FROM schema_version;"), 5);
++      QueryInt(last_opened_database, "SELECT version FROM schema_version;"), 6);
+   EXPECT_EQ(QueryInt(last_opened_database,
+                      "SELECT schema_revision FROM device_state WHERE id = 1;"),
+-            5);
++            6);
+   EXPECT_EQ(QueryText(last_opened_database,
+                       "SELECT id || '|' || rotated_event_count || '|' || "
+                       "COALESCE(last_rotation_at_seconds, -1) || '|' || "
+@@ -2582,11 +2583,11 @@ TEST(SecurityStoreTest, MigratesExactRevisionTwoDatabaseToRevisionFive) {
+   opened.value().reset();
+   EXPECT_EQ(QueryDatabaseInt(fixture.database_path(),
+                              "SELECT version FROM schema_version;"),
+-            5);
++            6);
+   EXPECT_EQ(QueryDatabaseInt(
+                 fixture.database_path(),
+                 "SELECT schema_revision FROM device_state WHERE id = 1;"),
+-            5);
++            6);
+   EXPECT_EQ(fixture.evidence(), before);
+   EXPECT_EQ(QueryDatabaseInt(
+                 fixture.database_path(),
+@@ -2622,11 +2623,11 @@ TEST(SecurityStoreTest, MigratesExactRevisionThreeDatabaseToRevisionFive) {
+   opened.value().reset();
+   EXPECT_EQ(QueryDatabaseInt(fixture.database_path(),
+                              "SELECT version FROM schema_version;"),
+-            5);
++            6);
+   EXPECT_EQ(QueryDatabaseInt(
+                 fixture.database_path(),
+                 "SELECT schema_revision FROM device_state WHERE id = 1;"),
+-            5);
++            6);
+   EXPECT_EQ(
+       QueryDatabaseTextRows(
+           fixture.database_path(),
+@@ -2656,8 +2657,8 @@ TEST(SecurityStoreTest, MigratesExactRevisionThreeDatabaseToRevisionFive) {
+   EXPECT_TRUE(SecurityStore::Open({fixture.state_directory()}).ok());
+ }
+ 
+-TEST(SecurityStoreTest, CurrentSchemaRevisionIsFive) {
+-  EXPECT_EQ(kSecuritySchemaRevision, 5);
++TEST(SecurityStoreTest, CurrentSchemaRevisionIsSix) {
++  EXPECT_EQ(kSecuritySchemaRevision, 6);
+ }
+ 
+ TEST(SecurityStoreTest, FreshSessionsTableCarriesManagementDeadline) {
+@@ -2687,10 +2688,75 @@ TEST(SecurityStoreTest, FreshSessionsTableCarriesManagementDeadline) {
+   int version = 0;
+   EXPECT_TRUE(
+       QuerySingleInt(database, "SELECT version FROM schema_version;", version));
+-  EXPECT_EQ(version, 5);
++  EXPECT_EQ(version, 6);
+   (void)::sqlite3_close_v2(database);
+ }
+ 
++TEST(SecurityStoreTest,
++     RevisionFiveMigrationPreservesRestrictedOperationalDevice) {
++  ResetSqliteHooks();
++  TemporaryDirectory root;
++  const auto state = root.Path("security");
++  const auto database = state / "security.db";
++  {
++    auto store = SecurityStore::Open({state});
++    ASSERT_TRUE(store.ok());
++    ASSERT_TRUE(
++        store.value()
++            ->InitializeDevice(
++                MakeBootstrapRecord(),
++                [] { return camera_firmware::common::Result<void>::Ok(); })
++            .ok());
++  }
++  // Construct the exact revision-5 metadata tables around the same accounts,
++  // password material, audit trail and management addresses.
++  ExecuteDatabaseSql(database, R"sql(
++ALTER TABLE schema_version RENAME TO schema_version_current;
++CREATE TABLE schema_version (
++  version INTEGER NOT NULL CHECK (version = 5)
++);
++INSERT INTO schema_version (version) VALUES (5);
++DROP TABLE schema_version_current;
++ALTER TABLE device_state RENAME TO device_state_current;
++CREATE TABLE device_state (
++  id INTEGER PRIMARY KEY CHECK (id = 1),
++  state TEXT NOT NULL CHECK (state IN ('default', 'operational')),
++  schema_revision INTEGER NOT NULL CHECK (schema_revision = 5),
++  setup_completed_at_seconds INTEGER,
++  CHECK (
++    (state = 'default' AND setup_completed_at_seconds IS NULL) OR
++    (state = 'operational' AND setup_completed_at_seconds IS NOT NULL AND
++     setup_completed_at_seconds >= 0)
++  )
++);
++INSERT INTO device_state
++  (id, state, schema_revision, setup_completed_at_seconds)
++SELECT id, state, 5, setup_completed_at_seconds FROM device_state_current;
++DROP TABLE device_state_current;
++)sql");
++  const auto before = QueryDatabaseTextRows(
++      database,
++      "SELECT canonical_username || '|' || hex(password_salt) || '|' || "
++      "hex(password_derived) FROM users;");
++  const int audits_before =
++      QueryDatabaseInt(database, "SELECT COUNT(*) FROM audit_events;");
++  auto reopened = SecurityStore::Open({state});
++  ASSERT_TRUE(reopened.ok()) << reopened.error().message;
++  EXPECT_TRUE(reopened.value()->ManagementIpRestrictionEnabled().value());
++  EXPECT_TRUE(reopened.value()->IsManagementPeer("2001:db8::10").value());
++  EXPECT_FALSE(reopened.value()->IsManagementPeer("198.51.100.44").value());
++  EXPECT_EQ(
++      QueryDatabaseTextRows(
++          database,
++          "SELECT canonical_username || '|' || hex(password_salt) || '|' || "
++          "hex(password_derived) FROM users;"),
++      before);
++  EXPECT_EQ(QueryDatabaseInt(database, "SELECT COUNT(*) FROM audit_events;"),
++            audits_before);
++  EXPECT_EQ(QueryDatabaseInt(database, "SELECT version FROM schema_version;"),
++            6);
++}
++
+ TEST(SecurityStoreTest, MigrationToRevisionFiveBackfillsZeroAndKeepsSessions) {
+   ResetSqliteHooks();
+   TemporaryDirectory root;
+@@ -2719,7 +2785,7 @@ TEST(SecurityStoreTest, MigrationToRevisionFiveBackfillsZeroAndKeepsSessions) {
+   int version = 0;
+   EXPECT_TRUE(
+       QuerySingleInt(database, "SELECT version FROM schema_version;", version));
+-  EXPECT_EQ(version, 5);
++  EXPECT_EQ(version, 6);
+   int sessions = 0;
+   EXPECT_TRUE(
+       QuerySingleInt(database, "SELECT COUNT(*) FROM sessions;", sessions));
+diff --git a/tests/unit/security/UserManagementServiceTest.cpp b/tests/unit/security/UserManagementServiceTest.cpp
+index 06d5c8a..a9dcd04 100644
+--- a/tests/unit/security/UserManagementServiceTest.cpp
++++ b/tests/unit/security/UserManagementServiceTest.cpp
+@@ -439,6 +439,110 @@ class UserManagementServiceTest : public ::testing::Test {
+   std::vector<SessionIdentity> revoked_;
+ };
+ 
++TEST_F(UserManagementServiceTest,
++       DisablingIpRestrictionPersistsAndRevokesAllSessions) {
++  const auto viewer_id = SeedViewer("monitor.east", "Monitor.East");
++  SeedSession(viewer_id, UserRole::kViewer, 0x51U);
++  SeedSession(administrator_id_, UserRole::kAdministrator, 0x52U, "192.0.2.10");
++  StartService();
++  auto changed = service_->SetManagementIpRestrictionEnabled(
++      false, AdministratorContext());
++  ASSERT_TRUE(changed.ok()) << changed.error().message;
++  ASSERT_TRUE(service_->ManagementIpRestrictionEnabled().ok());
++  EXPECT_FALSE(service_->ManagementIpRestrictionEnabled().value());
++  EXPECT_TRUE(store_->IsManagementPeer("198.51.100.44").value());
++  EXPECT_EQ(QueryInt(database_path(), "SELECT COUNT(*) FROM sessions;"), 0);
++  EXPECT_EQ(exact_revocation_calls_, 1);
++  EXPECT_EQ(revoked_,
++            (std::vector<SessionIdentity>{Identity(0x51U), Identity(0x52U)}));
++  EXPECT_EQ(
++      QueryText(database_path(),
++                "SELECT detail_code FROM audit_events WHERE event_type = "
++                "'management_ip_policy_changed' AND outcome = 'success';"),
++      "disabled");
++  service_.reset();
++  const auto state_directory = store_->state_directory();
++  store_.reset();
++  auto reopened = SecurityStore::Open({state_directory});
++  ASSERT_TRUE(reopened.ok()) << reopened.error().message;
++  EXPECT_FALSE(reopened.value()->ManagementIpRestrictionEnabled().value());
++  EXPECT_TRUE(reopened.value()->IsManagementPeer("198.51.100.44").value());
++}
++
++TEST_F(UserManagementServiceTest, EnablingIpRestrictionRejectsActorLockout) {
++  StartService();
++  ASSERT_TRUE(
++      service_->SetManagementIpRestrictionEnabled(false, AdministratorContext())
++          .ok());
++  auto roaming = AdministratorContext();
++  roaming.normalized_peer_ip = "198.51.100.44";
++  auto denied = service_->SetManagementIpRestrictionEnabled(true, roaming);
++  ASSERT_FALSE(denied.ok());
++  EXPECT_EQ(denied.error().code, "E_MANAGEMENT_IP_LOCKOUT");
++  EXPECT_FALSE(service_->ManagementIpRestrictionEnabled().value());
++  EXPECT_EQ(QueryInt(database_path(),
++                     "SELECT COUNT(*) FROM audit_events WHERE event_type = "
++                     "'management_ip_policy_changed' AND outcome = 'failure';"),
++            1);
++  ASSERT_TRUE(service_
++                  ->AddManagementIp(UserRole::kAdministrator, "198.51.100.44",
++                                    AdministratorContext())
++                  .ok());
++  ASSERT_TRUE(service_->SetManagementIpRestrictionEnabled(true, roaming).ok());
++  EXPECT_TRUE(service_->ManagementIpRestrictionEnabled().value());
++  EXPECT_TRUE(store_->IsManagementPeer("198.51.100.44").value());
++  EXPECT_FALSE(store_->IsManagementPeer("198.51.100.45").value());
++}
++
++TEST_F(UserManagementServiceTest, ViewerCannotChangeIpRestriction) {
++  const auto viewer_id = SeedViewer("monitor.east", "Monitor.East");
++  StartService();
++  auto changed = service_->SetManagementIpRestrictionEnabled(
++      false, ViewerContext(viewer_id, "monitor.east"));
++  ASSERT_FALSE(changed.ok());
++  EXPECT_EQ(changed.error().code, "E_MANAGEMENT_IP_FORBIDDEN");
++  EXPECT_TRUE(service_->ManagementIpRestrictionEnabled().value());
++}
++
++TEST_F(UserManagementServiceTest,
++       EnablingIpRestrictionRequiresEnabledAdministratorAddress) {
++  StartService();
++  ASSERT_TRUE(
++      service_->SetManagementIpRestrictionEnabled(false, AdministratorContext())
++          .ok());
++  auto roaming = AdministratorContext();
++  roaming.normalized_peer_ip = "198.51.100.44";
++  SeedManagementIp(UserRole::kViewer, roaming.normalized_peer_ip);
++  auto viewer_only = service_->SetManagementIpRestrictionEnabled(true, roaming);
++  ASSERT_FALSE(viewer_only.ok());
++  EXPECT_EQ(viewer_only.error().code, "E_MANAGEMENT_IP_LOCKOUT");
++  SeedManagementIp(UserRole::kAdministrator, roaming.normalized_peer_ip, false);
++  auto disabled = service_->SetManagementIpRestrictionEnabled(true, roaming);
++  ASSERT_FALSE(disabled.ok());
++  EXPECT_EQ(disabled.error().code, "E_MANAGEMENT_IP_LOCKOUT");
++  EXPECT_FALSE(service_->ManagementIpRestrictionEnabled().value());
++}
++
++TEST_F(UserManagementServiceTest,
++       PolicyCommitFailurePreservesSessionsAndRestriction) {
++  SeedSession(administrator_id_, UserRole::kAdministrator, 0x52U, "192.0.2.10");
++  StartService();
++  ScopedTransactionFailureReset reset;
++  ConfigureSecurityStoreTransactionFailuresForTest(true, false);
++  auto changed = service_->SetManagementIpRestrictionEnabled(
++      false, AdministratorContext());
++  ConfigureSecurityStoreTransactionFailuresForTest(false, false);
++  EXPECT_FALSE(changed.ok());
++  EXPECT_TRUE(service_->ManagementIpRestrictionEnabled().value());
++  EXPECT_EQ(QueryInt(database_path(), "SELECT COUNT(*) FROM sessions;"), 1);
++  EXPECT_EQ(exact_revocation_calls_, 0);
++  EXPECT_EQ(global_revocation_calls_, 0);
++  EXPECT_EQ(QueryInt(database_path(),
++                     "SELECT COUNT(*) FROM audit_events WHERE event_type = "
++                     "'management_ip_policy_changed';"),
++            0);
++}
++
+ TEST_F(UserManagementServiceTest, CreatesCanonicalViewerAndListsStableIdOrder) {
+   StartService();
+   auto east = service_->CreateViewer("Monitor.East", Secret("SouthMoon!8"),
+diff --git a/tests/unit/service/SecurityRequestGateTest.cpp b/tests/unit/service/SecurityRequestGateTest.cpp
+index 9e2eb10..a0de122 100644
+--- a/tests/unit/service/SecurityRequestGateTest.cpp
++++ b/tests/unit/service/SecurityRequestGateTest.cpp
+@@ -818,6 +818,110 @@ TEST(SecurityRequestGateTest, RejectsUnknownMethodsAndRouteMethodMismatch) {
+   EXPECT_EQ(malformed_result.error().code, "E_ACCESS_DENIED");
+ }
+ 
++TEST(SecurityRequestGateTest,
++     SocketAddressAllowsDhcpOriginsBeforeAndAfterSetup) {
++  for (const auto state : {DeviceState::kDefault, DeviceState::kOperational}) {
++    for (const std::string address :
++         {"198.51.100.60", "198.51.100.81", "2001:db8::60"}) {
++      auto context = Operational("/api/v1/auth/login", "POST");
++      context.state = state;
++      context.expected_origin = "https://198.51.100.61:8443";
++      context.local_ip = address;
++      context.local_port = 8443;
++      context.local_tls = true;
++      context.origin =
++          "https://" +
++          (address.find(':') == std::string::npos ? address
++                                                  : "[" + address + "]") +
++          ":8443";
++      context.has_management_header = true;
++      EXPECT_TRUE(AuthorizeSecurityRequest(context).ok()) << address;
++      context.has_management_header = false;
++      auto denied = AuthorizeSecurityRequest(context);
++      ASSERT_FALSE(denied.ok());
++      EXPECT_EQ(denied.error().code, "E_REQUEST_HEADER");
++    }
++  }
++}
++
++TEST(SecurityRequestGateTest,
++     SocketOriginStillRejectsOtherSitesAndInvalidEndpoints) {
++  auto context = Operational("/api/v1/auth/login", "POST");
++  context.expected_origin.clear();
++  context.local_ip = "198.51.100.60";
++  context.local_port = 8443;
++  context.local_tls = true;
++  context.has_management_header = true;
++  for (const std::string origin :
++       {"https://attacker.example:8443", "https://198.51.100.61:8443",
++        "http://198.51.100.60:8443", "https://198.51.100.60:443",
++        "https://198.51.100.60:8443/path", "null", ""}) {
++    context.origin = origin;
++    auto denied = AuthorizeSecurityRequest(context);
++    ASSERT_FALSE(denied.ok()) << origin;
++    EXPECT_EQ(denied.error().code, "E_REQUEST_ORIGIN") << origin;
++  }
++  context.origin = "https://198.51.100.60:8443";
++  context.local_tls = false;
++  EXPECT_FALSE(AuthorizeSecurityRequest(context).ok());
++  context.local_tls = true;
++  context.local_port = 0;
++  EXPECT_FALSE(AuthorizeSecurityRequest(context).ok());
++  context.local_port = 8443;
++  for (const std::string address : {"0.0.0.0", "::", "attacker.example", ""}) {
++    context.local_ip = address;
++    EXPECT_FALSE(AuthorizeSecurityRequest(context).ok());
++  }
++}
++
++TEST(SecurityRequestGateTest,
++     ManagementIpPolicyRequiresAdministratorAndFreshAuthority) {
++  auto context =
++      ValidManagementRequest("/api/v1/security/management-ip-policy", "PUT");
++  EXPECT_TRUE(AuthorizeSecurityRequest(context).ok());
++  EXPECT_TRUE(RouteRefreshesManagementDeadline(context.path, context.method));
++  context.principal = Viewer();
++  auto denied = AuthorizeSecurityRequest(context);
++  ASSERT_FALSE(denied.ok());
++  EXPECT_EQ(denied.error().code, "E_AUTHORIZATION_REQUIRED");
++  context.principal = Administrator();
++  context.principal->management_authority_valid = false;
++  denied = AuthorizeSecurityRequest(context);
++  ASSERT_FALSE(denied.ok());
++  EXPECT_EQ(denied.error().code, "E_MANAGEMENT_REAUTHENTICATION_REQUIRED");
++  context.method = "GET";
++  context.principal = Administrator();
++  EXPECT_TRUE(AuthorizeSecurityRequest(context).ok());
++  context.state = DeviceState::kDefault;
++  EXPECT_FALSE(AuthorizeSecurityRequest(context).ok());
++}
++
++TEST(SecurityRequestGateTest,
++     SetupAcceptsExplicitIpPolicyAndDefaultsLegacyRequestsToRestricted) {
++  const std::string prefix =
++      R"({"username":"operator","password":"T4m#pR9vLw","peer_ip":"192.0.2.10")";
++  auto legacy = ParseSetupJson(prefix + "}", "application/json");
++  ASSERT_TRUE(legacy.ok());
++  EXPECT_TRUE(legacy.value().management_ip_restriction_enabled);
++  for (const bool enabled : {false, true}) {
++    auto parsed =
++        ParseSetupJson(prefix + ",\"management_ip_restriction_enabled\":" +
++                           (enabled ? "true}" : "false}"),
++                       "application/json");
++    ASSERT_TRUE(parsed.ok());
++    EXPECT_EQ(parsed.value().management_ip_restriction_enabled, enabled);
++  }
++  for (const std::string suffix :
++       {"0}", "\"false\"}", "null}", "falsejunk}",
++        "false,\"management_ip_restriction_enabled\":true}"}) {
++    EXPECT_FALSE(
++        ParseSetupJson(
++            prefix + ",\"management_ip_restriction_enabled\":" + suffix,
++            "application/json")
++            .ok());
++  }
++}
++
+ TEST(SecurityRequestGateTest, SessionCookieIsStrictAndRejectsDuplicates) {
+   const std::string token(64U, 'a');
+   auto parsed = ParseSessionCookie("camera_session=" + token);
+diff --git a/tests/unit/service/UserManagementHttpTest.cpp b/tests/unit/service/UserManagementHttpTest.cpp
+index 04dd8ab..a9087fa 100644
+--- a/tests/unit/service/UserManagementHttpTest.cpp
++++ b/tests/unit/service/UserManagementHttpTest.cpp
+@@ -501,7 +501,7 @@ TEST(UserManagementHttpTest, SemanticErrorsMapToPublicStatusClasses) {
+     std::string_view code;
+     drogon::HttpStatusCode status;
+   };
+-  for (const auto& mapping : std::array<Mapping, 21>{
++  for (const auto& mapping : std::array<Mapping, 22>{
+            {{"E_INVALID_REQUEST", drogon::k400BadRequest},
+             {"E_REQUEST_TOO_LARGE", drogon::k413RequestEntityTooLarge},
+             {"E_USER_FORBIDDEN", drogon::k403Forbidden},
+@@ -521,6 +521,7 @@ TEST(UserManagementHttpTest, SemanticErrorsMapToPublicStatusClasses) {
+             {"E_MANAGEMENT_IP_LIMIT", drogon::k409Conflict},
+             {"E_MANAGEMENT_IP_ROLE_MISMATCH", drogon::k409Conflict},
+             {"E_MANAGEMENT_IP_PROTECTED", drogon::k409Conflict},
++            {"E_MANAGEMENT_IP_LOCKOUT", drogon::k409Conflict},
+             {"E_USER_MANAGEMENT_UNAVAILABLE", drogon::k503ServiceUnavailable},
+             {"E_PRIVATE_BACKEND_FAILURE", drogon::k503ServiceUnavailable}}}) {
+     EXPECT_EQ(UserManagementErrorStatus(mapping.code), mapping.status)
+diff --git a/web/e2e/management-shell.spec.ts b/web/e2e/management-shell.spec.ts
+index b4f4f39..6f9fb4e 100644
+--- a/web/e2e/management-shell.spec.ts
++++ b/web/e2e/management-shell.spec.ts
+@@ -714,6 +714,14 @@ async function installApiMocks(
+       });
+       return;
+     }
++    if (path === '/api/v1/security/management-ip-policy' && request.method() === 'GET') {
++      userManagementRequests.push(request);
++      await route.fulfill({
++        contentType: 'application/json',
++        body: JSON.stringify({ enabled: true }),
++      });
++      return;
++    }
+     if (path === '/api/v1/security/management-ips' && request.method() === 'GET') {
+       userManagementRequests.push(request);
+       await route.fulfill({
+@@ -1137,6 +1145,10 @@ test('first boot signs in with the initial account, runs the setup wizard, then
+   await page.getByRole('button', { name: 'Next' }).click();
+ 
+   await expect(page.getByRole('heading', { name: 'Register management access' })).toBeVisible();
++  const restrictManagement = page.getByRole('checkbox', { name: 'Restrict management access by IP' });
++  await expect(restrictManagement).not.toBeChecked();
++  await expect(page.getByLabel('Add a management address')).toHaveCount(0);
++  await restrictManagement.check();
+   await expect(
+     page.getByRole('list', { name: 'Registered management hosts' }),
+   ).toContainText('192.0.2.44 (current session)');
+@@ -1160,6 +1172,7 @@ test('first boot signs in with the initial account, runs the setup wizard, then
+     password: 'NorthStar!9',
+     peer_ip: '192.0.2.44',
+     management_ips: ['198.51.100.20'],
++    management_ip_restriction_enabled: true,
+   });
+   expect(api.initializeRequests[0].headers()['content-type']).toBe('application/json');
+   expect(api.initializeRequests[0].headers()['x-camera-request']).toBe('management');
+diff --git a/web/src/App.test.tsx b/web/src/App.test.tsx
+index 93fb8c5..1ebc7a0 100644
+--- a/web/src/App.test.tsx
++++ b/web/src/App.test.tsx
+@@ -12,7 +12,7 @@ import userEvent from '@testing-library/user-event';
+ import { StrictMode, type ReactElement } from 'react';
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+-import { ApiClient, UnauthorizedError } from './api/client';
++import { ApiClient, ApiError, UnauthorizedError } from './api/client';
+ import type { CameraApiClient, SetupStatus } from './api/types';
+ import { App } from './App';
+ import { LanguageProvider } from './i18n';
+@@ -328,6 +328,7 @@ describe('App bootstrap gate', () => {
+         password: 'NorthStar!9',
+         peer_ip: '192.0.2.10',
+         management_ips: [],
++        management_ip_restriction_enabled: false,
+       },
+       expect.any(Function),
+     );
+@@ -385,6 +386,7 @@ describe('App bootstrap gate', () => {
+     await user.type(screen.getByLabelText(/confirm password/i), 'NorthStar!9');
+     await user.click(screen.getByRole('button', { name: /next/i }));
+     await screen.findByRole('heading', { name: /management access/i });
++    await user.click(screen.getByRole('checkbox', { name: /restrict management access by ip/i }));
+     expect(screen.getByRole('list', { name: /registered management hosts/i }))
+       .toHaveTextContent('192.0.2.10 (current session)');
+     await user.click(screen.getByRole('button', { name: /^next$/i }));
+@@ -1389,6 +1391,81 @@ describe('App role-specific route trees', () => {
+     expect(screen.queryByRole('heading', { name: 'Camera login' })).not.toBeInTheDocument();
+   });
+ 
++  it.each([true, false])('saves a management IP policy change from %s and returns to sign in', async (enabled) => {
++    const user = userEvent.setup();
++    const client = renderRecoveredSession('administrator', '/users', {
++      '/api/v1/security/users': { users: [] },
++      '/api/v1/security/management-ips': { management_ips: [], current_peer_ip: '192.0.2.44' },
++      '/api/v1/security/management-ip-policy': { enabled },
++    });
++    vi.mocked(client.putJson).mockImplementation(async (_path, _body, parser) => parser({ enabled: !enabled }));
++    vi.mocked(client.postJson).mockResolvedValue({ logged_out: true });
++    await user.click(await screen.findByRole('tab', { name: 'Access IPs' }));
++    const toggle = screen.getByRole('checkbox', { name: /restrict management access by ip/i });
++    await waitFor(() => expect(toggle).toBeEnabled());
++    expect((toggle as HTMLInputElement).checked).toBe(enabled);
++    const save = screen.getByRole('button', { name: /save and sign in again/i });
++    expect(save).toBeDisabled();
++    await user.click(toggle);
++    expect(client.putJson).not.toHaveBeenCalled();
++    await user.click(save);
++    expect(await screen.findByRole('heading', { name: 'Camera login' })).toBeVisible();
++    expect(client.putJson).toHaveBeenCalledWith(
++      '/api/v1/security/management-ip-policy', { enabled: !enabled },
++      expect.any(Function), expect.any(AbortSignal),
++    );
++  });
++
++  it('explains a management IP policy lockout without logging out or losing the draft', async () => {
++    const user = userEvent.setup();
++    const client = renderRecoveredSession('administrator', '/users', {
++      '/api/v1/security/users': { users: [] },
++      '/api/v1/security/management-ips': { management_ips: [], current_peer_ip: '192.0.2.44' },
++      '/api/v1/security/management-ip-policy': { enabled: false },
++    });
++    vi.mocked(client.putJson).mockRejectedValue(new ApiError(409, 'E_MANAGEMENT_IP_LOCKOUT', 'private backend detail'));
++    await user.click(await screen.findByRole('tab', { name: 'Access IPs' }));
++    const toggle = screen.getByRole('checkbox', { name: /restrict management access by ip/i });
++    await waitFor(() => expect(toggle).toBeEnabled());
++    await user.click(toggle);
++    await user.click(screen.getByRole('button', { name: /save and sign in again/i }));
++    expect(await screen.findByRole('alert')).toHaveTextContent(/add your current IP address.*administrator/i);
++    expect(screen.getByText('Current connection address: 192.0.2.44')).toBeVisible();
++    expect(toggle).toBeChecked();
++    expect(screen.getByRole('heading', { name: 'Users & access' })).toBeVisible();
++    expect(client.postJson).not.toHaveBeenCalled();
++    expect(screen.queryByText(/private backend detail/i)).not.toBeInTheDocument();
++  });
++
++  it('reauthenticates a management IP policy save and allows an explicit retry', async () => {
++    const user = userEvent.setup();
++    const client = renderRecoveredSession('administrator', '/users', {
++      '/api/v1/security/users': { users: [] },
++      '/api/v1/security/management-ips': { management_ips: [], current_peer_ip: '192.0.2.44' },
++      '/api/v1/security/management-ip-policy': { enabled: true },
++    });
++    vi.mocked(client.putJson)
++      .mockRejectedValueOnce(new UnauthorizedError('E_MANAGEMENT_REAUTHENTICATION_REQUIRED'))
++      .mockImplementationOnce(async (_path, _body, parser) => parser({ enabled: false }));
++    vi.mocked(client.postJson).mockImplementation(async (path, _body, parser) => parser(
++      path === '/api/v1/auth/reauthenticate'
++        ? { management_expires_at_seconds: 4_000 }
++        : { logged_out: true },
++    ));
++    await user.click(await screen.findByRole('tab', { name: 'Access IPs' }));
++    const toggle = screen.getByRole('checkbox', { name: /restrict management access by ip/i });
++    await waitFor(() => expect(toggle).toBeEnabled());
++    await user.click(toggle);
++    await user.click(screen.getByRole('button', { name: /save and sign in again/i }));
++    await user.type(await screen.findByLabelText(/password/i), 'NorthStar!9');
++    await user.click(screen.getByRole('button', { name: /^confirm$/i }));
++    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
++    expect(toggle).not.toBeChecked();
++    expect(screen.queryByText('Your session has ended.')).not.toBeInTheDocument();
++    await user.click(screen.getByRole('button', { name: /save and sign in again/i }));
++    expect(await screen.findByRole('heading', { name: 'Camera login' })).toBeVisible();
++  });
++
+   it('loads administrator users with only the two management resources', async () => {
+     const client = renderRecoveredSession('administrator', '/users', {
+       '/api/v1/security/users': { users: [] },
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index ec8e398..2417664 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -33,6 +33,7 @@ import {
+ } from './features/audit/useAuditStatus';
+ import { ReauthenticateModal } from './features/auth/ReauthenticateModal';
+ import { useRuntimeSettings } from './features/settings/useRuntimeSettings';
++import { ManagementIpPolicyPanel } from './features/users/ManagementIpPolicyPanel';
+ import { useUserManagement } from './features/users/useUserManagement';
+ import { useSystemProtection } from './features/protection/useSystemProtection';
+ import type { SystemProtectionController } from './features/protection/useSystemProtection';
+@@ -385,7 +386,11 @@ function AdministratorUsersShell({ auditStatus, client, protection, registerView
+       protection={protection}
+       onRefresh={onRefresh}
+     >
+-      <UsersPage controller={controller} />
++      <UsersPage controller={controller} managementIpPolicy={
++        <ManagementIpPolicyPanel client={client} disabled={controller.mutation !== null}
++          currentPeerIp={controller.managementIps.data.current_peer_ip}
++          onSaved={() => { void auth.logout(); }} />
++      } />
+     </AppShell>
+   );
+ }
+diff --git a/web/src/features/users/contracts.test.ts b/web/src/features/users/contracts.test.ts
+index b696798..6115788 100644
+--- a/web/src/features/users/contracts.test.ts
++++ b/web/src/features/users/contracts.test.ts
+@@ -4,6 +4,7 @@ import {
+   parseDeletedResult,
+   parseManagementIpCreateResult,
+   parseManagementIpList,
++  parseManagementIpPolicy,
+   parseManagedUserCreateResult,
+   parseManagedUserList,
+   parsePasswordResetResult,
+@@ -142,3 +143,15 @@ describe('user-management mutation contracts', () => {
+     expectRejectedWithoutEcho(parser, value, 'Invalid user management response');
+   });
+ });
++
++describe('management IP policy contract', () => {
++  it.each([true, false])('preserves the server policy value %s', (enabled) => {
++    expect(parseManagementIpPolicy({ enabled })).toEqual({ enabled });
++  });
++
++  it.each([null, {}, { enabled: 'false' }, { enabled: 0 }, { enabled: true, unknown: true }])(
++    'rejects malformed policy instead of defaulting its enabled state: %j', (value) => {
++      expect(() => parseManagementIpPolicy(value)).toThrow('Invalid management IP policy response');
++    },
++  );
++});
+diff --git a/web/src/features/users/contracts.ts b/web/src/features/users/contracts.ts
+index 47e6149..60dc87c 100644
+--- a/web/src/features/users/contracts.ts
++++ b/web/src/features/users/contracts.ts
+@@ -31,6 +31,10 @@ export interface ManagementIpList {
+   current_peer_ip: string;
+ }
+ 
++export interface ManagementIpPolicy {
++  enabled: boolean;
++}
++
+ export interface ManagementIpCreateResult {
+   management_ip: ManagementIp;
+ }
+@@ -183,3 +187,10 @@ export function parseSelfPasswordChangeResult(value: unknown): SelfPasswordChang
+   }
+   return { password_changed: true, logged_out: true };
+ }
++
++export function parseManagementIpPolicy(value: unknown): ManagementIpPolicy {
++  if (!hasExactKeys(value, ['enabled']) || typeof value.enabled !== 'boolean') {
++    throw new Error('Invalid management IP policy response');
++  }
++  return { enabled: value.enabled };
++}
+diff --git a/web/src/features/users/publicError.ts b/web/src/features/users/publicError.ts
+index 6f26e88..57eef54 100644
+--- a/web/src/features/users/publicError.ts
++++ b/web/src/features/users/publicError.ts
+@@ -23,6 +23,7 @@ const messageKeys: Readonly<Record<string, string>> = {
+   E_USER_CONFLICT: 'errors.userConflict',
+   E_USER_NOT_FOUND: 'errors.userNotFound',
+   E_AUTHORIZATION_REQUIRED: 'errors.notAuthorized',
++  E_MANAGEMENT_IP_LOCKOUT: 'errors.managementIpLockout',
+   E_MANAGEMENT_IP_INVALID: 'errors.managementIpInvalid',
+   E_MANAGEMENT_IP_DUPLICATE: 'errors.managementIpExists',
+   E_MANAGEMENT_IP_LIMIT: 'errors.managementIpLimitReached',
+diff --git a/web/src/i18n/messages/en.ts b/web/src/i18n/messages/en.ts
+index 0808f64..05cbc8d 100644
+--- a/web/src/i18n/messages/en.ts
++++ b/web/src/i18n/messages/en.ts
+@@ -153,6 +153,8 @@ export const en = {
+     signIn: 'Sign in',
+     signingIn: 'Signing in...',
+     signInFailed: 'Sign in failed. Check your credentials and try again.',
++    requestOriginFailed:
++      'The request origin or camera address was rejected. Open the camera directly at its current HTTPS address and try again.',
+     initialSetupHeading: 'Initial setup account',
+     initialSetupDescription:
+       'This account is for initial setup only and is removed once setup completes.',
+@@ -194,9 +196,14 @@ export const en = {
+     next: 'Next',
+     registerAccessHeading: 'Register management access',
+     stepAccessProgress: 'Step 2 of 3 · Management access',
++    restrictManagementAccess: 'Restrict management access by IP',
++    managementPolicyLabel: 'Management IP restrictions',
++    restrictionsEnabled: 'Enabled',
++    restrictionsDisabled: 'Disabled',
++    managementPolicyDescription:
++      'Leave this off if client addresses can change with DHCP. No camera or client IP needs to be entered during setup. Signing in is still required. You can enable restrictions later in Users & access.',
+     singleHostsDescription:
+-      'Only single hosts may manage this camera — no ranges, wildcards, ' +
+-      'or CIDR blocks. Your current address is already registered.',
++      'Register individual client addresses, without ranges, wildcards, or CIDR blocks. Your current address will be included automatically. Choose stable addresses to avoid losing access after a DHCP change.',
+     registeredHostsLabel: 'Registered management hosts',
+     currentSessionTag: '(current session)',
+     addHostLabel: 'Add a management address',
+@@ -355,6 +362,17 @@ export const en = {
+     resetViewerPasswordFailed: 'The viewer password could not be reset.',
+     deleteViewerFailed: 'The viewer could not be deleted.',
+ 
++    policyDescription:
++      'When enabled, only the saved addresses for each role can sign in and access management. When disabled, those addresses are kept but are not enforced. Account sign-in remains required. DHCP changes can block access when restrictions are enabled.',
++    policyCurrentAddress: 'Current connection address: {address}',
++    policyCurrent: 'Current setting: {state}',
++    policyLoading: 'Loading management IP restrictions...',
++    policyLoadFailed: 'Management IP restrictions could not be loaded.',
++    policyRetry: 'Retry policy loading',
++    policySignInNotice: 'Saving this change ends all active sessions. Sign in again to continue.',
++    policySave: 'Save and sign in again',
++    policySaving: 'Saving restrictions...',
++    policySaveFailed: 'Management IP restrictions could not be saved.',
+     loadingAccessIps: 'Loading access IPs...',
+     accessIpListLoadFailed: 'The access IP list could not be loaded.',
+     retryAccessIps: 'Retry access IPs',
+@@ -529,6 +547,7 @@ export const en = {
+     userConflict: 'This account was changed. Refresh and try again.',
+     userNotFound: 'That account no longer exists.',
+     notAuthorized: 'You are not authorized to perform this action.',
++    managementIpLockout: 'Add your current IP address to the administrator access list before enabling restrictions.',
+     managementIpInvalid: 'Enter one valid IPv4 or IPv6 host address.',
+     managementIpExists: 'That address already exists for this role.',
+     managementIpLimitReached: 'The address limit for this role has been reached.',
+diff --git a/web/src/i18n/messages/ko.ts b/web/src/i18n/messages/ko.ts
+index 0a8bf03..c640cde 100644
+--- a/web/src/i18n/messages/ko.ts
++++ b/web/src/i18n/messages/ko.ts
+@@ -155,6 +155,8 @@ export const ko: Messages = {
+     signIn: '로그인',
+     signingIn: '로그인하는 중...',
+     signInFailed: '로그인에 실패했습니다. 자격 증명을 확인한 후 다시 시도하세요.',
++    requestOriginFailed:
++      '요청 출처 또는 카메라 주소가 거부되었습니다. 카메라의 현재 HTTPS 주소로 직접 접속한 후 다시 시도하세요.',
+     initialSetupHeading: '초기 설정 계정',
+     initialSetupDescription:
+       '이 계정은 초기 설정 전용이며 설정이 완료되면 삭제됩니다.',
+@@ -195,9 +197,14 @@ export const ko: Messages = {
+     next: '다음',
+     registerAccessHeading: '관리 액세스 등록',
+     stepAccessProgress: '3단계 중 2단계 · 관리 액세스',
++    restrictManagementAccess: 'IP로 관리 접근 제한',
++    managementPolicyLabel: '관리 IP 제한',
++    restrictionsEnabled: '사용',
++    restrictionsDisabled: '사용 안 함',
++    managementPolicyDescription:
++      'DHCP로 클라이언트 주소가 바뀔 수 있다면 이 설정을 끄세요. 초기 설정에서 카메라나 클라이언트 IP를 입력할 필요가 없습니다. 로그인은 계속 필요합니다. 사용자 및 접근에서 나중에 제한을 켤 수 있습니다.',
+     singleHostsDescription:
+-      '이 카메라는 단일 호스트만 관리할 수 있습니다 — 범위, 와일드카드, ' +
+-      'CIDR 블록은 사용할 수 없습니다. 현재 주소는 이미 등록되어 있습니다.',
++      '범위, 와일드카드, CIDR 블록 대신 개별 클라이언트 주소를 등록하세요. 현재 주소는 자동으로 포함됩니다. DHCP 변경 후에도 접근하려면 고정된 주소를 사용하세요.',
+     registeredHostsLabel: '등록된 관리 호스트',
+     currentSessionTag: '(현재 세션)',
+     addHostLabel: '관리 주소 추가',
+@@ -356,6 +363,17 @@ export const ko: Messages = {
+     resetViewerPasswordFailed: '뷰어 비밀번호를 재설정할 수 없습니다.',
+     deleteViewerFailed: '뷰어를 삭제할 수 없습니다.',
+ 
++    policyDescription:
++      '사용하면 역할별로 저장된 주소에서만 로그인하고 관리 기능에 접근할 수 있습니다. 끄면 주소는 보관되지만 접근 제한에 적용되지 않습니다. 계정 로그인은 계속 필요합니다. 제한을 켠 상태에서 DHCP 주소가 바뀌면 접근이 차단될 수 있습니다.',
++    policyCurrentAddress: '현재 연결 주소: {address}',
++    policyCurrent: '현재 설정: {state}',
++    policyLoading: '관리 IP 제한을 불러오는 중...',
++    policyLoadFailed: '관리 IP 제한을 불러오지 못했습니다.',
++    policyRetry: '제한 설정 다시 불러오기',
++    policySignInNotice: '변경 내용을 저장하면 모든 활성 세션이 종료됩니다. 계속하려면 다시 로그인하세요.',
++    policySave: '저장 후 다시 로그인',
++    policySaving: '제한을 저장하는 중...',
++    policySaveFailed: '관리 IP 제한을 저장하지 못했습니다.',
+     loadingAccessIps: '액세스 IP를 불러오는 중...',
+     accessIpListLoadFailed: '액세스 IP 목록을 불러올 수 없습니다.',
+     retryAccessIps: '액세스 IP 다시 시도',
+@@ -530,6 +548,7 @@ export const ko: Messages = {
+     userConflict: '이 계정이 변경되었습니다. 새로고침한 후 다시 시도하세요.',
+     userNotFound: '해당 계정이 더 이상 존재하지 않습니다.',
+     notAuthorized: '이 작업을 수행할 권한이 없습니다.',
++    managementIpLockout: '제한을 켜기 전에 현재 IP 주소를 관리자 접근 목록에 추가하세요.',
+     managementIpInvalid: '유효한 IPv4 또는 IPv6 호스트 주소를 하나 입력하세요.',
+     managementIpExists: '해당 주소는 이 역할에 이미 존재합니다.',
+     managementIpLimitReached: '이 역할의 주소 한도에 도달했습니다.',
+diff --git a/web/src/pages/LoginPage.test.tsx b/web/src/pages/LoginPage.test.tsx
+index 3144f2f..e55be54 100644
+--- a/web/src/pages/LoginPage.test.tsx
++++ b/web/src/pages/LoginPage.test.tsx
+@@ -2,12 +2,28 @@ import { cleanup, render, screen } from '@testing-library/react';
+ import userEvent from '@testing-library/user-event';
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
++import { ApiError } from '../api/client';
+ import { LanguageProvider } from '../i18n';
+ import { LoginPage } from './LoginPage';
+ 
+-afterEach(cleanup);
++afterEach(() => { cleanup(); localStorage.removeItem('cf.lang'); });
+ 
+ describe('LoginPage', () => {
++  it.each([
++    ['en', /origin|address/i],
++    ['ko', /출처|주소/],
++  ])('distinguishes a rejected request origin from bad credentials in %s', async (language, expected) => {
++    localStorage.setItem('cf.lang', language);
++    const user = userEvent.setup();
++    const login = vi.fn().mockRejectedValue(new ApiError(403, 'E_REQUEST_ORIGIN', 'private backend detail'));
++    render(<LanguageProvider><LoginPage login={login} /></LanguageProvider>);
++    await user.type(screen.getByLabelText(/^(password|비밀번호)$/i), 'NorthStar!9');
++    await user.click(screen.getByRole('button', { name: /^(sign in|로그인)$/i }));
++    expect(await screen.findByRole('alert')).toHaveTextContent(expected);
++    expect(screen.getByRole('alert')).not.toHaveTextContent(/check your credentials|private backend detail/i);
++    expect(screen.getByLabelText(/^(password|비밀번호)$/i)).toHaveValue('');
++  });
++
+   it('submits credentials through auth and clears the masked password on success', async () => {
+     const user = userEvent.setup();
+     const login = vi.fn().mockResolvedValue(undefined);
+diff --git a/web/src/pages/LoginPage.tsx b/web/src/pages/LoginPage.tsx
+index a384d9b..fa4dd46 100644
+--- a/web/src/pages/LoginPage.tsx
++++ b/web/src/pages/LoginPage.tsx
+@@ -1,5 +1,6 @@
+ import { type FormEvent, useState } from 'react';
+ 
++import { ApiError } from '../api/client';
+ import { LanguageSwitcher } from '../components/LanguageSwitcher';
+ import { useTranslation } from '../i18n/LanguageContext';
+ 
+@@ -26,8 +27,10 @@ export function LoginPage({ login, initialCredential = null }: LoginPageProps) {
+     setSubmitting(true);
+     try {
+       await login(username, password);
+-    } catch {
+-      setFailure(t('auth.signInFailed'));
++    } catch (error) {
++      setFailure(t(error instanceof ApiError && error.code === 'E_REQUEST_ORIGIN'
++        ? 'auth.requestOriginFailed'
++        : 'auth.signInFailed'));
+     } finally {
+       setPassword('');
+       setSubmitting(false);
+diff --git a/web/src/pages/UsersPage.tsx b/web/src/pages/UsersPage.tsx
+index 1f31dde..304fc5f 100644
+--- a/web/src/pages/UsersPage.tsx
++++ b/web/src/pages/UsersPage.tsx
+@@ -1,4 +1,4 @@
+-import { type KeyboardEvent, useState } from 'react';
++import { type KeyboardEvent, type ReactNode, useState } from 'react';
+ 
+ import { AccessIpsTab } from '../features/users/AccessIpsTab';
+ import { AccountsTab } from '../features/users/AccountsTab';
+@@ -7,6 +7,7 @@ import { useTranslation } from '../i18n/LanguageContext';
+ 
+ interface UsersPageProps {
+   controller: UserManagementController;
++  managementIpPolicy?: ReactNode;
+ }
+ 
+ type ActiveTab = 'accounts' | 'access_ips';
+@@ -31,7 +32,7 @@ const tabs: ReadonlyArray<{
+   },
+ ];
+ 
+-export function UsersPage({ controller }: UsersPageProps) {
++export function UsersPage({ controller, managementIpPolicy }: UsersPageProps) {
+   const { t } = useTranslation();
+   const [activeTab, setActiveTab] = useState<ActiveTab>('accounts');
+   const [createDialog, setCreateDialog] =
+@@ -130,11 +131,14 @@ export function UsersPage({ controller }: UsersPageProps) {
+             onCreateClose={() => setCreateDialog(null)}
+           />
+         ) : (
+-          <AccessIpsTab
+-            controller={controller}
+-            createOpen={createDialog === 'management_ip'}
+-            onCreateClose={() => setCreateDialog(null)}
+-          />
++          <>
++            {managementIpPolicy}
++            <AccessIpsTab
++              controller={controller}
++              createOpen={createDialog === 'management_ip'}
++              onCreateClose={() => setCreateDialog(null)}
++            />
++          </>
+         )}
+       </section>
+     </div>
+diff --git a/web/src/pages/setup/SetupIpStep.test.tsx b/web/src/pages/setup/SetupIpStep.test.tsx
+index 8eff3d9..cf44f55 100644
+--- a/web/src/pages/setup/SetupIpStep.test.tsx
++++ b/web/src/pages/setup/SetupIpStep.test.tsx
+@@ -20,7 +20,7 @@ afterEach(cleanup);
+ describe('SetupIpStep', () => {
+   it('lists the current peer as already registered', () => {
+     render(
+-      <SetupIpStep peerIp="192.0.2.44" hosts={[]} onAddHost={vi.fn()}
++      <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={[]} onAddHost={vi.fn()}
+         onBack={vi.fn()} onNext={vi.fn()} />,
+     );
+ 
+@@ -42,7 +42,7 @@ describe('SetupIpStep', () => {
+     const user = userEvent.setup();
+     const onAddHost = vi.fn();
+     render(
+-      <SetupIpStep peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
++      <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
+         onBack={vi.fn()} onNext={vi.fn()} />,
+     );
+ 
+@@ -57,7 +57,7 @@ describe('SetupIpStep', () => {
+     const user = userEvent.setup();
+     const onAddHost = vi.fn();
+     const { rerender } = render(
+-      <SetupIpStep peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
++      <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
+         onBack={vi.fn()} onNext={vi.fn()} />,
+     );
+ 
+@@ -67,7 +67,7 @@ describe('SetupIpStep', () => {
+ 
+     rerender(
+       <LanguageProvider>
+-        <SetupIpStep peerIp="192.0.2.44" hosts={['198.51.100.20']} onAddHost={onAddHost}
++        <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={['198.51.100.20']} onAddHost={onAddHost}
+           onBack={vi.fn()} onNext={vi.fn()} />
+       </LanguageProvider>,
+     );
+@@ -77,7 +77,7 @@ describe('SetupIpStep', () => {
+ 
+     rerender(
+       <LanguageProvider>
+-        <SetupIpStep peerIp="192.0.2.44" hosts={['198.51.100.20', '203.0.113.7']}
++        <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={['198.51.100.20', '203.0.113.7']}
+           onAddHost={onAddHost} onBack={vi.fn()} onNext={vi.fn()} />
+       </LanguageProvider>,
+     );
+@@ -89,7 +89,7 @@ describe('SetupIpStep', () => {
+     const user = userEvent.setup();
+     const onAddHost = vi.fn();
+     render(
+-      <SetupIpStep peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
++      <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
+         onBack={vi.fn()} onNext={vi.fn()} />,
+     );
+ 
+@@ -103,7 +103,7 @@ describe('SetupIpStep', () => {
+     const user = userEvent.setup();
+     const onAddHost = vi.fn();
+     render(
+-      <SetupIpStep peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
++      <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={[]} onAddHost={onAddHost}
+         onBack={vi.fn()} onNext={vi.fn()} />,
+     );
+ 
+@@ -119,7 +119,7 @@ describe('SetupIpStep', () => {
+     const onAddHost = vi.fn();
+     const hosts = Array.from({ length: 31 }, (_, index) => `198.51.100.${index}`);
+     render(
+-      <SetupIpStep peerIp="192.0.2.44" hosts={hosts} onAddHost={onAddHost}
++      <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={hosts} onAddHost={onAddHost}
+         onBack={vi.fn()} onNext={vi.fn()} />,
+     );
+ 
+@@ -133,7 +133,7 @@ describe('SetupIpStep', () => {
+     const onBack = vi.fn();
+     const onNext = vi.fn();
+     render(
+-      <SetupIpStep peerIp="192.0.2.44" hosts={[]} onAddHost={vi.fn()}
++      <SetupIpStep restrictionEnabled onRestrictionChange={vi.fn()} peerIp="192.0.2.44" hosts={[]} onAddHost={vi.fn()}
+         onBack={onBack} onNext={onNext} />,
+     );
+ 
+diff --git a/web/src/pages/setup/SetupIpStep.tsx b/web/src/pages/setup/SetupIpStep.tsx
+index 063a603..230cdf0 100644
+--- a/web/src/pages/setup/SetupIpStep.tsx
++++ b/web/src/pages/setup/SetupIpStep.tsx
+@@ -82,18 +82,17 @@ const MAXIMUM_ADDITIONAL_HOSTS = 31;
+ export interface SetupIpStepProps {
+   peerIp: string;
+   hosts: string[];
++  restrictionEnabled: boolean;
++  onRestrictionChange: (enabled: boolean) => void;
+   onAddHost: (host: string) => void;
+   onBack: () => void;
+   onNext: () => void;
+ }
+ 
+-/**
+- * Step 2 of the setup wizard: the current peer is already registered (it is
+- * what /api/v1/setup/initialize confirms as the administrator's pinned
+- * address), and the operator may stage further single-host addresses here
+- * for review in step 3.
+- */
+-export function SetupIpStep({ peerIp, hosts, onAddHost, onBack, onNext }: SetupIpStepProps) {
++/** Step 2: optional single-host restrictions for installations with stable client addresses. */
++export function SetupIpStep({
++  peerIp, hosts, restrictionEnabled, onRestrictionChange, onAddHost, onBack, onNext,
++}: SetupIpStepProps) {
+   const { t } = useTranslation();
+   const [draft, setDraft] = useState('');
+   const [error, setError] = useState<string | null>(null);
+@@ -118,39 +117,51 @@ export function SetupIpStep({ peerIp, hosts, onAddHost, onBack, onNext }: SetupI
+     <>
+       <h1 id="wizard-heading">{t('setup.registerAccessHeading')}</h1>
+       <p className="wizard-progress">{t('setup.stepAccessProgress')}</p>
+-      <p>
+-        {t('setup.singleHostsDescription')}
+-      </p>
+-      {/* Explicit role: list-style none strips the implicit list role (and
+-          with it the aria-label) in WebKit accessibility trees. */}
+-      <ul className="management-host-list" role="list" aria-label={t('setup.registeredHostsLabel')}>
+-        <li>
+-          {peerIp} <span className="management-host-tag">{t('setup.currentSessionTag')}</span>
+-        </li>
+-        {hosts.map((host) => <li key={host}>{host}</li>)}
+-      </ul>
+-      <form className="auth-form" onSubmit={addHost} noValidate>
+-        <div className="field">
+-          <label htmlFor="wizard-add-host">{t('setup.addHostLabel')}</label>
+-          <input
+-            id="wizard-add-host"
+-            value={draft}
+-            disabled={atCapacity}
+-            aria-describedby={error ? 'wizard-add-host-error' : undefined}
+-            aria-invalid={error ? true : undefined}
+-            onChange={(event) => setDraft(event.target.value)}
+-          />
+-          {error && <p className="form-error" id="wizard-add-host-error">{error}</p>}
+-          {atCapacity && (
+-            <p className="form-error">
+-              {t('setup.hostCapacityReached', { max: MAXIMUM_ADDITIONAL_HOSTS })}
+-            </p>
+-          )}
+-        </div>
+-        <button className="secondary-button" type="submit" disabled={atCapacity}>
+-          {t('setup.addHost')}
+-        </button>
+-      </form>
++      <label className="management-policy-toggle">
++        <input
++          type="checkbox"
++          checked={restrictionEnabled}
++          onChange={(event) => onRestrictionChange(event.target.checked)}
++          aria-describedby="setup-management-policy-description"
++        />
++        {t('setup.restrictManagementAccess')}
++      </label>
++      <p id="setup-management-policy-description">{t('setup.managementPolicyDescription')}</p>
++      {restrictionEnabled && (
++        <>
++          <p>{t('setup.singleHostsDescription')}</p>
++          {/* Explicit role: list-style none strips the implicit list role (and
++              with it the aria-label) in WebKit accessibility trees. */}
++          <ul className="management-host-list" role="list" aria-label={t('setup.registeredHostsLabel')}>
++            <li>
++              {peerIp} <span className="management-host-tag">{t('setup.currentSessionTag')}</span>
++            </li>
++            {hosts.map((host) => <li key={host}>{host}</li>)}
++          </ul>
++          <form className="auth-form" onSubmit={addHost} noValidate>
++            <div className="field">
++              <label htmlFor="wizard-add-host">{t('setup.addHostLabel')}</label>
++              <input
++                id="wizard-add-host"
++                value={draft}
++                disabled={atCapacity}
++                aria-describedby={error ? 'wizard-add-host-error' : undefined}
++                aria-invalid={error ? true : undefined}
++                onChange={(event) => setDraft(event.target.value)}
++              />
++              {error && <p className="form-error" id="wizard-add-host-error">{error}</p>}
++              {atCapacity && (
++                <p className="form-error">
++                  {t('setup.hostCapacityReached', { max: MAXIMUM_ADDITIONAL_HOSTS })}
++                </p>
++              )}
++            </div>
++            <button className="secondary-button" type="submit" disabled={atCapacity}>
++              {t('setup.addHost')}
++            </button>
++          </form>
++        </>
++      )}
+       <div className="wizard-actions">
+         <button type="button" className="secondary-button" onClick={onBack}>{t('setup.back')}</button>
+         <button type="button" className="primary-button" onClick={onNext}>{t('setup.next')}</button>
+diff --git a/web/src/pages/setup/SetupReviewStep.test.tsx b/web/src/pages/setup/SetupReviewStep.test.tsx
+index 7933133..8bfe235 100644
+--- a/web/src/pages/setup/SetupReviewStep.test.tsx
++++ b/web/src/pages/setup/SetupReviewStep.test.tsx
+@@ -21,6 +21,7 @@ describe('SetupReviewStep', () => {
+   it('shows the collected values with the password masked', () => {
+     render(
+       <SetupReviewStep
++        restrictionEnabled
+         username="operator.one"
+         password="NorthStar!9"
+         peerIp="192.0.2.44"
+@@ -43,6 +44,7 @@ describe('SetupReviewStep', () => {
+     const onSubmit = vi.fn();
+     render(
+       <SetupReviewStep
++        restrictionEnabled
+         username="operator.one"
+         password="NorthStar!9"
+         peerIp="192.0.2.44"
+@@ -63,6 +65,7 @@ describe('SetupReviewStep', () => {
+   it('disables the controls while submitting', () => {
+     render(
+       <SetupReviewStep
++        restrictionEnabled
+         username="operator.one"
+         password="NorthStar!9"
+         peerIp="192.0.2.44"
+diff --git a/web/src/pages/setup/SetupReviewStep.tsx b/web/src/pages/setup/SetupReviewStep.tsx
+index 7a9f4e8..d419f79 100644
+--- a/web/src/pages/setup/SetupReviewStep.tsx
++++ b/web/src/pages/setup/SetupReviewStep.tsx
+@@ -7,6 +7,7 @@ export interface SetupReviewStepProps {
+   password: string;
+   peerIp: string;
+   hosts: string[];
++  restrictionEnabled: boolean;
+   submitting: boolean;
+   onBack: () => void;
+   onSubmit: () => void;
+@@ -23,6 +24,7 @@ export function SetupReviewStep({
+   password,
+   peerIp,
+   hosts,
++  restrictionEnabled,
+   submitting,
+   onBack,
+   onSubmit,
+@@ -42,16 +44,22 @@ export function SetupReviewStep({
+           <dd aria-label={t('setup.passwordHiddenLabel')}>{PASSWORD_MASK}</dd>
+         </div>
+         <div className="wizard-review-row">
+-          <dt>{t('setup.managementAddressesLabel')}</dt>
+-          <dd>
+-            <ul className="management-host-list">
+-              <li>
+-                {peerIp} <span className="management-host-tag">{t('setup.currentSessionTag')}</span>
+-              </li>
+-              {hosts.map((host) => <li key={host}>{host}</li>)}
+-            </ul>
+-          </dd>
++          <dt>{t('setup.managementPolicyLabel')}</dt>
++          <dd>{t(restrictionEnabled ? 'setup.restrictionsEnabled' : 'setup.restrictionsDisabled')}</dd>
+         </div>
++        {restrictionEnabled && (
++          <div className="wizard-review-row">
++            <dt>{t('setup.managementAddressesLabel')}</dt>
++            <dd>
++              <ul className="management-host-list">
++                <li>
++                  {peerIp} <span className="management-host-tag">{t('setup.currentSessionTag')}</span>
++                </li>
++                {hosts.map((host) => <li key={host}>{host}</li>)}
++              </ul>
++            </dd>
++          </div>
++        )}
+       </dl>
+       <div className="wizard-actions">
+         <button type="button" className="secondary-button" onClick={onBack} disabled={submitting}>
+diff --git a/web/src/pages/setup/SetupWizard.test.tsx b/web/src/pages/setup/SetupWizard.test.tsx
+index fd091f4..59e12fd 100644
+--- a/web/src/pages/setup/SetupWizard.test.tsx
++++ b/web/src/pages/setup/SetupWizard.test.tsx
+@@ -40,6 +40,47 @@ async function advanceToReview(user: ReturnType<typeof userEvent.setup>) {
+ }
+ 
+ describe('SetupWizard', () => {
++  it('defaults to DHCP-friendly setup without entering management addresses', async () => {
++    const user = userEvent.setup();
++    const client = makeClient();
++    render(<SetupWizard client={client} peerIp="192.0.2.44" onInitialized={vi.fn()} />);
++    await user.type(screen.getByLabelText(/^username$/i), 'operator.one');
++    await user.type(screen.getByLabelText(/^password$/i), 'NorthStar!9');
++    await user.type(screen.getByLabelText(/confirm password/i), 'NorthStar!9');
++    await user.click(screen.getByRole('button', { name: /^next$/i }));
++    expect(screen.getByRole('checkbox', { name: /restrict management access by ip/i })).not.toBeChecked();
++    expect(screen.queryByLabelText(/add a management address/i)).not.toBeInTheDocument();
++    expect(screen.queryByRole('list', { name: /registered management hosts/i })).not.toBeInTheDocument();
++    await user.click(screen.getByRole('button', { name: /^next$/i }));
++    expect(screen.getByText('Disabled')).toBeVisible();
++    expect(screen.queryByText('192.0.2.44', { exact: false })).not.toBeInTheDocument();
++  });
++
++  it('omits staged hosts when IP restrictions are switched off again', async () => {
++    const user = userEvent.setup();
++    const client = makeClient();
++    vi.mocked(client.postJson).mockResolvedValue({ required: false, runtime: 'running' });
++    render(<SetupWizard client={client} peerIp="192.0.2.44" onInitialized={vi.fn()} />);
++    await user.type(screen.getByLabelText(/^username$/i), 'operator.one');
++    await user.type(screen.getByLabelText(/^password$/i), 'NorthStar!9');
++    await user.type(screen.getByLabelText(/confirm password/i), 'NorthStar!9');
++    await user.click(screen.getByRole('button', { name: /^next$/i }));
++    const restriction = screen.getByRole('checkbox', { name: /restrict management access by ip/i });
++    await user.click(restriction);
++    await user.type(screen.getByLabelText(/add a management address/i), '198.51.100.20');
++    await user.click(screen.getByRole('button', { name: /add host/i }));
++    await user.click(restriction);
++    await user.click(screen.getByRole('button', { name: /^next$/i }));
++    expect(screen.getByText('Disabled')).toBeVisible();
++    expect(screen.queryByText('198.51.100.20')).not.toBeInTheDocument();
++    await user.click(screen.getByRole('button', { name: /complete setup/i }));
++    await waitFor(() => expect(client.postJson).toHaveBeenCalledWith(
++      '/api/v1/setup/initialize',
++      expect.objectContaining({ management_ip_restriction_enabled: false, management_ips: [] }),
++      expect.any(Function),
++    ));
++  });
++
+   it('walks credentials, IP, and review while preserving values moving forward and back', async () => {
+     const user = userEvent.setup();
+     const client = makeClient();
+@@ -52,6 +93,7 @@ describe('SetupWizard', () => {
+     await user.click(screen.getByRole('button', { name: /next/i }));
+ 
+     await screen.findByRole('heading', { name: /management access/i });
++    await user.click(screen.getByRole('checkbox', { name: /restrict management access by ip/i }));
+     await user.type(screen.getByLabelText(/add a management address/i), '198.51.100.20');
+     await user.click(screen.getByRole('button', { name: /add host/i }));
+     expect(screen.getByText('198.51.100.20')).toBeVisible();
+@@ -95,6 +137,7 @@ describe('SetupWizard', () => {
+         // advanceToReview never adds a host: an empty list here proves the
+         // key is always sent, not only when the operator adds something.
+         management_ips: [],
++        management_ip_restriction_enabled: false,
+       },
+       expect.any(Function),
+     );
+@@ -110,6 +153,7 @@ describe('SetupWizard', () => {
+     await user.type(screen.getByLabelText(/^password$/i), 'NorthStar!9');
+     await user.type(screen.getByLabelText(/confirm password/i), 'NorthStar!9');
+     await user.click(screen.getByRole('button', { name: /next/i }));
++    await user.click(screen.getByRole('checkbox', { name: /restrict management access by ip/i }));
+     await user.type(screen.getByLabelText(/add a management address/i), '198.51.100.20');
+     await user.click(screen.getByRole('button', { name: /add host/i }));
+     await user.click(screen.getByRole('button', { name: /^next$/i }));
+@@ -119,7 +163,7 @@ describe('SetupWizard', () => {
+     await waitFor(() => expect(client.postJson).toHaveBeenCalledTimes(1));
+     expect(client.postJson).toHaveBeenCalledWith(
+       '/api/v1/setup/initialize',
+-      expect.objectContaining({ peer_ip: '192.0.2.44', management_ips: ['198.51.100.20'] }),
++      expect.objectContaining({ peer_ip: '192.0.2.44', management_ips: ['198.51.100.20'], management_ip_restriction_enabled: true }),
+       expect.any(Function),
+     );
+   });
+@@ -179,6 +223,7 @@ describe('SetupWizard', () => {
+     await user.type(screen.getByLabelText(/^password$/i), 'NorthStar!9');
+     await user.type(screen.getByLabelText(/confirm password/i), 'NorthStar!9');
+     await user.click(screen.getByRole('button', { name: /next/i }));
++    await user.click(screen.getByRole('checkbox', { name: /restrict management access by ip/i }));
+     await user.type(screen.getByLabelText(/add a management address/i), '198.51.100.20');
+     await user.click(screen.getByRole('button', { name: /add host/i }));
+     await user.click(screen.getByRole('button', { name: /^next$/i }));
+diff --git a/web/src/pages/setup/SetupWizard.tsx b/web/src/pages/setup/SetupWizard.tsx
+index 94a21df..00be404 100644
+--- a/web/src/pages/setup/SetupWizard.tsx
++++ b/web/src/pages/setup/SetupWizard.tsx
+@@ -16,17 +16,7 @@ export interface SetupWizardProps {
+ 
+ type WizardStep = 'credentials' | 'ip' | 'review';
+ 
+-/**
+- * Owns every value collected across the three setup steps and performs the
+- * single submission to /api/v1/setup/initialize: username, password, and
+- * peer_ip (unchanged from before this session requirement was added; see
+- * src/service/ServiceApp.cpp and SecurityRequestGate::ParseSetupJson), plus
+- * management_ips — the additional single hosts collected in step 2. The
+- * confirming peer is registered unconditionally by the server before it
+- * reads that list (SecurityStore::InitializeDevice), so it is never
+- * included in `hosts` here. Steps are client state only: no request is
+- * sent until review submits.
+- */
++/** Collects setup choices locally and submits them once at review. */
+ export function SetupWizard({
+   client,
+   peerIp,
+@@ -39,6 +29,7 @@ export function SetupWizard({
+   const [password, setPassword] = useState('');
+   const [confirmation, setConfirmation] = useState('');
+   const [hosts, setHosts] = useState<string[]>([]);
++  const [restrictionEnabled, setRestrictionEnabled] = useState(false);
+   const [failure, setFailure] = useState<string | null>(null);
+   const [submitting, setSubmitting] = useState(false);
+ 
+@@ -52,7 +43,13 @@ export function SetupWizard({
+     try {
+       await client.postJson(
+         '/api/v1/setup/initialize',
+-        { username, password, peer_ip: peerIp, management_ips: hosts },
++        {
++          username,
++          password,
++          peer_ip: peerIp,
++          management_ip_restriction_enabled: restrictionEnabled,
++          management_ips: restrictionEnabled ? hosts : [],
++        },
+         parseInitializeResult,
+       );
+       // Cleared before notifying the caller, not after: the plaintext has
+@@ -94,6 +91,8 @@ export function SetupWizard({
+           <SetupIpStep
+             peerIp={peerIp}
+             hosts={hosts}
++            restrictionEnabled={restrictionEnabled}
++            onRestrictionChange={setRestrictionEnabled}
+             onAddHost={addHost}
+             onBack={() => setStep('credentials')}
+             onNext={() => setStep('review')}
+@@ -105,6 +104,7 @@ export function SetupWizard({
+             password={password}
+             peerIp={peerIp}
+             hosts={hosts}
++            restrictionEnabled={restrictionEnabled}
+             submitting={submitting}
+             onBack={() => setStep('ip')}
+             onSubmit={() => { void submit(); }}
+diff --git a/web/src/styles.css b/web/src/styles.css
+index 1a32aef..246169e 100644
+--- a/web/src/styles.css
++++ b/web/src/styles.css
+@@ -2858,3 +2858,33 @@ select:focus-visible {
+     animation: none;
+   }
+ }
++
++.management-policy-toggle {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  font-weight: 600;
++}
++
++.management-policy-toggle input {
++  width: 18px;
++  height: 18px;
++  flex: 0 0 auto;
++}
++
++.management-ip-policy {
++  margin-bottom: 24px;
++  padding: 20px;
++  border: 1px solid #d7dde3;
++  border-radius: 8px;
++  background: #ffffff;
++}
++
++.management-ip-policy h2 {
++  margin-top: 0;
++  font-size: 18px;
++}
++
++.management-ip-policy button {
++  padding: 8px 16px;
++}
+diff --git a/web/src/features/users/ManagementIpPolicyPanel.tsx b/web/src/features/users/ManagementIpPolicyPanel.tsx
+new file mode 100644
+index 0000000..c6903b5
+--- /dev/null
++++ b/web/src/features/users/ManagementIpPolicyPanel.tsx
+@@ -0,0 +1,109 @@
++import { type FormEvent, useEffect, useRef, useState } from 'react';
++
++import { ApiError } from '../../api/client';
++import type { CameraApiClient } from '../../api/types';
++import { useTranslation } from '../../i18n/LanguageContext';
++import { parseManagementIpPolicy } from './contracts';
++import { userManagementErrorMessage } from './publicError';
++
++interface ManagementIpPolicyPanelProps {
++  client: CameraApiClient;
++  disabled?: boolean;
++  currentPeerIp: string;
++  onSaved(): void;
++}
++
++const POLICY_PATH = '/api/v1/security/management-ip-policy';
++
++export function ManagementIpPolicyPanel({
++  client, disabled = false, currentPeerIp, onSaved,
++}: ManagementIpPolicyPanelProps) {
++  const { t } = useTranslation();
++  const [savedEnabled, setSavedEnabled] = useState<boolean | null>(null);
++  const [enabled, setEnabled] = useState(false);
++  const [loading, setLoading] = useState(true);
++  const [loadError, setLoadError] = useState(false);
++  const [failure, setFailure] = useState<string | null>(null);
++  const [submitting, setSubmitting] = useState(false);
++  const [attempt, setAttempt] = useState(0);
++  const activeSave = useRef<AbortController | null>(null);
++
++  useEffect(() => {
++    const request = new AbortController();
++    setLoading(true);
++    setLoadError(false);
++    void client.getJson(POLICY_PATH, parseManagementIpPolicy, request.signal)
++      .then((policy) => {
++        if (!request.signal.aborted) {
++          setSavedEnabled(policy.enabled);
++          setEnabled(policy.enabled);
++        }
++      })
++      .catch(() => {
++        if (!request.signal.aborted) setLoadError(true);
++      })
++      .finally(() => {
++        if (!request.signal.aborted) setLoading(false);
++      });
++    return () => request.abort();
++  }, [attempt, client]);
++
++  useEffect(() => () => activeSave.current?.abort(), []);
++
++  const submit = async (event: FormEvent<HTMLFormElement>) => {
++    event.preventDefault();
++    if (disabled || loading || savedEnabled === null || enabled === savedEnabled ||
++        activeSave.current !== null) return;
++    const request = new AbortController();
++    activeSave.current = request;
++    setSubmitting(true);
++    setFailure(null);
++    try {
++      await client.putJson(POLICY_PATH, { enabled }, parseManagementIpPolicy, request.signal);
++      // Policy changes revoke every server session; return to sign-in without
++      // trying to refresh authenticated resources with the revoked cookie.
++      if (!request.signal.aborted) onSaved();
++    } catch (error) {
++      if (!request.signal.aborted && !(error instanceof ApiError &&
++          error.code === 'E_MANAGEMENT_REAUTHENTICATION_REQUIRED')) {
++        setFailure(userManagementErrorMessage(error, t('users.policySaveFailed'), t));
++      }
++    } finally {
++      if (activeSave.current === request) {
++        activeSave.current = null;
++        if (!request.signal.aborted) setSubmitting(false);
++      }
++    }
++  };
++
++  return (
++    <form className="management-ip-policy" onSubmit={(event) => { void submit(event); }}
++      aria-labelledby="management-ip-policy-heading">
++      <h2 id="management-ip-policy-heading">{t('setup.managementPolicyLabel')}</h2>
++      <label className="management-policy-toggle">
++        <input type="checkbox" checked={enabled}
++          disabled={disabled || loading || loadError || submitting || savedEnabled === null}
++          aria-describedby="management-ip-policy-description"
++          onChange={(event) => setEnabled(event.target.checked)} />
++        {t('setup.restrictManagementAccess')}
++      </label>
++      <p id="management-ip-policy-description">{t('users.policyDescription')}</p>
++      {currentPeerIp && <p>{t('users.policyCurrentAddress', { address: currentPeerIp })}</p>}
++      {loading && <p role="status">{t('users.policyLoading')}</p>}
++      {savedEnabled !== null && <p>{t('users.policyCurrent', {
++        state: t(savedEnabled ? 'setup.restrictionsEnabled' : 'setup.restrictionsDisabled'),
++      })}</p>}
++      {loadError && <>
++        <p className="form-error" role="alert">{t('users.policyLoadFailed')}</p>
++        <button type="button" className="secondary-button"
++          onClick={() => setAttempt((value) => value + 1)}>{t('users.policyRetry')}</button>
++      </>}
++      <p>{t('users.policySignInNotice')}</p>
++      {failure && <p className="form-error" role="alert">{failure}</p>}
++      <button className="primary-button" type="submit"
++        disabled={disabled || loading || loadError || submitting || savedEnabled === null || enabled === savedEnabled}>
++        {t(submitting ? 'users.policySaving' : 'users.policySave')}
++      </button>
++    </form>
++  );
++}

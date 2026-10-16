@@ -1,0 +1,35 @@
+From: Camera firmware maintainers
+Subject: [PATCH] simple-protocol: enforce existing client limit and bound accept logs
+
+The simple protocol defines CLIENTS_MAX but did not enforce it. Close
+newly accepted sockets at the limit before allocating a Client. Avoid
+unbounded error logging when accept fails from descriptor exhaustion.
+Other accept errors retain the existing logging.
+
+This is a narrow local resource bound inspired by the client admission
+and error handling in upstream proposal 808. It intentionally does not
+port the unmerged credential/rlimit refactor. An attacker holding all
+slots can still deny new simple-protocol clients. Accept readiness after
+EMFILE/ENFILE can still consume CPU because no listener backoff is added.
+This mitigates daemon memory, descriptor and error-log exhaustion.
+
+Related candidate: CVE-2025-59529 (partial resource mitigation only)
+Upstream-Status: Pending [https://github.com/avahi/avahi/pull/808]
+
+--- a/avahi-daemon/simple-protocol.c
++++ b/avahi-daemon/simple-protocol.c
+@@ -443,8 +443,12 @@
+     if (events & AVAHI_WATCH_IN) {
+         int cfd;
+ 
+-        if ((cfd = accept(fd, NULL, NULL)) < 0)
+-            avahi_log_error("accept(): %s", strerror(errno));
++        if ((cfd = accept(fd, NULL, NULL)) < 0) {
++            /* Do not let descriptor exhaustion flood the error log. */
++            if (errno != EMFILE && errno != ENFILE)
++                avahi_log_error("accept(): %s", strerror(errno));
++        } else if (s->n_clients >= CLIENTS_MAX)
++            close(cfd);
+         else
+             client_new(s, cfd);
+     }

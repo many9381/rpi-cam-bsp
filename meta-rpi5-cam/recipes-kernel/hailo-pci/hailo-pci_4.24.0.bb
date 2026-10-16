@@ -1,16 +1,16 @@
 SUMMARY = "Hailo-8 PCIe kernel driver"
 HOMEPAGE = "https://github.com/hailo-ai/hailort-drivers"
 LICENSE = "GPL-2.0-only"
-LIC_FILES_CHKSUM = "file://LICENSE;md5=39bba7d2cf0ba1036f2a6e2be52fe3f0"
+LIC_FILES_CHKSUM = "file://hailort/drivers/linux/pcie/src/pcie.c;beginline=1;endline=1;md5=50d2ba0afecd20f74c12a4bdbcfcfe61"
+
+require hailo-pcie-deb.inc
 
 SRC_URI = " \
-    git://github.com/hailo-ai/hailort-drivers.git;protocol=https;branch=hailo8 \
-    file://0001-use-target-kernel-configuration.patch \
+    file://0001-deb-use-target-kernel-configuration.patch \
     file://60-hailo.rules \
 "
-SRCREV = "2789e0ff8b75ffdbaf8f7235f55aef3c06a2ed24"
-S = "${UNPACKDIR}/git"
-B = "${S}/linux/pcie"
+S = "${UNPACKDIR}/deb/usr/src/hailort-pcie-driver"
+B = "${S}/hailort/drivers/linux/pcie"
 
 inherit module
 
@@ -24,6 +24,9 @@ RDEPENDS:${PN} += "hailo-firmware (= ${EXTENDPKGV})"
 do_install:append() {
     install -d ${D}${nonarch_base_libdir}/udev/rules.d
     install -m 0644 ${UNPACKDIR}/60-hailo.rules ${D}${nonarch_base_libdir}/udev/rules.d/60-hailo.rules
+    install -d ${D}${sysconfdir}/modprobe.d
+    install -m 0644 ${UNPACKDIR}/deb/etc/modprobe.d/hailo_pci.conf ${D}${sysconfdir}/modprobe.d/
 }
 
-FILES:${PN} += "${nonarch_base_libdir}/udev/rules.d/60-hailo.rules"
+FILES:${PN} += "${nonarch_base_libdir}/udev/rules.d/60-hailo.rules ${sysconfdir}/modprobe.d/hailo_pci.conf"
+CONFFILES:${PN} = "${sysconfdir}/modprobe.d/hailo_pci.conf"

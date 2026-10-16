@@ -4,6 +4,8 @@ DESCRIPTION = "Extends rpi5-minimal-image with IMX708 still capture and software
 require rpi5-minimal-image.bb
 
 IMAGE_INSTALL:append = " \
+    rpi5-camera-support \
+    rpi5-security-policy \
     libcamera-apps \
     libcamera \
     v4l-utils \

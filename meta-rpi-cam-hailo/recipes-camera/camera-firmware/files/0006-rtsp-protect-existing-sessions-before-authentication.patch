@@ -1,0 +1,490 @@
+From: Camera Firmware Maintainers <firmware@example.invalid>
+Subject: [PATCH] rtsp: authenticate session-bearing OPTIONS and test isolation
+
+Keep sessionless OPTIONS discovery public, but require Digest authorization for
+both Session and Pipelined-Requests selectors. Pair with the rtsp-server layer
+patch that authorizes before session lookup and prevents response-side adoption.
+
+Add real adapter and TLS/SRTP playback regressions for rejected requests,
+unsolicited responses, session existence, authenticated OPTIONS and reconnect.
+
+Upstream-Status: Pending
+
+diff --git a/src/rtsp/GstRtspDigestAuth.cpp b/src/rtsp/GstRtspDigestAuth.cpp
+--- a/src/rtsp/GstRtspDigestAuth.cpp
++++ b/src/rtsp/GstRtspDigestAuth.cpp
+@@ -247,8 +247,18 @@
+   }
+   if (g_strcmp0(check, GST_RTSP_AUTH_CHECK_URL) == 0 && context != nullptr &&
+       context->method == GST_RTSP_OPTIONS) {
+-    ClearContextToken(context);
+-    return TRUE;
++    // Only sessionless discovery is public. Either selector can make
++    // GStreamer look up, touch and watch an existing session after this check.
++    gchar* selector = nullptr;
++    if (context->request != nullptr &&
++        gst_rtsp_message_get_header(context->request, GST_RTSP_HDR_SESSION,
++                                    &selector, 0) != GST_RTSP_OK &&
++        gst_rtsp_message_get_header(context->request,
++                                    GST_RTSP_HDR_PIPELINED_REQUESTS, &selector,
++                                    0) != GST_RTSP_OK) {
++      ClearContextToken(context);
++      return TRUE;
++    }
+   }
+   if (g_strcmp0(check, GST_RTSP_AUTH_CHECK_URL) == 0) {
+     if (context == nullptr) {
+diff --git a/tests/unit/rtsp/GstRtspDigestAuthTest.cpp b/tests/unit/rtsp/GstRtspDigestAuthTest.cpp
+--- a/tests/unit/rtsp/GstRtspDigestAuthTest.cpp
++++ b/tests/unit/rtsp/GstRtspDigestAuthTest.cpp
+@@ -278,7 +278,8 @@
+ }
+ 
+ std::string BuildAuthorization(std::string_view password,
+-                               std::string_view nonce) {
++                               std::string_view nonce,
++                               std::string_view method = kMethod) {
+   auto ha1 = ComputeRtspDigestHa1(RtspDigestAlgorithm::kSha256, kUsername,
+                                   kRealm, Bytes(password));
+   if (!ha1.ok()) {
+@@ -286,7 +287,7 @@
+   }
+   auto response = ComputeRtspDigestResponse(
+       RtspDigestAlgorithm::kSha256, {ha1.value().data(), ha1.value().size()},
+-      kMethod, kUri, nonce, kNonceCount, kCnonce);
++      method, kUri, nonce, kNonceCount, kCnonce);
+   if (!response.ok()) {
+     throw std::runtime_error("failed to calculate test response");
+   }
+@@ -444,6 +445,199 @@
+ 
+   ClearContextToken(&context);
+   (void)gst_rtsp_message_unset(&request);
++}
++
++TEST(GstRtspDigestAuthTest, OptionsWithSessionSelectorsRequiresAuthorization) {
++  TemporaryDirectory directory;
++  const auto credentials = directory.File("credentials");
++  WriteFile(credentials, CredentialFile(kOldPassword));
++  DeterministicNonceInputs inputs;
++  AuthPtr auth = CreateAuth(AuthConfig(credentials), inputs);
++  ASSERT_NE(auth, nullptr);
++
++  for (const auto header :
++       {GST_RTSP_HDR_SESSION, GST_RTSP_HDR_PIPELINED_REQUESTS}) {
++    for (const char* value : {"active-session", ""}) {
++      GstRTSPMessage request{};
++      GstRTSPMessage response{};
++      ASSERT_EQ(gst_rtsp_message_init_request(&request, GST_RTSP_OPTIONS,
++                                              std::string(kUri).c_str()),
++                GST_RTSP_OK);
++      ASSERT_EQ(gst_rtsp_message_add_header(&request, header, value),
++                GST_RTSP_OK);
++      GstRTSPClient* client = gst_rtsp_client_new();
++      SentMessageCapture capture;
++      gst_rtsp_client_set_send_func(client, CaptureSentMessage, &capture,
++                                    nullptr);
++      GstRTSPContext context{};
++      context.client = client;
++      context.request = &request;
++      context.response = &response;
++      context.method = GST_RTSP_OPTIONS;
++
++      EXPECT_FALSE(CheckUrl(auth.get(), &context));
++      EXPECT_EQ(context.token, nullptr);
++      EXPECT_EQ(capture.count, 1);
++      EXPECT_EQ(capture.status, GST_RTSP_STS_UNAUTHORIZED);
++      EXPECT_EQ(capture.challenges.size(), 1U);
++
++      gst_object_unref(client);
++      (void)gst_rtsp_message_unset(&request);
++      (void)gst_rtsp_message_unset(&response);
++    }
++  }
++}
++
++TEST(GstRtspDigestAuthTest, RejectedRequestDoesNotWatchExistingSession) {
++  TemporaryDirectory directory;
++  const auto credentials = directory.File("credentials");
++  WriteFile(credentials, CredentialFile(kOldPassword));
++  DeterministicNonceInputs inputs;
++  AuthPtr auth = CreateAuth(AuthConfig(credentials), inputs);
++  ASSERT_NE(auth, nullptr);
++
++  GstRTSPSessionPool* pool = gst_rtsp_session_pool_new();
++  GstRTSPSession* session = gst_rtsp_session_pool_create(pool);
++  GstRTSPClient* client = gst_rtsp_client_new();
++  gst_rtsp_client_set_session_pool(client, pool);
++  gst_rtsp_client_set_auth(client, auth.get());
++  SentMessageCapture capture;
++  gst_rtsp_client_set_send_func(client, CaptureSentMessage, &capture, nullptr);
++  GstRTSPMessage request{};
++  ASSERT_EQ(gst_rtsp_message_init_request(&request, GST_RTSP_PLAY,
++                                          std::string(kUri).c_str()),
++            GST_RTSP_OK);
++  ASSERT_EQ(
++      gst_rtsp_message_add_header(&request, GST_RTSP_HDR_SESSION,
++                                  gst_rtsp_session_get_sessionid(session)),
++      GST_RTSP_OK);
++  ASSERT_EQ(gst_rtsp_message_add_header(&request, GST_RTSP_HDR_CSEQ, "1"),
++            GST_RTSP_OK);
++
++  const gint64 fixed_now = g_get_monotonic_time();
++  const gint timeout_before =
++      gst_rtsp_session_next_timeout_usec(session, fixed_now);
++  ASSERT_GT(timeout_before, 0);
++  // next_timeout_usec returns milliseconds; separate any accidental touch
++  // from the initial value without waiting for the real session to expire.
++  g_usleep(5000);
++  EXPECT_EQ(gst_rtsp_client_handle_message(client, &request), GST_RTSP_OK);
++  EXPECT_EQ(capture.status, GST_RTSP_STS_UNAUTHORIZED);
++  EXPECT_EQ(gst_rtsp_session_next_timeout_usec(session, fixed_now),
++            timeout_before);
++  GList* watched = gst_rtsp_client_session_filter(client, nullptr, nullptr);
++  EXPECT_EQ(g_list_length(watched), 0U);
++  g_list_free_full(watched, g_object_unref);
++
++  (void)gst_rtsp_message_unset(&request);
++  gst_rtsp_session_pool_remove(pool, session);
++  g_object_unref(session);
++  g_object_unref(client);
++  g_object_unref(pool);
++}
++
++TEST(GstRtspDigestAuthTest, UnsolicitedResponseDoesNotWatchExistingSession) {
++  gst_init(nullptr, nullptr);
++  GstRTSPSessionPool* pool = gst_rtsp_session_pool_new();
++  GstRTSPSession* session = gst_rtsp_session_pool_create(pool);
++  GstRTSPClient* client = gst_rtsp_client_new();
++  gst_rtsp_client_set_session_pool(client, pool);
++  GstRTSPMessage response{};
++  ASSERT_EQ(gst_rtsp_message_init_response(&response, GST_RTSP_STS_OK, nullptr,
++                                           nullptr),
++            GST_RTSP_OK);
++  ASSERT_EQ(
++      gst_rtsp_message_add_header(&response, GST_RTSP_HDR_SESSION,
++                                  gst_rtsp_session_get_sessionid(session)),
++      GST_RTSP_OK);
++  ASSERT_EQ(gst_rtsp_message_add_header(&response, GST_RTSP_HDR_CSEQ, "1"),
++            GST_RTSP_OK);
++
++  const gint64 fixed_now = g_get_monotonic_time();
++  const gint timeout_before =
++      gst_rtsp_session_next_timeout_usec(session, fixed_now);
++  ASSERT_GT(timeout_before, 0);
++  g_usleep(5000);
++  EXPECT_EQ(gst_rtsp_client_handle_message(client, &response), GST_RTSP_OK);
++  EXPECT_EQ(gst_rtsp_session_next_timeout_usec(session, fixed_now),
++            timeout_before);
++  GList* watched = gst_rtsp_client_session_filter(client, nullptr, nullptr);
++  EXPECT_EQ(g_list_length(watched), 0U);
++  g_list_free_full(watched, g_object_unref);
++
++  (void)gst_rtsp_message_unset(&response);
++  gst_rtsp_session_pool_remove(pool, session);
++  g_object_unref(session);
++  g_object_unref(client);
++  g_object_unref(pool);
++}
++
++TEST(GstRtspDigestAuthTest,
++     ResponseForAuthenticatedSessionStillReachesHandler) {
++  TemporaryDirectory directory;
++  const auto credentials = directory.File("credentials");
++  WriteFile(credentials, CredentialFile(kOldPassword));
++  DeterministicNonceInputs inputs;
++  AuthPtr auth = CreateAuth(AuthConfig(credentials), inputs);
++  ASSERT_NE(auth, nullptr);
++  const auto authorization =
++      BuildAuthorization(kOldPassword, IssueChallenge(auth.get()), "OPTIONS");
++  GstRTSPSessionPool* pool = gst_rtsp_session_pool_new();
++  GstRTSPSession* session = gst_rtsp_session_pool_create(pool);
++  GstRTSPClient* client = gst_rtsp_client_new();
++  gst_rtsp_client_set_session_pool(client, pool);
++  gst_rtsp_client_set_auth(client, auth.get());
++  SentMessageCapture sent;
++  gst_rtsp_client_set_send_func(client, CaptureSentMessage, &sent, nullptr);
++  GstRTSPMessage request{};
++  ASSERT_EQ(gst_rtsp_message_init_request(&request, GST_RTSP_OPTIONS,
++                                          std::string(kUri).c_str()),
++            GST_RTSP_OK);
++  gst_rtsp_message_add_header(&request, GST_RTSP_HDR_CSEQ, "1");
++  gst_rtsp_message_add_header(&request, GST_RTSP_HDR_SESSION,
++                              gst_rtsp_session_get_sessionid(session));
++  gst_rtsp_message_add_header(&request, GST_RTSP_HDR_AUTHORIZATION,
++                              authorization.c_str());
++  ASSERT_EQ(gst_rtsp_client_handle_message(client, &request), GST_RTSP_OK);
++  ASSERT_EQ(sent.count, 1);
++  ASSERT_EQ(sent.status, GST_RTSP_STS_OK);
++
++  struct HandledResponse {
++    int count{0};
++    GstRTSPSession* session{nullptr};
++  } handled;
++  const auto handler =
++      +[](GstRTSPClient*, GstRTSPContext* context, gpointer data) {
++        auto* capture = static_cast<HandledResponse*>(data);
++        ++capture->count;
++        capture->session = context->session;
++      };
++  g_signal_connect(client, "handle-response", G_CALLBACK(handler), &handled);
++  GstRTSPMessage response{};
++  gst_rtsp_message_init_response(&response, GST_RTSP_STS_OK, nullptr, nullptr);
++  gst_rtsp_message_add_header(&response, GST_RTSP_HDR_CSEQ, "2");
++  gst_rtsp_message_add_header(&response, GST_RTSP_HDR_SESSION,
++                              gst_rtsp_session_get_sessionid(session));
++  const gint64 fixed_now = g_get_monotonic_time();
++  const gint timeout_before =
++      gst_rtsp_session_next_timeout_usec(session, fixed_now);
++  g_usleep(5000);
++  EXPECT_EQ(gst_rtsp_client_handle_message(client, &response), GST_RTSP_OK);
++  EXPECT_EQ(handled.count, 1);
++  EXPECT_EQ(handled.session, session);
++  EXPECT_GT(gst_rtsp_session_next_timeout_usec(session, fixed_now),
++            timeout_before);
++  GList* watched = gst_rtsp_client_session_filter(client, nullptr, nullptr);
++  EXPECT_EQ(g_list_length(watched), 1U);
++  EXPECT_EQ(watched == nullptr ? nullptr : watched->data, session);
++  g_list_free_full(watched, g_object_unref);
++
++  (void)gst_rtsp_message_unset(&request);
++  (void)gst_rtsp_message_unset(&response);
++  gst_rtsp_session_pool_remove(pool, session);
++  g_object_unref(session);
++  g_object_unref(client);
++  g_object_unref(pool);
+ }
+ 
+ TEST(GstRtspDigestAuthTest, UnauthorizedCheckAddsOnlyDigestChallenges) {
+diff --git a/tests/integration/RtspDigestAuthIntegrationTest.cpp b/tests/integration/RtspDigestAuthIntegrationTest.cpp
+--- a/tests/integration/RtspDigestAuthIntegrationTest.cpp
++++ b/tests/integration/RtspDigestAuthIntegrationTest.cpp
+@@ -328,8 +328,10 @@
+   TlsRtspTestClient(const TlsRtspTestClient&) = delete;
+   TlsRtspTestClient& operator=(const TlsRtspTestClient&) = delete;
+ 
+-  RtspTestResponse Request(std::string_view method, std::string_view uri,
+-                           std::string_view authorization = {}) {
++  RtspTestResponse Request(
++      std::string_view method, std::string_view uri,
++      std::string_view authorization = {},
++      const std::vector<std::pair<std::string, std::string>>& headers = {}) {
+     std::string request;
+     request.reserve(method.size() + uri.size() + authorization.size() + 160U);
+     request.append(method);
+@@ -346,11 +348,14 @@
+       request.append(authorization);
+       request.append("\r\n");
+     }
++    for (const auto& [name, value] : headers) {
++      request.append(name).append(": ").append(value).append("\r\n");
++    }
+     request.append("\r\n");
+     return Send(request);
+   }
+ 
+-  RtspTestResponse Send(std::string_view request) {
++  void SendOnly(std::string_view request) {
+     std::size_t sent = 0U;
+     while (sent < request.size()) {
+       const int result = SSL_write(ssl_.get(), request.data() + sent,
+@@ -360,7 +365,12 @@
+       }
+       sent += static_cast<std::size_t>(result);
+     }
+-
++  }
++
++  RtspTestResponse Send(std::string_view request) {
++    SendOnly(request);
++    while (ReadInterleavedFrame()) {
++    }
+     const std::string separator = "\r\n\r\n";
+     while (pending_.find(separator) == std::string::npos) {
+       ReadMore(kMaximumHeaderBytes);
+@@ -431,6 +441,18 @@
+     return response;
+   }
+ 
++  std::size_t ReceiveRtpFor(std::chrono::milliseconds duration) {
++    const auto before = rtp_packets_;
++    const auto deadline = std::chrono::steady_clock::now() + duration;
++    while (std::chrono::steady_clock::now() < deadline) {
++      if (!ReadInterleavedFrame()) {
++        throw std::runtime_error(
++            "unexpected RTSP response during media receive");
++      }
++    }
++    return rtp_packets_ - before;
++  }
++
+  private:
+   TlsRtspTestClient(UniqueFd socket_fd, SslContextPtr context, SslPtr ssl)
+       : socket_(std::move(socket_fd)),
+@@ -449,11 +471,35 @@
+     }
+   }
+ 
++  bool ReadInterleavedFrame() {
++    while (pending_.empty()) {
++      ReadMore(kMaximumBodyBytes + kMaximumHeaderBytes);
++    }
++    if (pending_.front() != '$') {
++      return false;
++    }
++    while (pending_.size() < 4U) {
++      ReadMore(kMaximumBodyBytes + kMaximumHeaderBytes);
++    }
++    const auto channel = static_cast<unsigned char>(pending_[1]);
++    const std::size_t size = (static_cast<unsigned char>(pending_[2]) << 8U) |
++                             static_cast<unsigned char>(pending_[3]);
++    while (pending_.size() < size + 4U) {
++      ReadMore(kMaximumBodyBytes + kMaximumHeaderBytes);
++    }
++    if (channel == 0U) {
++      ++rtp_packets_;
++    }
++    pending_.erase(0U, size + 4U);
++    return true;
++  }
++
+   UniqueFd socket_;
+   SslContextPtr context_;
+   SslPtr ssl_;
+   std::string pending_;
+   unsigned int next_cseq_{1U};
++  std::size_t rtp_packets_{0U};
+ };
+ 
+ class TemporaryDirectory {
+@@ -816,6 +862,130 @@
+                             uri, *nonce);
+ }
+ 
++RtspTestResponse AuthenticatedRequest(
++    TlsRtspTestClient& client, const LiveSecureServer& server,
++    std::string_view method, std::string_view uri,
++    const std::vector<std::pair<std::string, std::string>>& headers = {}) {
++  // Each challenge issues a fresh nonce; the test's fixed nc=1 is never reused.
++  const auto challenge = client.Request("DESCRIBE", server.url());
++  const auto nonce =
++      DigestParameter(ChallengeFor(challenge, "SHA-256"), "nonce");
++  if (challenge.status_code != 401 || !nonce.has_value()) {
++    throw std::runtime_error(
++        "test server did not issue a fresh Digest challenge");
++  }
++  const auto authorization =
++      BuildAuthorization(RtspDigestAlgorithm::kSha256, kUsername, kPassword,
++                         kRealm, method, uri, *nonce);
++  return client.Request(method, uri, authorization, headers);
++}
++
++std::string SetupSession(TlsRtspTestClient& client,
++                         const LiveSecureServer& server) {
++  const auto describe =
++      AuthenticatedRequest(client, server, "DESCRIBE", server.url());
++  if (describe.status_code != 200) {
++    throw std::runtime_error("authenticated DESCRIBE failed");
++  }
++  const auto setup = AuthenticatedRequest(
++      client, server, "SETUP", server.url() + "/stream=0",
++      {{"Transport", "RTP/SAVPF/TCP;unicast;interleaved=0-1"}});
++  const auto headers = HeaderValues(setup, "Session");
++  if (setup.status_code != 200 || headers.size() != 1U) {
++    throw std::runtime_error("authenticated SETUP failed");
++  }
++  return headers.front().substr(0U, headers.front().find(';'));
++}
++
++class RtspSessionIsolationTest : public testing::TestWithParam<const char*> {};
++
++TEST_P(RtspSessionIsolationTest, RejectedConnectionCannotInterruptPlayback) {
++  LiveSecureServer server;
++  auto owner = TlsRtspTestClient::Connect(server.port());
++  ASSERT_NE(owner, nullptr);
++  const auto session = SetupSession(*owner, server);
++  const std::vector<std::pair<std::string, std::string>> headers{
++      {"Session", session}};
++  ASSERT_EQ(AuthenticatedRequest(*owner, server, "PLAY", server.url(), headers)
++                .status_code,
++            200);
++  ASSERT_GT(owner->ReceiveRtpFor(std::chrono::milliseconds(100)), 0U);
++
++  auto rejected = TlsRtspTestClient::Connect(server.port());
++  ASSERT_NE(rejected, nullptr);
++  if (std::string_view(GetParam()) == "RESPONSE") {
++    rejected->SendOnly("RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: " + session +
++                       "\r\n\r\n");
++    // An ordered round trip proves the preceding response reached dispatch.
++    ASSERT_EQ(rejected->Request("OPTIONS", server.url()).status_code, 200);
++  } else {
++    const auto response =
++        rejected->Request(GetParam(), server.url(), {}, headers);
++    EXPECT_EQ(response.status_code, 401);
++    EXPECT_TRUE(response.body.empty());
++  }
++  rejected.reset();
++
++  // Checking process health or GET_PARAMETER alone misses the session teardown.
++  EXPECT_NO_THROW(
++      EXPECT_GT(owner->ReceiveRtpFor(std::chrono::milliseconds(500)), 0U));
++  EXPECT_EQ(AuthenticatedRequest(*owner, server, "PLAY", server.url(), headers)
++                .status_code,
++            200);
++  EXPECT_EQ(
++      AuthenticatedRequest(*owner, server, "TEARDOWN", server.url(), headers)
++          .status_code,
++      200);
++}
++
++INSTANTIATE_TEST_SUITE_P(Unauthenticated, RtspSessionIsolationTest,
++                         testing::Values("PLAY", "OPTIONS", "GET_PARAMETER",
++                                         "TEARDOWN", "RESPONSE"));
++
++TEST(RtspDigestAuthIntegrationTest,
++     SessionExistenceIsHiddenBeforeAuthentication) {
++  LiveSecureServer server;
++  auto client = TlsRtspTestClient::Connect(server.port());
++  ASSERT_NE(client, nullptr);
++  const std::vector<std::pair<std::string, std::string>> headers{
++      {"Session", "nonexistent-session"}};
++  for (const char* method : {"PLAY", "OPTIONS"}) {
++    EXPECT_EQ(client->Request(method, server.url(), {}, headers).status_code,
++              401);
++    EXPECT_EQ(
++        AuthenticatedRequest(*client, server, method, server.url(), headers)
++            .status_code,
++        454);
++  }
++}
++
++TEST(RtspDigestAuthIntegrationTest, AuthenticatedOptionsAndReconnectStillWork) {
++  LiveSecureServer server;
++  // A new connection can establish a fresh stream after a normal teardown.
++  for (int connection = 0; connection < 2; ++connection) {
++    auto client = TlsRtspTestClient::Connect(server.port());
++    ASSERT_NE(client, nullptr);
++    const auto session = SetupSession(*client, server);
++    const std::vector<std::pair<std::string, std::string>> headers{
++        {"Session", session}};
++    client->SendOnly("RTSP/1.0 200 OK\r\nCSeq: 1\r\nSession: " + session +
++                     "\r\n\r\n");
++    EXPECT_EQ(
++        AuthenticatedRequest(*client, server, "OPTIONS", server.url(), headers)
++            .status_code,
++        200);
++    ASSERT_EQ(
++        AuthenticatedRequest(*client, server, "PLAY", server.url(), headers)
++            .status_code,
++        200);
++    EXPECT_GT(client->ReceiveRtpFor(std::chrono::milliseconds(100)), 0U);
++    EXPECT_EQ(
++        AuthenticatedRequest(*client, server, "TEARDOWN", server.url(), headers)
++            .status_code,
++        200);
++  }
++}
++
+ class InjectedClockTlsServer {
+  public:
+   InjectedClockTlsServer()

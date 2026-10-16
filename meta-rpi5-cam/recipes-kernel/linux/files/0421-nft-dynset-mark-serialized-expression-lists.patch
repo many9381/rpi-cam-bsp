@@ -1,0 +1,22 @@
+From: RPi5 Camera Firmware Maintainers <maintainers@example.invalid>
+Subject: [PATCH] netfilter: nft_dynset: mark serialized expression lists
+
+nft_dynset_init requires NFT_DYNSET_F_EXPR for NFTA_DYNSET_EXPRESSIONS.
+Set that flag exactly when dumping a list, retaining the inversion flag.
+Without it, replay rejects standalone lists and the declared-set overrides
+now exposed by the preceding ownership fix. Single and borrowed default
+expressions retain their existing wire format.
+
+Upstream-Status: Pending
+Signed-off-by: RPi5 Camera Firmware Maintainers <maintainers@example.invalid>
+
+--- a/net/netfilter/nft_dynset.c
++++ b/net/netfilter/nft_dynset.c
+@@ -405,6 +405,7 @@
+ 		} else if (priv->num_exprs > 1) {
+ 			struct nlattr *nest;
+ 
++			flags |= NFT_DYNSET_F_EXPR;
+ 			nest = nla_nest_start_noflag(skb, NFTA_DYNSET_EXPRESSIONS);
+ 			if (!nest)
+ 				goto nla_put_failure;

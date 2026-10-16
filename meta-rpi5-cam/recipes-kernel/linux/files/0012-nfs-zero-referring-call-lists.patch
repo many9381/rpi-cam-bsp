@@ -1,0 +1,34 @@
+From 8fa4804fe62ca4155a2d8fc2789d630376cbf2fc Mon Sep 17 00:00:00 2001
+Subject: [PATCH] NFSv4.1: zero referring call lists before decoding
+
+decode_cb_sequence_args() allocates csa_rclists with kmalloc_objs(), so
+each referring_call_list starts uninitialized. decode_rc_list() assigns
+rcl_refcalls only when rcl_nrefcalls is nonzero. A valid list with zero
+referring calls therefore leaves the pointer uninitialized, and
+nfs4_callback_sequence() later passes stale slab contents to kfree().
+
+Allocate csa_rclists with kzalloc_objs() so every rcl_refcalls member is
+NULL from the beginning, including valid empty referring call lists.
+
+Fixes: 4aece6a19cf7 ("nfs41: cb_sequence xdr implementation")
+Assisted-by: Codex:gpt-5
+Signed-off-by: Jérémy Jean <Jeremy.Jean@oss.cyber.gouv.fr>
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+
+
+CVE: CVE-2026-90104
+Upstream-Status: Backport [https://github.com/torvalds/linux/commit/8fa4804fe62ca4155a2d8fc2789d630376cbf2fc]
+
+6.18 backport notes: 6.18 uses kmalloc_array(n, sizeof(*p), GFP_KERNEL); use its zeroing counterpart kcalloc with the same arguments.
+
+--- a/fs/nfs/callback_xdr.c
++++ b/fs/nfs/callback_xdr.c
+@@ -422,7 +422,7 @@
+ 	args->csa_nrclists = ntohl(*p++);
+ 	args->csa_rclists = NULL;
+ 	if (args->csa_nrclists) {
+-		args->csa_rclists = kmalloc_array(args->csa_nrclists,
++		args->csa_rclists = kcalloc(args->csa_nrclists,
+ 						  sizeof(*args->csa_rclists),
+ 						  GFP_KERNEL);
+ 		if (unlikely(args->csa_rclists == NULL))

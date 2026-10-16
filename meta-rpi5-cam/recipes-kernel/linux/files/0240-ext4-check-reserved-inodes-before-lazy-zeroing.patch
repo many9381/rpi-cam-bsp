@@ -1,0 +1,59 @@
+From: Kernel Security Review <security@example.invalid>
+Subject: [PATCH] ext4: check reserved inode coverage for uninitialized groups
+
+CVE: CVE-2018-10876
+Upstream-Status: Pending [supplemental reserved-inode invariant guard]
+
+The reserved-inode coverage check added by 501228470077 was moved
+inside the initialized-bitmap branch by a149d2a5cabb. An invalid group
+with INODE_UNINIT can bypass that check and request zeroing over the
+reserved inode table. Perform the coverage check for both branches.
+The no-free-block exception and full-table behavior remain intact.
+
+This applies the invariant described by the original CVE fix and its
+follow-up without disallowing lazy initialization of valid groups.
+
+Upstream references:
+https://git.kernel.org/linus/8844618d8aa7a9973e7b527d038a2a589665002c
+https://git.kernel.org/linus/5012284700775a4e6e3fbe7eac4c543c4874b559
+https://git.kernel.org/linus/a149d2a5cabbf6507a7832a1c4fd2593c55fd450
+
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -1569,21 +1569,21 @@
+ 			goto err_out;
+ 		}
+ 
+-		used_inos += group * EXT4_INODES_PER_GROUP(sb);
+-		/*
+-		 * Are there some uninitialized inodes in the inode table
+-		 * before the first normal inode?
+-		 */
+-		if ((used_blks != sbi->s_itb_per_group) &&
+-		     (used_inos < EXT4_FIRST_INO(sb))) {
+-			ext4_error(sb, "Something is wrong with group %u: "
+-				   "itable unused count: %u; "
+-				   "itables initialized count: %ld",
+-				   group, ext4_itable_unused_count(sb, gdp),
+-				   used_inos);
+-			ret = 1;
+-			goto err_out;
+-		}
++	}
++	used_inos += group * EXT4_INODES_PER_GROUP(sb);
++	/*
++	 * Are there some uninitialized inodes in the inode table
++	 * before the first normal inode?
++	 */
++	if ((used_blks != sbi->s_itb_per_group) &&
++	     (used_inos < EXT4_FIRST_INO(sb))) {
++		ext4_error(sb, "Something is wrong with group %u: "
++			   "itable unused count: %u; "
++			   "itables initialized count: %ld",
++			   group, ext4_itable_unused_count(sb, gdp),
++			   used_inos);
++		ret = 1;
++		goto err_out;
+ 	}
+ 
+ 	blk = ext4_inode_table(sb, gdp) + used_blks;

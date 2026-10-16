@@ -1,0 +1,79 @@
+From: Firmware Security Follow-up <security@example.invalid>
+Subject: [PATCH] scsi pair eh runtime pm using one snapshot
+
+Complete upstream bool conversion, single EH-iteration snapshot, and UFS runtime writers. Place bool before local bitfields because the later async_scan bool is absent. libata initializes eh_noresume before scsi_add_host publication; it is not a concurrent runtime writer and remains unchanged.
+
+CVE: CVE-2026-74754
+Upstream-Status: Backport [https://git.kernel.org/stable/c/872f486259ae0bc6b73ca4735a15d013241f73e9]
+
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -2358,6 +2358,7 @@
+ int scsi_error_handler(void *data)
+ {
+ 	struct Scsi_Host *shost = data;
++	bool eh_noresume;
+ 
+ 	/*
+ 	 * We use TASK_INTERRUPTIBLE so that the thread is not
+@@ -2399,7 +2400,8 @@
+ 		 * what we need to do to get it up and online again (if we can).
+ 		 * If we fail, we end up taking the thing offline.
+ 		 */
+-		if (!shost->eh_noresume && scsi_autopm_get_host(shost) != 0) {
++		eh_noresume = READ_ONCE(shost->eh_noresume);
++		if (!eh_noresume && scsi_autopm_get_host(shost) != 0) {
+ 			SCSI_LOG_ERROR_RECOVERY(1,
+ 				shost_printk(KERN_ERR, shost,
+ 					     "scsi_eh_%d: unable to autoresume\n",
+@@ -2423,7 +2425,7 @@
+ 		 * which are still online.
+ 		 */
+ 		scsi_restart_operations(shost);
+-		if (!shost->eh_noresume)
++		if (!eh_noresume)
+ 			scsi_autopm_put_host(shost);
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -9637,7 +9637,7 @@
+ 	 * we are functional while we are here, skip host resume in error
+ 	 * handling context.
+ 	 */
+-	hba->host->eh_noresume = 1;
++	WRITE_ONCE(hba->host->eh_noresume, 1);
+ 
+ 	/*
+ 	 * Current function would be generally called from the power management
+@@ -9659,7 +9659,7 @@
+ 	}
+ 
+ 	scsi_device_put(sdp);
+-	hba->host->eh_noresume = 0;
++	WRITE_ONCE(hba->host->eh_noresume, 0);
+ 	return ret;
+ }
+ 
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@ -631,6 +631,9 @@
+ 	 */
+ 	unsigned nr_hw_queues;
+ 	unsigned nr_maps;
++
++	/* Don't resume host in EH */
++	bool eh_noresume;
+ 	unsigned active_mode:2;
+ 
+ 	/*
+@@ -651,9 +654,6 @@
+ 
+ 	/* Asynchronous scan in progress */
+ 	unsigned async_scan:1;
+-
+-	/* Don't resume host in EH */
+-	unsigned eh_noresume:1;
+ 
+ 	/* The controller does not support WRITE SAME */
+ 	unsigned no_write_same:1;

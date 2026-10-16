@@ -1,0 +1,99 @@
+From: Kernel security backport review <noreply@example.invalid>
+Subject: [PATCH] PCI: copy dynamic IDs under lock
+
+Preserve local pci_match_one_device and driver_override/static semantics.
+Convert all three local callers, including new_id_store, so a dynamic node
+can be removed after the lock without invalidating the returned ID.
+
+CVE: CVE-2026-90421
+Upstream-Status: Backport [https://git.kernel.org/stable/c/3ffc4c9690c33ee28cdb3d0182b12f9c623e3acc]
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -127,6 +127,7 @@
+  * pci_match_device - See if a device matches a driver's list of IDs
+  * @drv: the PCI driver to match against
+  * @dev: the PCI device structure to match against
++ * @id_copy: caller storage for a dynamic ID, valid during probe
+  *
+  * Used by a driver to check whether a PCI device is in its list of
+  * supported devices or in the dynids list, which may have been augmented
+@@ -134,7 +135,8 @@
+  * structure or %NULL if there is no match.
+  */
+ static const struct pci_device_id *pci_match_device(struct pci_driver *drv,
+-						    struct pci_dev *dev)
++						    struct pci_dev *dev,
++						    struct pci_device_id *id_copy)
+ {
+ 	struct pci_dynid *dynid;
+ 	const struct pci_device_id *found_id = NULL, *ids;
+@@ -149,7 +151,8 @@
+ 	spin_lock(&drv->dynids.lock);
+ 	list_for_each_entry(dynid, &drv->dynids.list, node) {
+ 		if (pci_match_one_device(&dynid->id, dev)) {
+-			found_id = &dynid->id;
++			*id_copy = dynid->id;
++			found_id = id_copy;
+ 			break;
+ 		}
+ 	}
+@@ -210,6 +213,7 @@
+ 		return -EINVAL;
+ 
+ 	if (fields != 7) {
++		struct pci_device_id id_copy;
+ 		struct pci_dev *pdev = kzalloc(sizeof(*pdev), GFP_KERNEL);
+ 		if (!pdev)
+ 			return -ENOMEM;
+@@ -222,7 +226,7 @@
+ 		pdev->dev.release = _pci_free_device;
+ 
+ 		device_initialize(&pdev->dev);
+-		if (pci_match_device(pdrv, pdev))
++		if (pci_match_device(pdrv, pdev, &id_copy))
+ 			retval = -EEXIST;
+ 
+ 		put_device(&pdev->dev);
+@@ -416,12 +420,13 @@
+ static int __pci_device_probe(struct pci_driver *drv, struct pci_dev *pci_dev)
+ {
+ 	const struct pci_device_id *id;
++	struct pci_device_id id_copy;
+ 	int error = 0;
+ 
+ 	if (drv->probe) {
+ 		error = -ENODEV;
+ 
+-		id = pci_match_device(drv, pci_dev);
++		id = pci_match_device(drv, pci_dev, &id_copy);
+ 		if (id)
+ 			error = pci_call_probe(drv, pci_dev, id);
+ 	}
+@@ -1511,12 +1516,13 @@
+ 	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 	struct pci_driver *pci_drv;
+ 	const struct pci_device_id *found_id;
++	struct pci_device_id id_copy;
+ 
+ 	if (pci_dev_binding_disallowed(pci_dev))
+ 		return 0;
+ 
+ 	pci_drv = (struct pci_driver *)to_pci_driver(drv);
+-	found_id = pci_match_device(pci_drv, pci_dev);
++	found_id = pci_match_device(pci_drv, pci_dev, &id_copy);
+ 	if (found_id)
+ 		return 1;
+ 
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -937,6 +937,7 @@
+  *		function returns zero when the driver chooses to
+  *		take "ownership" of the device or an error code
+  *		(negative number) otherwise.
++ *		The pci_device_id parameter is only valid during probe.
+  *		The probe function always gets called from process
+  *		context, so it can sleep.
+  * @remove:	The remove() function gets called whenever a device

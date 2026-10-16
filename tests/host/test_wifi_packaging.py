@@ -1,5 +1,6 @@
 import configparser
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -21,8 +22,20 @@ class WifiPackagingTest(unittest.TestCase):
                 body = body.replace("${" + key + "}", str(value))
             result = subprocess.run(["bash", "-eu", "-c", body], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+            modprobe_config = root / "etc/modprobe.d/rpi5-wifi.conf"
+            self.assertTrue(modprobe_config.is_file(),
+                            "Firmware WPA offload workaround is missing from the package")
+            result = subprocess.run(
+                [shutil.which("modprobe") or "/usr/sbin/modprobe", "--showconfig",
+                 "--config", str(modprobe_config)], capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            options = [line.split()[2:] for line in result.stdout.splitlines()
+                       if line.startswith("options brcmfmac ")]
+            self.assertEqual(options, [["feature_disable=0x2000"]])
             self.assertEqual({str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()},
-                             {"etc/systemd/network/25-wireless.network",
+                             {"etc/modprobe.d/rpi5-wifi.conf",
+                              "etc/systemd/network/25-wireless.network",
                               "usr/lib/systemd/system/rpi5-wifi.service"})
             network = configparser.ConfigParser()
             network.read(root / "etc/systemd/network/25-wireless.network")

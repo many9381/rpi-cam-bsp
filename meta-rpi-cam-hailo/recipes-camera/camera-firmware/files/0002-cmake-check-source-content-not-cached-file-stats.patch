@@ -1,0 +1,33 @@
+From: Camera Firmware Integration <noreply@example.invalid>
+Subject: [PATCH] cmake: compare dependency contents after license collection
+
+Yocto hardlinks dependency license files when collecting licenses. This changes
+their ctime without changing their contents. Git diff-files reports the stale
+index stat entries as modifications, rejecting otherwise clean pinned sources.
+
+Use git diff to compare actual worktree contents. Keep the exact commit, tree
+and staged-content checks, and continue rejecting modified tracked files.
+
+Upstream-Status: Pending
+
+diff --git a/cmake/Dependencies.cmake b/cmake/Dependencies.cmake
+--- a/cmake/Dependencies.cmake
++++ b/cmake/Dependencies.cmake
+@@ -100,7 +100,7 @@
+   endif()
+   execute_process(
+       COMMAND "${GIT_EXECUTABLE}" -C "${_cf_drogon_source}"
+-              diff-files --quiet --ignore-submodules=all --
++              diff --quiet --ignore-submodules=all --
+       RESULT_VARIABLE _cf_drogon_worktree_result)
+   execute_process(
+       COMMAND "${GIT_EXECUTABLE}" -C "${_cf_drogon_source}"
+@@ -144,7 +144,7 @@
+   endif()
+   execute_process(
+       COMMAND "${GIT_EXECUTABLE}" -C "${_cf_trantor_source}"
+-              diff-files --quiet --
++              diff --quiet --
+       RESULT_VARIABLE _cf_trantor_worktree_result)
+   execute_process(
+       COMMAND "${GIT_EXECUTABLE}" -C "${_cf_trantor_source}"

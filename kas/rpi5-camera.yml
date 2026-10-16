@@ -8,19 +8,39 @@ target: rpi5-camera-image
 # Optional private/local Git transport; source revision remains recipe-pinned.
 env:
   CAMERA_FIRMWARE_GIT_URI: null
+  CAMERA_FIRMWARE_MODEL_DIR: null
+  RPI_CAM_HAILO_DEV_REPO: null
 
 repos:
+  meta-rpi5-cam:
+    layers:
+      meta-rpi-cam-hailo:
   meta-openembedded:
     layers:
       meta-oe:
       meta-python:
       meta-multimedia:
+      meta-networking:
 
 local_conf_header:
   rpi5-camera: |
+    INHERIT += "codex-latest"
+    # Preserve recipe CVE/backport annotations for current out-of-build scans.
+    SPDX_INCLUDE_VEX = "all"
+    # Set to 0 to omit the editable Git checkout from both camera images.
+    RPI_CAM_HAILO_DEV_REPO ?= "1"
     hostname:pn-base-files = "rpi5-camera"
-    RASPBERRYPI_CAMERA_V3 = "1"
+    # The BSP's explicit imx708 overlay defaults to CAM/DISP1. Let the Pi 5
+    # firmware detect the official Camera Module 3 on either connector.
+    RASPBERRYPI_CAMERA_V3 = "0"
+    RPI_EXTRA_CONFIG:append = "\ncamera_auto_detect=1\n"
+    # Firmware and camera tools must share the Raspberry Pi FFmpeg libraries.
+    PREFERRED_PROVIDER_ffmpeg = "rpidistro-ffmpeg"
+    PREFERRED_PROVIDER_libav = "rpidistro-ffmpeg"
+    PREFERRED_RPROVIDER_ffmpeg = "rpidistro-ffmpeg"
     PACKAGECONFIG:append:pn-libcamera-apps = " libav"
     PACKAGECONFIG:append:pn-rpidistro-ffmpeg = " x264"
+    # Keep libx264 encoding; its CLI demuxer would depend back on FFmpeg.
+    PACKAGECONFIG:remove:pn-x264 = "ffmpeg"
     PACKAGECONFIG:append:pn-gstreamer1.0-plugins-bad = " srtp"
     LICENSE_FLAGS_ACCEPTED += " commercial"

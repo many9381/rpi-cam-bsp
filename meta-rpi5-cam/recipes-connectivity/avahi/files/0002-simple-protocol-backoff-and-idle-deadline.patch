@@ -1,0 +1,195 @@
+From: Camera firmware maintainers
+Subject: [PATCH] simple-protocol: back off resource failures and expire idle handshakes
+
+Preallocate a disabled retry timer and pause listener polling for one second
+on descriptor/memory exhaustion or a full client pool. Expire connections
+that have not submitted their first complete command within five seconds;
+partial input cannot extend the deadline. Preserve active queries and
+long-lived DNS browser semantics. Clean up both timers on shutdown/failure.
+
+Related candidate: CVE-2025-59529 (additional availability mitigation).
+Active clients can still hold the bounded pool; this does not claim complete
+fairness against a malicious client with valid long-lived browse requests.
+Upstream-Status: Inappropriate [local availability hardening]
+Reference: https://github.com/avahi/avahi/security/advisories/GHSA-73wf-3xmj-x82q
+
+--- a/avahi-daemon/simple-protocol.c
++++ b/avahi-daemon/simple-protocol.c
+@@ -35,6 +35,7 @@
+ #include <avahi-common/llist.h>
+ #include <avahi-common/malloc.h>
+ #include <avahi-common/error.h>
++#include <avahi-common/timeval.h>
+ 
+ #include <avahi-core/log.h>
+ #include <avahi-core/lookup.h>
+@@ -58,6 +59,8 @@
+ #define BUFFER_SIZE (20*1024)
+ 
+ #define CLIENTS_MAX 50
++#define ACCEPT_BACKOFF_MSEC 1000
++#define INITIAL_REQUEST_MSEC 5000
+ 
+ typedef struct Client Client;
+ typedef struct Server Server;
+@@ -77,6 +80,7 @@
+ 
+     int fd;
+     AvahiWatch *watch;
++    AvahiTimeout *request_timeout;
+ 
+     char inbuf[BUFFER_SIZE], outbuf[BUFFER_SIZE];
+     size_t inbuf_length, outbuf_length;
+@@ -94,6 +98,7 @@
+     const AvahiPoll *poll_api;
+     int fd;
+     AvahiWatch *watch;
++    AvahiTimeout *accept_timeout;
+     AVAHI_LLIST_HEAD(Client, clients);
+ 
+     unsigned n_clients;
+@@ -119,6 +124,9 @@
+     if (c->dns_server_browser)
+         avahi_s_dns_server_browser_free(c->dns_server_browser);
+ 
++    if (c->request_timeout)
++        c->server->poll_api->timeout_free(c->request_timeout);
++
+     c->server->poll_api->watch_free(c->watch);
+     close(c->fd);
+ 
+@@ -126,8 +134,17 @@
+     avahi_free(c);
+ }
+ 
++static void client_request_expired(AvahiTimeout *timeout, void *userdata) {
++    Client *c = userdata;
++
++    c->server->poll_api->timeout_update(timeout, NULL);
++    if (c->state == CLIENT_IDLE)
++        client_free(c);
++}
++
+ static void client_new(Server *s, int fd) {
+     Client *c;
++    struct timeval tv;
+ 
+     assert(fd >= 0);
+ 
+@@ -135,6 +152,7 @@
+     c->server = s;
+     c->fd = fd;
+     c->state = CLIENT_IDLE;
++    c->request_timeout = NULL;
+ 
+     c->inbuf_length = c->outbuf_length = 0;
+ 
+@@ -143,6 +161,23 @@
+     c->dns_server_browser = NULL;
+ 
+     c->watch = s->poll_api->watch_new(s->poll_api, fd, AVAHI_WATCH_IN, client_work, c);
++    if (!c->watch) {
++        close(fd);
++        avahi_free(c);
++        return;
++    }
++
++    /* An incomplete first request must not hold a slot indefinitely.
++     * Active resolvers and long-lived browsers are not timed out. */
++    avahi_elapse_time(&tv, INITIAL_REQUEST_MSEC, 0);
++    c->request_timeout = s->poll_api->timeout_new(s->poll_api, &tv, client_request_expired, c);
++    if (!c->request_timeout) {
++        s->poll_api->watch_free(c->watch);
++        close(fd);
++        avahi_free(c);
++        return;
++    }
++
+ 
+     AVAHI_LLIST_PREPEND(Client, clients, s->clients, c);
+     s->n_clients++;
+@@ -272,6 +307,8 @@
+ 
+     if (c->state != CLIENT_IDLE)
+         return;
++
++    c->server->poll_api->timeout_update(c->request_timeout, NULL);
+ 
+     if ((n_args = sscanf(s, "%63s %63s", cmd, arg)) < 1 ) {
+         client_output_printf(c, "%+i Failed to parse command, try \"HELP\".\n", AVAHI_ERR_INVALID_OPERATION);
+@@ -435,6 +472,21 @@
+         (c->inbuf_length < sizeof(c->inbuf) ? AVAHI_WATCH_IN : 0));
+ }
+ 
++static void accept_resume(AvahiTimeout *timeout, void *userdata) {
++    Server *s = userdata;
++
++    s->poll_api->timeout_update(timeout, NULL);
++    s->poll_api->watch_update(s->watch, AVAHI_WATCH_IN);
++}
++
++static void accept_backoff(Server *s) {
++    struct timeval tv;
++
++    s->poll_api->watch_update(s->watch, 0);
++    avahi_elapse_time(&tv, ACCEPT_BACKOFF_MSEC, 0);
++    s->poll_api->timeout_update(s->accept_timeout, &tv);
++}
++
+ static void server_work(AVAHI_GCC_UNUSED AvahiWatch *watch, int fd, AvahiWatchEvent events, void *userdata) {
+     Server *s = userdata;
+ 
+@@ -444,12 +496,16 @@
+         int cfd;
+ 
+         if ((cfd = accept(fd, NULL, NULL)) < 0) {
+-            /* Do not let descriptor exhaustion flood the error log. */
+-            if (errno != EMFILE && errno != ENFILE)
++            /* Readability persists after resource exhaustion: remove the
++             * listener from polling until a bounded retry is due. */
++            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM)
++                accept_backoff(s);
++            else if (errno != EINTR && errno != EAGAIN)
+                 avahi_log_error("accept(): %s", strerror(errno));
+-        } else if (s->n_clients >= CLIENTS_MAX)
++        } else if (s->n_clients >= CLIENTS_MAX) {
+             close(cfd);
+-        else
++            accept_backoff(s);
++        } else
+             client_new(s, cfd);
+     }
+ }
+@@ -468,6 +524,7 @@
+     server->n_clients = 0;
+     AVAHI_LLIST_HEAD_INIT(Client, server->clients);
+     server->watch = NULL;
++    server->accept_timeout = NULL;
+ 
+     u = umask(0000);
+ 
+@@ -525,6 +582,14 @@
+     umask(u);
+ 
+     server->watch = poll_api->watch_new(poll_api, server->fd, AVAHI_WATCH_IN, server_work, server);
++    if (!server->watch)
++        goto fail;
++
++    /* Allocate once so an exhausted process needs no allocation to retry. */
++    server->accept_timeout = poll_api->timeout_new(poll_api, NULL, accept_resume, server);
++    if (!server->accept_timeout)
++        goto fail;
++
+ 
+     return 0;
+ 
+@@ -550,6 +615,9 @@
+         while (server->clients)
+             client_free(server->clients);
+ 
++        if (server->accept_timeout)
++            server->poll_api->timeout_free(server->accept_timeout);
++
+         if (server->watch)
+             server->poll_api->watch_free(server->watch);
+ 

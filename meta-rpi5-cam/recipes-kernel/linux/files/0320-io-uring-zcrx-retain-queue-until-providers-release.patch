@@ -1,0 +1,201 @@
+From: Kernel maintenance <maintenance@localhost>
+Subject: [PATCH] io_uring: retain ZCRX queue until every provider releases it
+
+Adapt the complete ownership/caller contract to the retained 6.18 APIs.
+Use a separate spinlock for final netdev ownership publication: mutex_unlock
+may still access its embedded storage after ownership becomes available.
+Keep area mapping under pp_lock and finish all uninstall accesses before
+releasing netdev_lock. Admit provider initialization only with a live ctx
+reference; balance it on mapping failure to avoid reviving completed shutdown.
+
+CVE: CVE-2026-43174
+Upstream-Status: Backport [https://git.kernel.org/stable/c/18afaff077b46655a8eb6fd7f6de1b81327be577]
+
+--- a/io_uring/zcrx.c
++++ b/io_uring/zcrx.c
+@@ -326,6 +326,8 @@
+ 
+ static const struct memory_provider_ops io_uring_pp_zc_ops;
+ 
++static void io_zcrx_scrub(struct io_zcrx_ifq *ifq);
++
+ static inline atomic_t *io_get_user_counter(struct net_iov *niov)
+ {
+ 	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
+@@ -483,16 +485,18 @@
+ 	if (!ifq)
+ 		return NULL;
+ 
++	refcount_set(&ifq->refs, 1);
+ 	ifq->if_rxq = -1;
+ 	ifq->ctx = ctx;
+ 	spin_lock_init(&ifq->rq_lock);
+ 	mutex_init(&ifq->pp_lock);
++	spin_lock_init(&ifq->netdev_lock);
+ 	return ifq;
+ }
+ 
+ static void io_zcrx_drop_netdev(struct io_zcrx_ifq *ifq)
+ {
+-	guard(mutex)(&ifq->pp_lock);
++	guard(spinlock_bh)(&ifq->netdev_lock);
+ 
+ 	if (!ifq->netdev)
+ 		return;
+@@ -509,17 +513,15 @@
+ 		.mp_priv = ifq,
+ 	};
+ 
+-	if (ifq->if_rxq == -1)
+-		return;
+-
+-	scoped_guard(mutex, &ifq->pp_lock) {
++	scoped_guard(spinlock_bh, &ifq->netdev_lock) {
+ 		netdev = ifq->netdev;
+ 		netdev_tracker = ifq->netdev_tracker;
+ 		ifq->netdev = NULL;
+ 	}
+ 
+ 	if (netdev) {
+-		net_mp_close_rxq(netdev, ifq->if_rxq, &p);
++		if (ifq->if_rxq != -1)
++			net_mp_close_rxq(netdev, ifq->if_rxq, &p);
+ 		netdev_put(netdev, &netdev_tracker);
+ 	}
+ 	ifq->if_rxq = -1;
+@@ -527,8 +529,6 @@
+ 
+ static void io_zcrx_ifq_free(struct io_zcrx_ifq *ifq)
+ {
+-	io_close_queue(ifq);
+-
+ 	if (ifq->area)
+ 		io_zcrx_free_area(ifq->area);
+ 	if (ifq->dev)
+@@ -537,6 +537,20 @@
+ 	io_free_rbuf_ring(ifq);
+ 	mutex_destroy(&ifq->pp_lock);
+ 	kfree(ifq);
++}
++
++/* The provider holds ctx independently until after final ifq cleanup. */
++static void io_zcrx_ifq_put(struct io_zcrx_ifq *ifq)
++{
++	if (refcount_dec_and_test(&ifq->refs))
++		io_zcrx_ifq_free(ifq);
++}
++
++static void zcrx_unregister(struct io_zcrx_ifq *ifq)
++{
++	io_zcrx_scrub(ifq);
++	io_close_queue(ifq);
++	io_zcrx_ifq_put(ifq);
+ }
+ 
+ struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
+@@ -650,13 +664,13 @@
+ 	}
+ 	return 0;
+ netdev_put_unlock:
+-	netdev_put(ifq->netdev, &ifq->netdev_tracker);
++	/* io_close_queue() owns the explicit tracker hold on every path. */
+ 	netdev_unlock(ifq->netdev);
+ err:
+ 	scoped_guard(mutex, &ctx->mmap_lock)
+ 		xa_erase(&ctx->zcrx_ctxs, id);
+ ifq_free:
+-	io_zcrx_ifq_free(ifq);
++	zcrx_unregister(ifq);
+ 	return ret;
+ }
+ 
+@@ -676,7 +690,7 @@
+ 		}
+ 		if (!ifq)
+ 			break;
+-		io_zcrx_ifq_free(ifq);
++		zcrx_unregister(ifq);
+ 	}
+ 
+ 	xa_destroy(&ctx->zcrx_ctxs);
+@@ -890,19 +904,27 @@
+ 	if (pp->p.dma_dir != DMA_FROM_DEVICE)
+ 		return -EOPNOTSUPP;
+ 
++	/* A restarted queue must not resurrect a completed ring shutdown. */
++	if (!percpu_ref_tryget_live(&ifq->ctx->refs))
++		return -ENXIO;
++
+ 	ret = io_zcrx_map_area(ifq, ifq->area);
+-	if (ret)
++	if (ret) {
++		percpu_ref_put(&ifq->ctx->refs);
+ 		return ret;
+-
+-	percpu_ref_get(&ifq->ctx->refs);
++	}
++
++	refcount_inc(&ifq->refs);
+ 	return 0;
+ }
+ 
+ static void io_pp_zc_destroy(struct page_pool *pp)
+ {
+ 	struct io_zcrx_ifq *ifq = io_pp_to_ifq(pp);
+-
+-	percpu_ref_put(&ifq->ctx->refs);
++	struct io_ring_ctx *ctx = ifq->ctx;
++
++	io_zcrx_ifq_put(ifq);
++	percpu_ref_put(&ctx->refs);
+ }
+ 
+ static int io_pp_nl_fill(void *mp_priv, struct sk_buff *rsp,
+@@ -925,12 +947,14 @@
+ 	struct pp_memory_provider_params *p = &rxq->mp_params;
+ 	struct io_zcrx_ifq *ifq = mp_priv;
+ 
+-	io_zcrx_drop_netdev(ifq);
+ 	if (ifq->area)
+ 		io_zcrx_unmap_area(ifq, ifq->area);
+ 
+ 	p->mp_ops = NULL;
+ 	p->mp_priv = NULL;
++
++	/* NULL netdev must imply that uninstall has finished using ifq. */
++	io_zcrx_drop_netdev(ifq);
+ }
+ 
+ static const struct memory_provider_ops io_uring_pp_zc_ops = {
+--- a/io_uring/zcrx.h
++++ b/io_uring/zcrx.h
+@@ -5,6 +5,7 @@
+ #include <linux/io_uring_types.h>
+ #include <linux/dma-buf.h>
+ #include <linux/socket.h>
++#include <linux/refcount.h>
+ #include <net/page_pool/types.h>
+ #include <net/net_trackers.h>
+ 
+@@ -39,6 +40,8 @@
+ };
+ 
+ struct io_zcrx_ifq {
++	/* Registration owner plus every successfully initialized page pool. */
++	refcount_t			refs;
+ 	struct io_ring_ctx		*ctx;
+ 	struct io_zcrx_area		*area;
+ 	unsigned			niov_shift;
+@@ -53,9 +56,11 @@
+ 	struct device			*dev;
+ 	struct net_device		*netdev;
+ 	netdevice_tracker		netdev_tracker;
++	/* Final netdev publication must not outlive an unlock operation. */
++	spinlock_t			netdev_lock;
+ 
+ 	/*
+-	 * Page pool and net configuration lock, can be taken deeper in the
++	 * Page pool mapping lock, can be taken deeper in the
+ 	 * net stack.
+ 	 */
+ 	struct mutex			pp_lock;

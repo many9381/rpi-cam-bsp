@@ -1,0 +1,25 @@
+From: Raspberry Pi camera firmware maintainers
+Subject: [PATCH] avutil/drm: let the device callback own failure cleanup
+
+Pi's rpi_29 patch registers drm_device_free before opening the device. When
+drmGetVersion fails, av_hwdevice_ctx_create unreferences the device context
+and invokes that callback. Closing the descriptor here as well can close
+an unrelated descriptor reused by another thread between the two calls.
+Leave the single close to the already registered cleanup callback.
+
+Upstream-Status: Pending
+---
+ libavutil/hwcontext_drm.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/libavutil/hwcontext_drm.c b/libavutil/hwcontext_drm.c
+--- a/libavutil/hwcontext_drm.c
++++ b/libavutil/hwcontext_drm.c
+@@ -135,7 +135,6 @@ static int drm_device_create(AVHWDeviceContext *hwdev, const char *device,
+     if (!version) {
+         av_log(hwdev, AV_LOG_ERROR, "Failed to get version information "
+                "from %s: probably not a DRM device?\n", device);
+-        close(hwctx->fd);
+         return AVERROR(EINVAL);
+     }
+ 

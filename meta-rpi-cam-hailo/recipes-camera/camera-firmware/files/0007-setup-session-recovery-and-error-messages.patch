@@ -1,0 +1,468 @@
+From: Firmware Maintainers <firmware@example.invalid>
+Subject: [PATCH] web: recover expired initial setup sessions and explain failures
+
+Refresh bootstrap state and credentials after a rejected setup session, return
+operators to login, and retain phase reconciliation when setup has advanced.
+Use allowlisted localized messages instead of blaming credentials for every
+failure. Cover expiry, failed refresh, clock steps and safe public errors.
+
+Upstream-Status: Pending
+
+diff --git a/tests/unit/security/AuthServiceTest.cpp b/tests/unit/security/AuthServiceTest.cpp
+--- a/tests/unit/security/AuthServiceTest.cpp
++++ b/tests/unit/security/AuthServiceTest.cpp
+@@ -801,6 +801,36 @@
+             1);
+ }
+ 
++TEST_F(AuthServiceTest, InitialSetupCanSignInAgainAfterIdleExpiryOrForwardClockStep) {
++  service_.reset();
++  // Characterize the existing wall-clock policy: both ordinary inactivity and
++  // a first-boot NTP correction can invalidate an initial-account session.
++  for (const auto elapsed : {600, 19 * 60}) {
++    SCOPED_TRACE(elapsed);
++    auto service = OpenDefaultStateService();
++    auto first = service->Login(Login("InitialAccount", "NorthStar!9", "192.0.2.55"));
++    ASSERT_TRUE(first.ok()) << first.error().message;
++    const auto old_token = std::span<const unsigned char>(
++        first.value().session_token.data(), first.value().session_token.size());
++    service->WaitForSessionExpiryIdleForTesting();
++    now_seconds_ += elapsed;
++
++    auto expired = service->Verify(old_token, "192.0.2.55", ManagementActivity::kNone);
++    ASSERT_FALSE(expired.ok());
++    EXPECT_EQ(expired.error().code, "E_AUTHENTICATION_FAILED");
++    EXPECT_EQ(default_store_->State().value(), DeviceState::kDefault);
++
++    auto next = service->Login(Login("InitialAccount", "NorthStar!9", "192.0.2.55"));
++    ASSERT_TRUE(next.ok()) << next.error().message;
++    auto principal = service->Verify(
++        {next.value().session_token.data(), next.value().session_token.size()},
++        "192.0.2.55", ManagementActivity::kNone);
++    ASSERT_TRUE(principal.ok()) << principal.error().message;
++    EXPECT_EQ(principal.value().username, "InitialAccount");
++    EXPECT_FALSE(service->Verify(old_token, "192.0.2.55", ManagementActivity::kNone).ok());
++  }
++}
++
+ TEST_F(AuthServiceTest, DefaultStateAdmitsOnlyTheMintedInitialAccount) {
+   auto service = OpenDefaultStateService();
+   // A second row cannot reach `users` in default state through any supported
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -141,10 +141,20 @@
+   // established. /api/v1/setup/initialize requires that session now — see
+   // SetupWizard.tsx.
+   const [wizardActive, setWizardActive] = useState(false);
++  const [setupSessionEnded, setSetupSessionEnded] = useState(false);
+ 
+   const reconcilePhase = async (
+     expected: Extract<SetupStatus, { required: true }>['phase'],
++    error?: unknown,
+   ): Promise<boolean> => {
++    const sessionEnded = expected === 'administrator' && error instanceof UnauthorizedError;
++    if (sessionEnded) {
++      // Unmount the rejected wizard and fetch current bootstrap credentials:
++      // the service may have restarted and replaced the initial account.
++      setWizardActive(false);
++      setSetupSessionEnded(true);
++      setState({ kind: 'checking' });
++    }
+     const controller = new AbortController();
+     let timeoutId: number | undefined;
+     const timeout = new Promise<null>((resolve) => {
+@@ -164,18 +174,20 @@
+         timeout,
+       ]);
+       if (status === null) {
+-        return false;
++        if (sessionEnded) setState({ kind: 'unavailable' });
++        return sessionEnded;
+       }
+       if (status.required && status.phase === expected) {
+         setState({ kind: 'required', status });
+-        return false;
++        return sessionEnded;
+       }
+       setState(status.required
+         ? { kind: 'required', status }
+         : { kind: 'operational' });
+       return true;
+     } catch {
+-      return false;
++      if (sessionEnded) setState({ kind: 'unavailable' });
++      return sessionEnded;
+     } finally {
+       window.clearTimeout(timeoutId);
+     }
+@@ -238,6 +250,7 @@
+       { username, password },
+       parseLoginResult,
+     );
++    setSetupSessionEnded(false);
+     setWizardActive(true);
+   }, [client]);
+ 
+@@ -276,7 +289,7 @@
+             setWizardActive(false);
+             setAttempt((value) => value + 1);
+           }}
+-          onInitializationFailed={() => reconcilePhase('administrator')}
++          onInitializationFailed={(error) => reconcilePhase('administrator', error)}
+         />
+       );
+     }
+@@ -288,7 +301,11 @@
+         }
+       : null;
+     return (
+-      <LoginPage login={bootstrapLogin} initialCredential={initialCredential} />
++      <LoginPage
++        login={bootstrapLogin}
++        initialCredential={initialCredential}
++        notice={setupSessionEnded ? t('setup.sessionEnded') : undefined}
++      />
+     );
+   }
+   return operationalChild ?? (
+diff --git a/web/src/i18n/messages/en.ts b/web/src/i18n/messages/en.ts
+--- a/web/src/i18n/messages/en.ts
++++ b/web/src/i18n/messages/en.ts
+@@ -178,7 +178,14 @@
+   },
+   setup: {
+     initializationFailed:
+-      'Camera initialization failed. Check the credentials and try again.',
++      'Unable to confirm camera initialization. Check the connection to the camera and try again.',
++    sessionEnded:
++      'Your initial setup session has ended. Sign in again with the initial account shown below, then enter your administrator details again.',
++    serviceUnavailable:
++      'The camera service could not complete setup. Wait a moment and try again.',
++    rateLimited: 'Too many requests. Wait a moment and try again.',
++    requestInvalid: 'The setup request was rejected. Review your entries and try again.',
++    peerChanged: 'Your connection address changed. Review your settings and try again.',
+     createAdministratorHeading: 'Create administrator',
+     stepAccountProgress: 'Step 1 of 3 · Account',
+     resolveRequirements: 'Resolve the password requirements listed below.',
+diff --git a/web/src/i18n/messages/ko.ts b/web/src/i18n/messages/ko.ts
+--- a/web/src/i18n/messages/ko.ts
++++ b/web/src/i18n/messages/ko.ts
+@@ -179,7 +179,14 @@
+   },
+   setup: {
+     initializationFailed:
+-      '카메라 초기화에 실패했습니다. 자격 증명을 확인한 후 다시 시도하세요.',
++      '카메라 초기화 결과를 확인하지 못했습니다. 카메라 연결 상태를 확인한 후 다시 시도하세요.',
++    sessionEnded:
++      '초기 설정 로그인 세션이 종료되었습니다. 아래에 표시된 초기 계정으로 다시 로그인한 뒤 관리자 정보를 다시 입력하세요.',
++    serviceUnavailable:
++      '카메라 서비스가 초기 설정을 완료하지 못했습니다. 잠시 후 다시 시도하세요.',
++    rateLimited: '요청이 너무 많습니다. 잠시 후 다시 시도하세요.',
++    requestInvalid: '초기 설정 요청이 거부되었습니다. 입력 내용을 확인한 후 다시 시도하세요.',
++    peerChanged: '접속 주소가 변경되었습니다. 설정 내용을 확인한 후 다시 시도하세요.',
+     createAdministratorHeading: '관리자 계정 생성',
+     stepAccountProgress: '3단계 중 1단계 · 계정',
+     resolveRequirements: '아래에 나열된 비밀번호 요구 사항을 해결하세요.',
+diff --git a/web/src/pages/LoginPage.tsx b/web/src/pages/LoginPage.tsx
+--- a/web/src/pages/LoginPage.tsx
++++ b/web/src/pages/LoginPage.tsx
+@@ -12,9 +12,10 @@
+ interface LoginPageProps {
+   login(username: string, password: string): Promise<void>;
+   initialCredential?: InitialCredential | null;
++  notice?: string;
+ }
+ 
+-export function LoginPage({ login, initialCredential = null }: LoginPageProps) {
++export function LoginPage({ login, initialCredential = null, notice }: LoginPageProps) {
+   const { t } = useTranslation();
+   const [username, setUsername] = useState('');
+   const [password, setPassword] = useState('');
+@@ -43,6 +44,7 @@
+       <section className="auth-panel" aria-labelledby="login-heading">
+         <div className="brand-mark" aria-hidden="true">{t('common.brandShort')}</div>
+         <h1 id="login-heading">{t('auth.loginHeading')}</h1>
++        {notice && <p role="status">{notice}</p>}
+         <form className="auth-form" onSubmit={submit} noValidate>
+           <div className="field">
+             <label htmlFor="login-username">{t('common.username')}</label>
+diff --git a/web/src/pages/setup/SetupSessionRecovery.test.tsx b/web/src/pages/setup/SetupSessionRecovery.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/web/src/pages/setup/SetupSessionRecovery.test.tsx
+@@ -0,0 +1,187 @@
++import '@testing-library/jest-dom/vitest';
++
++import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++import { MemoryRouter } from 'react-router-dom';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import { ApiClient } from '../../api/client';
++import { BootstrapGate } from '../../App';
++import { LanguageProvider } from '../../i18n';
++import { SetupWizard } from './SetupWizard';
++
++const initialStatus = {
++  required: true, phase: 'administrator', tls: 'ready', peer_ip: '192.0.2.10',
++  initial_username: 'setup.old', initial_password: 'OldInitial!9',
++};
++const freshStatus = {
++  ...initialStatus, initial_username: 'setup.new', initial_password: 'NewInitial!9',
++};
++const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
++  status, headers: { 'Content-Type': 'application/json' },
++});
++
++afterEach(() => {
++  cleanup();
++  localStorage.removeItem('cf.lang');
++  vi.useRealTimers();
++});
++
++async function review(user: ReturnType<typeof userEvent.setup>) {
++  await user.type(await screen.findByLabelText(/^username$/i), 'operator.one');
++  await user.type(screen.getByLabelText(/^password$/i), 'NorthStar!9');
++  await user.type(screen.getByLabelText(/confirm password/i), 'NorthStar!9');
++  await user.click(screen.getByRole('button', { name: /^next$/i }));
++  await user.click(screen.getByRole('button', { name: /^next$/i }));
++}
++
++function expiredSessionCamera(
++  refresh: 'ready' | 'offline' | 'timeout' | 'completed' = 'ready',
++  rejection = 'E_AUTHENTICATION_REQUIRED',
++) {
++  let session = true;
++  let expired = false;
++  let statusReads = 0;
++  let initializeRequests = 0;
++  let refreshMode = refresh;
++  const client = new ApiClient(async (input) => {
++    const path = String(input);
++    if (path === '/api/v1/setup/status') {
++      ++statusReads;
++      if (!expired) return json(initialStatus);
++      if (refreshMode === 'offline') throw new TypeError('Private transport details');
++      if (refreshMode === 'timeout') return new Promise<Response>(() => {});
++      if (refreshMode === 'completed') return json({ required: false });
++      return json(freshStatus);
++    }
++    if (path === '/api/v1/auth/me') {
++      return session
++        ? json({ username: 'setup.old', role: 'viewer' })
++        : json({ code: 'E_AUTHENTICATION_REQUIRED' }, 401);
++    }
++    if (path === '/api/v1/auth/login') {
++      session = true;
++      return json({ role: 'viewer', idle_expires_at_seconds: 1720000700 });
++    }
++    if (path === '/api/v1/setup/initialize') {
++      ++initializeRequests;
++      expired = true;
++      session = false;
++      return json({ code: rejection }, 401);
++    }
++    throw new Error(`Unexpected test request: ${path}`);
++  });
++  render(<LanguageProvider><MemoryRouter>
++    <BootstrapGate client={client} operationalChild={<p>Operational camera</p>} />
++  </MemoryRouter></LanguageProvider>);
++  return {
++    restoreNetwork: () => { refreshMode = 'ready'; },
++    statusReads: () => statusReads,
++    initializeRequests: () => initializeRequests,
++  };
++}
++
++describe('Initial setup session recovery', () => {
++  it.each(['E_AUTHENTICATION_REQUIRED', 'E_AUTHENTICATION_FAILED'])(
++    'returns a rejected setup session (%s) to login with refreshed initial credentials', async (code) => {
++    const user = userEvent.setup();
++    const camera = expiredSessionCamera('ready', code);
++    await review(user);
++    await user.click(screen.getByRole('button', { name: /complete setup/i }));
++
++    expect(await screen.findByRole('heading', { name: 'Camera login' })).toBeVisible();
++    expect(screen.getByRole('status')).toHaveTextContent('Your initial setup session has ended');
++    expect(screen.getByText('setup.new')).toBeVisible();
++    expect(screen.getByText('NewInitial!9')).toBeVisible();
++    expect(screen.queryByText('OldInitial!9')).not.toBeInTheDocument();
++    expect(screen.getByLabelText(/^password$/i)).toHaveValue('');
++    expect(camera.statusReads()).toBe(2);
++    expect(camera.initializeRequests()).toBe(1);
++
++    await user.type(screen.getByLabelText(/^username$/i), 'setup.new');
++    await user.type(screen.getByLabelText(/^password$/i), 'NewInitial!9');
++    await user.click(screen.getByRole('button', { name: /^sign in$/i }));
++    expect(await screen.findByRole('heading', { name: 'Create administrator' })).toBeVisible();
++    expect(screen.getByLabelText(/^password$/i)).toHaveValue('');
++    expect(screen.queryByRole('status')).not.toBeInTheDocument();
++    expect(camera.initializeRequests()).toBe(1);
++  });
++
++  it('offers a retry if fresh initial credentials cannot be fetched', async () => {
++    const user = userEvent.setup();
++    const camera = expiredSessionCamera('offline');
++    await review(user);
++    await user.click(screen.getByRole('button', { name: /complete setup/i }));
++    const retry = await screen.findByRole('button', { name: /^retry$/i });
++    expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
++    expect(screen.queryByText('OldInitial!9')).not.toBeInTheDocument();
++    camera.restoreNetwork();
++    await user.click(retry);
++    expect(await screen.findByRole('heading', { name: 'Camera login' })).toBeVisible();
++    expect(screen.getByText('NewInitial!9')).toBeVisible();
++    expect(screen.getByRole('status')).toHaveTextContent('Your initial setup session has ended');
++    expect(camera.initializeRequests()).toBe(1);
++  });
++
++  it('bounds the credential refresh wait after session rejection', async () => {
++    const user = userEvent.setup();
++    expiredSessionCamera('timeout');
++    await review(user);
++    vi.useFakeTimers();
++    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /complete setup/i })); });
++    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
++    expect(screen.getByRole('button', { name: /^retry$/i })).toBeVisible();
++    expect(screen.queryByRole('heading', { name: 'Create administrator' })).not.toBeInTheDocument();
++  });
++
++  it('honors completed setup even when the old setup session is rejected', async () => {
++    const user = userEvent.setup();
++    expiredSessionCamera('completed');
++    await review(user);
++    await user.click(screen.getByRole('button', { name: /complete setup/i }));
++    expect(await screen.findByText('Operational camera')).toBeVisible();
++    expect(screen.queryByRole('heading', { name: 'Camera login' })).not.toBeInTheDocument();
++  });
++});
++
++describe('Public setup failures', () => {
++  it.each([
++    [400, 'E_USERNAME_RESERVED', 'This username is reserved.'],
++    [400, 'E_PASSWORD_LENGTH', 'Enter a password with the required length.'],
++    [403, 'E_REQUEST_ORIGIN', 'The request origin or camera address was rejected.'],
++    [503, 'E_INTERNAL', 'The camera service could not complete setup.'],
++    [429, 'E_RATE_LIMITED', 'Too many requests.'],
++    [400, 'E_BOOTSTRAP_PEER', 'Your connection address changed.'],
++    [400, '__proto__', 'The setup request was rejected.'],
++    [0, '', 'Unable to confirm camera initialization.'],
++  ])('shows safe guidance for HTTP %i / %s', async (status, code, message) => {
++    const user = userEvent.setup();
++    const client = new ApiClient(async () => {
++      if (status === 0) throw new TypeError('secret internal connection detail');
++      return json({ code, message: 'secret internal connection detail' }, status);
++    });
++    render(<LanguageProvider><SetupWizard client={client} peerIp="192.0.2.10" onInitialized={() => {}} /></LanguageProvider>);
++    await review(user);
++    await user.click(screen.getByRole('button', { name: /complete setup/i }));
++    expect(await screen.findByRole('alert')).toHaveTextContent(message);
++    expect(screen.queryByText(/secret internal connection detail/)).not.toBeInTheDocument();
++    expect(screen.getByLabelText(/^username$/i)).toHaveValue('operator.one');
++    expect(screen.getByLabelText(/^password$/i)).toHaveValue('');
++    expect(screen.getByLabelText(/confirm password/i)).toHaveValue('');
++  });
++
++  it('explains a service failure in Korean without blaming the password', async () => {
++    localStorage.setItem('cf.lang', 'ko');
++    const user = userEvent.setup();
++    const client = new ApiClient(async () => json({ code: 'E_SECURITY_UNAVAILABLE' }, 503));
++    render(<LanguageProvider><SetupWizard client={client} peerIp="192.0.2.10" onInitialized={() => {}} /></LanguageProvider>);
++    await user.type(screen.getByLabelText('사용자 이름'), 'operator.one');
++    await user.type(screen.getByLabelText('비밀번호'), 'NorthStar!9');
++    await user.type(screen.getByLabelText('비밀번호 확인'), 'NorthStar!9');
++    await user.click(screen.getByRole('button', { name: '다음' }));
++    await user.click(screen.getByRole('button', { name: '다음' }));
++    await user.click(screen.getByRole('button', { name: '설정 완료' }));
++    expect(await screen.findByRole('alert')).toHaveTextContent('카메라 서비스가 초기 설정을 완료하지 못했습니다.');
++    expect(screen.getByRole('alert')).not.toHaveTextContent('자격 증명');
++  });
++});
+diff --git a/web/src/pages/setup/SetupWizard.test.tsx b/web/src/pages/setup/SetupWizard.test.tsx
+--- a/web/src/pages/setup/SetupWizard.test.tsx
++++ b/web/src/pages/setup/SetupWizard.test.tsx
+@@ -233,7 +233,7 @@
+ 
+     await screen.findByRole('heading', { name: /create administrator/i });
+     expect(screen.getByRole('alert')).toHaveTextContent(
+-      'Camera initialization failed. Check the credentials and try again.',
++      'Unable to confirm camera initialization. Check the connection to the camera and try again.',
+     );
+     expect(screen.queryByText(/reserved identity detail/i)).not.toBeInTheDocument();
+     expect(screen.getByLabelText(/^username$/i)).toHaveValue('operator.one');
+diff --git a/web/src/pages/setup/SetupWizard.tsx b/web/src/pages/setup/SetupWizard.tsx
+--- a/web/src/pages/setup/SetupWizard.tsx
++++ b/web/src/pages/setup/SetupWizard.tsx
+@@ -6,12 +6,13 @@
+ import { SetupCredentialsStep } from './SetupCredentialsStep';
+ import { SetupIpStep } from './SetupIpStep';
+ import { SetupReviewStep } from './SetupReviewStep';
++import { setupErrorMessage } from './publicError';
+ 
+ export interface SetupWizardProps {
+   client: CameraApiClient;
+   peerIp: string;
+   onInitialized: () => void;
+-  onInitializationFailed?: () => Promise<boolean>;
++  onInitializationFailed?: (error: unknown) => Promise<boolean>;
+ }
+ 
+ type WizardStep = 'credentials' | 'ip' | 'review';
+@@ -59,13 +60,13 @@
+       setPassword('');
+       setConfirmation('');
+       onInitialized();
+-    } catch {
++    } catch (error) {
+       setPassword('');
+       setConfirmation('');
+-      const advanced = await onInitializationFailed();
++      const advanced = await onInitializationFailed(error);
+       if (!advanced) {
+         setStep('credentials');
+-        setFailure(t('setup.initializationFailed'));
++        setFailure(setupErrorMessage(error, t));
+       }
+     } finally {
+       setSubmitting(false);
+diff --git a/web/src/pages/setup/publicError.ts b/web/src/pages/setup/publicError.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/pages/setup/publicError.ts
+@@ -0,0 +1,35 @@
++import { ApiError } from '../../api/client';
++import type { useTranslation } from '../../i18n/LanguageContext';
++
++const validationKeys: Readonly<Record<string, string>> = {
++  E_USERNAME_RESERVED: 'errors.usernameReserved',
++  E_USERNAME_FORMAT: 'errors.usernameInvalid',
++  E_PASSWORD_LENGTH: 'errors.passwordLengthRequired',
++  E_PASSWORD_ASCII: 'errors.passwordAsciiOnly',
++  E_PASSWORD_USERNAME: 'errors.passwordDiffersFromUsername',
++  E_PASSWORD_CLASS: 'errors.passwordClassMix',
++  E_PASSWORD_REPEAT: 'errors.passwordRepeatedChars',
++  E_PASSWORD_SEQUENCE: 'errors.passwordSequentialChars',
++  E_MANAGEMENT_IP_INVALID: 'errors.managementIpInvalid',
++  E_MANAGEMENT_IP_LIMIT: 'errors.managementIpLimitReached',
++  E_BOOTSTRAP_PEER: 'setup.peerChanged',
++};
++
++export function setupErrorMessage(
++  error: unknown,
++  t: ReturnType<typeof useTranslation>['t'],
++): string {
++  // Only public, known errors select text. Never echo server/transport details.
++  if (error instanceof ApiError) {
++    if (error.status === 401) return t('setup.sessionEnded');
++    if (error.status === 429) return t('setup.rateLimited');
++    if (error.status >= 500) return t('setup.serviceUnavailable');
++    if (error.code === 'E_REQUEST_ORIGIN') return t('auth.requestOriginFailed');
++    if (error.status === 400) {
++      return t(Object.prototype.hasOwnProperty.call(validationKeys, error.code)
++        ? validationKeys[error.code]
++        : 'setup.requestInvalid');
++    }
++  }
++  return t('setup.initializationFailed');
++}

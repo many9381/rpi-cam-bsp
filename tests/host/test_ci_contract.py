@@ -225,8 +225,8 @@ exit 99
             self.calls.read_text(encoding="utf-8"),
         )
 
-    def test_rpi5_image_repeats_qemu_gate_before_image_build(self) -> None:
-        """Catches a Pi image build detached from its QEMU gate."""
+    def test_rpi5_image_build_does_not_run_qemu(self) -> None:
+        """Catches an unsolicited emulator build during a Pi-only CI job."""
         self._prepare_checkout()
         result = self._run_stage("rpi5-image")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -234,16 +234,10 @@ exit 99
             self._call_lines("build "),
             [
                 "build container=1 args=--build-id "
-                f"{EXPECTED_BUILD_ID} qemu checkout",
-                "build container=1 args=--build-id "
-                f"{EXPECTED_BUILD_ID} qemu parse",
-                "build container=1 args=--build-id "
-                f"{EXPECTED_BUILD_ID} qemu build",
-                "build container=1 args=--build-id "
                 f"{EXPECTED_BUILD_ID} rpi5-minimal build",
             ],
         )
-        self.assertEqual(len(self._call_lines("test-qemu ")), 1)
+        self.assertEqual(self._call_lines("test-qemu "), [])
         self.assertFalse((self.root / "keys" / "rpi5_admin").exists())
         self.assertFalse((self.root / "keys" / "rpi5_admin.pub").exists())
         self.assertNotIn(

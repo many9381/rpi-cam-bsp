@@ -1,0 +1,96 @@
+From: Firmware Security Maintenance <security@local.invalid>
+Subject: [PATCH] bpf: require JIT for unsupported interpreter programs
+
+Carry the upstream per-program requirement into the retained runtime API.
+The final, spare sixteenth bit in bpf_prog records a sticky requirement; the local
+bpf_prog_select_runtime seeds jit_needed from it. Existing always-on,
+kfunc, interpreter-stack, offload, subprogram and error handling remain.
+Program reallocation and blinding copy the program header, preserving the
+requirement. Successful subprogram JIT has already set bpf_func and jited;
+failed subprogram JIT clears jit_requested, not the requirement.
+
+The fixup pass remains in verifier.c here. Match the three per-CPU map kinds
+locally instead of importing the later CPU-flags helper rename. Mark only
+successful generator paths; EOPNOTSUPP retains the ordinary helper fallback.
+This tree has only the x86 SMP CPU-number verifier emitter; ARM64 current-task
+helpers use its bpf_jit_inlines_helper_call path. No UAPI or config changes.
+
+CVE: CVE-2026-93044
+Upstream-Status: Backport [https://git.kernel.org/linus/34746b5a84ec37c0ea2bf6808c65c5ed8790eb51]
+Stable-Commit: 408b6d3bc19c4aa852ab7ee2f447756e52e69967
+Stable-Downloaded-Patch-SHA256: 25efc76d7f214f13e477720daff99641356d733a49527af219489035a428f9d1
+CVE: CVE-2026-93135
+Upstream-Status: Backport [https://git.kernel.org/linus/f1c27922576edccb99d0257827d09bd05c0304a6]
+Stable-Commit: 21c6445366795fa3a89954e1d318e7c8afdef843
+Stable-Downloaded-Patch-SHA256: 98f6d08158b13d48c99840b04d17d5d690366f4f5d7cb86a08e10096b4b47a73
+CVE: CVE-2026-93270
+Upstream-Status: Backport [https://git.kernel.org/linus/7a0855e73757ee9cf25ba635a1c735018ecba742]
+Stable-Commit: 57cf929a33cb76be3f24886073ae820b4c496914
+Stable-Downloaded-Patch-SHA256: d860e3218878053df142d3431ff6f853e746724896f1c53e4a84bf52ec2b36a4
+
+---
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1715,7 +1715,8 @@
+ 				call_get_stack:1, /* Do we call bpf_get_stack() or bpf_get_stackid() */
+ 				call_get_func_ip:1, /* Do we call get_func_ip() */
+ 				tstamp_type_access:1, /* Accessed __sk_buff->tstamp_type */
+-				sleepable:1;	/* BPF program is sleepable */
++				sleepable:1,	/* BPF program is sleepable */
++				jit_required:1; /* Interpreter cannot execute this program */
+ 	enum bpf_prog_type	type;		/* Type of BPF program */
+ 	enum bpf_attach_type	expected_attach_type; /* For some prog types */
+ 	u32			len;		/* Number of filter blocks */
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2564,7 +2564,7 @@
+ 	/* In case of BPF to BPF calls, verifier did all the prep
+ 	 * work with regards to JITing, etc.
+ 	 */
+-	bool jit_needed = false;
++	bool jit_needed = fp->jit_required;
+ 
+ 	if (fp->bpf_func)
+ 		goto finalize;
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -21063,6 +21063,7 @@
+ 			return -EOPNOTSUPP;
+ 		}
+ 		env->prog->aux->arena = (void *)map;
++		env->prog->jit_required = true;
+ 		if (!bpf_arena_get_user_vm_start(env->prog->aux->arena)) {
+ 			verbose(env, "arena's user address must be set via map_extra or mmap()\n");
+ 			return -EINVAL;
+@@ -22980,8 +22981,10 @@
+ 		}
+ 
+ 		/* Skip inlining the helper call if the JIT does it. */
+-		if (bpf_jit_inlines_helper_call(insn->imm))
++		if (bpf_jit_inlines_helper_call(insn->imm)) {
++			prog->jit_required = true;
+ 			goto next_insn;
++		}
+ 
+ 		if (insn->imm == BPF_FUNC_get_route_realm)
+ 			prog->dst_needed = 1;
+@@ -23163,6 +23166,11 @@
+ 					verifier_bug(env, "%d insns generated for map lookup", cnt);
+ 					return -EFAULT;
+ 				}
++
++				if (map_ptr->map_type == BPF_MAP_TYPE_PERCPU_ARRAY ||
++				    map_ptr->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
++				    map_ptr->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH)
++					prog->jit_required = true;
+ 
+ 				new_prog = bpf_patch_insn_data(env, i + delta,
+ 							       insn_buf, cnt);
+@@ -23268,6 +23276,7 @@
+ 			 * way, it's fine to back out this inlining logic
+ 			 */
+ #ifdef CONFIG_SMP
++			prog->jit_required = true;
+ 			insn_buf[0] = BPF_MOV64_IMM(BPF_REG_0, (u32)(unsigned long)&cpu_number);
+ 			insn_buf[1] = BPF_MOV64_PERCPU_REG(BPF_REG_0, BPF_REG_0);
+ 			insn_buf[2] = BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_0, 0);

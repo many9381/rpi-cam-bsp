@@ -1,0 +1,861 @@
+From: Firmware Maintainers <firmware@example.invalid>
+Subject: [PATCH] camera: detect capture stalls and bound runtime recovery
+
+Track actual frame arrivals with steady time, supervise recovery through the
+existing protected lifecycle, preserve manual recovery after exhaustion, and
+show safe capture diagnostics in the web interface. Include regression tests.
+
+Upstream-Status: Pending
+
+diff --git a/apps/camera-firmware/main.cpp b/apps/camera-firmware/main.cpp
+--- a/apps/camera-firmware/main.cpp
++++ b/apps/camera-firmware/main.cpp
+@@ -130,8 +130,9 @@
+   drogon::app().setTermSignalHandler(RequestShutdown);
+ }
+ 
+-void WaitForShutdown() {
++void WaitForShutdown(const std::function<void()>& poll_runtime) {
+   while (!g_stop_requested.load()) {
++    poll_runtime();
+     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+   }
+ }
+@@ -233,6 +234,9 @@
+     service_status.capture_error_count = status.capture_error_count;
+     service_status.encode_error_count = status.encode_error_count;
+     service_status.last_encode_ms = status.last_encode_ms;
++    service_status.capture_error = status.capture_error;
++    service_status.recovery_attempts = status.recovery_attempts;
++    service_status.recovery_limit = status.recovery_limit;
+     result.push_back(std::move(service_status));
+   }
+   return result;
+@@ -624,6 +628,10 @@
+   }
+   boot_dependencies.start_runtime = [&runtime] { return runtime->Start(); };
+   boot_dependencies.stop_runtime = [&runtime] { runtime->Stop(); };
++  boot_dependencies.runtime_needs_start = [&runtime] {
++    return runtime->State() ==
++           camera_firmware::runtime::ManagedRuntimeState::kFailed;
++  };
+   boot_dependencies.start_service =
+       [&service, &service_args](
+           camera_firmware::boot::RuntimeStartCallback start_runtime) {
+@@ -660,7 +668,14 @@
+   }
+ 
+   Logger::instance().log(Logger::Level::kInfo, "camera firmware running");
+-  WaitForShutdown();
++  WaitForShutdown([&] {
++    if (system_protection) {
++      (void)system_protection->RunRuntimeControlIfAllowed(
++          [&] { runtime->PollCameraHealth(); });
++    } else {
++      runtime->PollCameraHealth();
++    }
++  });
+ 
+   if (system_protection) {
+     system_protection->Stop();
+diff --git a/include/camera_firmware/boot/FirmwareBootCoordinator.hpp b/include/camera_firmware/boot/FirmwareBootCoordinator.hpp
+--- a/include/camera_firmware/boot/FirmwareBootCoordinator.hpp
++++ b/include/camera_firmware/boot/FirmwareBootCoordinator.hpp
+@@ -33,6 +33,8 @@
+   std::function<common::Result<void>(RuntimeStartCallback)> start_service;
+   std::function<void()> quiesce_service;
+   std::function<void()> stop_service;
++  // Optional: true when a previously started graph self-stopped after failure.
++  std::function<bool()> runtime_needs_start;
+ };
+ 
+ class FirmwareBootCoordinator {
+diff --git a/include/camera_firmware/media/CameraPipeline.hpp b/include/camera_firmware/media/CameraPipeline.hpp
+--- a/include/camera_firmware/media/CameraPipeline.hpp
++++ b/include/camera_firmware/media/CameraPipeline.hpp
+@@ -34,6 +34,9 @@
+   // Wall-clock cost of the most recent x264 encode call and the number of
+   // encoded access units dropped from the ring before any reader saw them.
+   double last_encode_ms{0.0};
++  std::string capture_error;
++  unsigned int recovery_attempts{0U};
++  unsigned int recovery_limit{3U};
+   std::string ai_source{"main-fallback"};
+ };
+ 
+diff --git a/include/camera_firmware/media/CaptureHealth.hpp b/include/camera_firmware/media/CaptureHealth.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/camera_firmware/media/CaptureHealth.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include <chrono>
++#include <optional>
++#include <string>
++
++namespace camera_firmware::media {
++
++// Guarded by the pipeline mutex. Use arrival time, never sensor or wall time.
++class CaptureHealth {
++ public:
++  using TimePoint = std::chrono::steady_clock::time_point;
++
++  void Start(TimePoint now) {
++    started_ = now;
++    last_frame_.reset();
++  }
++  void Frame(TimePoint now) { last_frame_ = now; }
++
++  [[nodiscard]] std::string ErrorCode(TimePoint now) const {
++    if (!last_frame_) {
++      return now - started_ >= std::chrono::seconds(10) ? "E_CAMERA_NO_FRAMES"
++                                                        : "";
++    }
++    return now - *last_frame_ >= std::chrono::seconds(5)
++               ? "E_CAMERA_CAPTURE_STALLED"
++               : "";
++  }
++
++  [[nodiscard]] std::string State(TimePoint now) const {
++    if (!ErrorCode(now).empty())
++      return "error";
++    return last_frame_ ? "running" : "starting";
++  }
++
++ private:
++  TimePoint started_{};
++  std::optional<TimePoint> last_frame_;
++};
++
++}  // namespace camera_firmware::media
+diff --git a/include/camera_firmware/runtime/ManagedFirmwareRuntime.hpp b/include/camera_firmware/runtime/ManagedFirmwareRuntime.hpp
+--- a/include/camera_firmware/runtime/ManagedFirmwareRuntime.hpp
++++ b/include/camera_firmware/runtime/ManagedFirmwareRuntime.hpp
+@@ -42,7 +42,9 @@
+ class ManagedFirmwareRuntime final {
+  public:
+   ManagedFirmwareRuntime(config::AppConfig initial_config,
+-                         FirmwareRuntimeFactory factory);
++                         FirmwareRuntimeFactory factory,
++                         std::function<std::chrono::steady_clock::time_point()>
++                             clock = std::chrono::steady_clock::now);
+   ~ManagedFirmwareRuntime();
+ 
+   ManagedFirmwareRuntime(const ManagedFirmwareRuntime&) = delete;
+@@ -52,6 +54,8 @@
+ 
+   [[nodiscard]] common::Result<void> Start();
+   void Stop();
++  // Caller must hold the protection runtime-control gate, when enabled.
++  void PollCameraHealth();
+   [[nodiscard]] RuntimeReplacementResult Replace(
+       const config::AppConfig& candidate_config,
+       std::function<common::Result<void>()> durable_promote);
+@@ -78,6 +82,8 @@
+     std::shared_ptr<FirmwareRuntime> runtime;
+     config::AppConfig config;
+     ManagedRuntimeState state{ManagedRuntimeState::kStopped};
++    std::string capture_error;
++    unsigned int recovery_attempts{0U};
+   };
+ 
+   [[nodiscard]] RuntimeSnapshot ReadSnapshot() const;
+@@ -90,6 +96,7 @@
+   [[nodiscard]] bool RestorePrevious(
+       const std::shared_ptr<FirmwareRuntime>& previous);
+   void SetState(ManagedRuntimeState state);
++  void ResetRecovery();
+ 
+   mutable std::mutex command_mutex_;
+   mutable std::mutex snapshot_mutex_;
+@@ -97,6 +104,12 @@
+   config::AppConfig active_config_;
+   FirmwareRuntimeFactory factory_;
+   ManagedRuntimeState state_{ManagedRuntimeState::kStopped};
++  std::function<std::chrono::steady_clock::time_point()> clock_;
++  // Published fields are guarded by snapshot_mutex_; timers by command_mutex_.
++  std::string capture_error_;
++  unsigned int recovery_attempts_{0U};
++  std::chrono::steady_clock::time_point retry_at_{};
++  std::optional<std::chrono::steady_clock::time_point> healthy_since_;
+ };
+ 
+ }  // namespace camera_firmware::runtime
+diff --git a/include/camera_firmware/service/ServiceApp.hpp b/include/camera_firmware/service/ServiceApp.hpp
+--- a/include/camera_firmware/service/ServiceApp.hpp
++++ b/include/camera_firmware/service/ServiceApp.hpp
+@@ -61,6 +61,9 @@
+   std::uint64_t capture_error_count{0U};
+   std::uint64_t encode_error_count{0U};
+   double last_encode_ms{0.0};
++  std::string capture_error;
++  unsigned int recovery_attempts{0U};
++  unsigned int recovery_limit{3U};
+ };
+ 
+ using CameraStatusProvider = std::function<std::vector<CameraStatus>()>;
+diff --git a/src/boot/FirmwareBootCoordinator.cpp b/src/boot/FirmwareBootCoordinator.cpp
+--- a/src/boot/FirmwareBootCoordinator.cpp
++++ b/src/boot/FirmwareBootCoordinator.cpp
+@@ -198,7 +198,8 @@
+       return BootError("E_BOOT_TRANSITION",
+                        "runtime transition is not available");
+     }
+-    if (runtime_started_) {
++    if (runtime_started_ && (!dependencies_.runtime_needs_start ||
++                             !dependencies_.runtime_needs_start())) {
+       return common::Result<void>::Ok();
+     }
+     authorization_generation = runtime_transition_generation_;
+@@ -218,7 +219,8 @@
+       return BootError("E_BOOT_TRANSITION",
+                        "runtime transition is not available");
+     }
+-    if (runtime_started_) {
++    if (runtime_started_ && (!dependencies_.runtime_needs_start ||
++                             !dependencies_.runtime_needs_start())) {
+       return common::Result<void>::Ok();
+     }
+     if (authorization_generation != runtime_transition_generation_) {
+diff --git a/src/media/CameraPipeline.cpp b/src/media/CameraPipeline.cpp
+--- a/src/media/CameraPipeline.cpp
++++ b/src/media/CameraPipeline.cpp
+@@ -28,6 +28,7 @@
+ #include "camera_firmware/ai/AiFrameTap.hpp"
+ #include "camera_firmware/common/Logger.hpp"
+ #include "camera_firmware/media/CameraTiming.hpp"
++#include "camera_firmware/media/CaptureHealth.hpp"
+ #include "camera_firmware/media/EncodeMailbox.hpp"
+ #include "camera_firmware/media/LoresGeometry.hpp"
+ #include "camera_firmware/media/OsdCompositor.hpp"
+@@ -348,6 +349,7 @@
+       std::scoped_lock lock(mutex);
+       running = true;
+       state = "running";
++      capture_health.Start(std::chrono::steady_clock::now());
+     }
+ 
+     encode_mailbox.Reopen();
+@@ -470,6 +472,16 @@
+     status.capture_error_count = capture_error_count;
+     status.encode_error_count = encode_error_count;
+     status.last_encode_ms = last_encode_ms;
++    if (running) {
++      const auto now = std::chrono::steady_clock::now();
++      status.state = capture_health.State(now);
++      status.capture_error = capture_health.ErrorCode(now);
++      if (status.state != "running") {
++        status.snapshot_available = false;
++        status.capture_fps = 0.0;
++        status.encoded_fps = 0.0;
++      }
++    }
+     status.ai_source = ai_uses_lores ? (ai_lores_rgb ? "lores-rgb" : "lores")
+                                      : "main-fallback";
+     return status;
+@@ -772,6 +784,8 @@
+       RequeueRequest(requeue_context, request);
+       return;
+     }
++
++    capture_health.Frame(std::chrono::steady_clock::now());
+ 
+     // Burn the OSD in before any lease exists: this is the only moment the
+     // buffer is exclusively ours. Every downstream reader (x264, the sub
+@@ -1128,6 +1142,7 @@
+   EncodeMailbox encode_mailbox;
+   std::thread encoder_thread;
+   config::CameraConfig configured_camera;
++  CaptureHealth capture_health;
+   FrameRateEstimator capture_rate;
+   FrameRateEstimator encoded_rate;
+   std::uint64_t next_pts{0};
+diff --git a/src/runtime/ManagedFirmwareRuntime.cpp b/src/runtime/ManagedFirmwareRuntime.cpp
+--- a/src/runtime/ManagedFirmwareRuntime.cpp
++++ b/src/runtime/ManagedFirmwareRuntime.cpp
+@@ -1,9 +1,11 @@
+ #include "camera_firmware/runtime/ManagedFirmwareRuntime.hpp"
+ 
+ #include <exception>
++
+ #include <string>
+ #include <type_traits>
+ #include <utility>
++#include "camera_firmware/common/Logger.hpp"
+ 
+ namespace camera_firmware::runtime {
+ namespace {
+@@ -46,9 +48,12 @@
+ 
+ }  // namespace
+ 
+-ManagedFirmwareRuntime::ManagedFirmwareRuntime(config::AppConfig initial_config,
+-                                               FirmwareRuntimeFactory factory)
+-    : active_config_(std::move(initial_config)), factory_(std::move(factory)) {}
++ManagedFirmwareRuntime::ManagedFirmwareRuntime(
++    config::AppConfig initial_config, FirmwareRuntimeFactory factory,
++    std::function<std::chrono::steady_clock::time_point()> clock)
++    : active_config_(std::move(initial_config)),
++      factory_(std::move(factory)),
++      clock_(std::move(clock)) {}
+ 
+ ManagedFirmwareRuntime::~ManagedFirmwareRuntime() {
+   try {
+@@ -65,6 +70,7 @@
+     return common::Result<void>::Ok();
+   }
+ 
++  ResetRecovery();
+   SetState(ManagedRuntimeState::kStarting);
+   bool newly_built = false;
+   if (!snapshot.runtime) {
+@@ -101,6 +107,7 @@
+     return;
+   }
+ 
++  ResetRecovery();
+   SetState(ManagedRuntimeState::kStopping);
+   StopRuntime(snapshot.runtime);
+   SetState(ManagedRuntimeState::kStopped);
+@@ -130,6 +137,7 @@
+   }
+ 
+   config::AppConfig published_config = candidate_config;
++  ResetRecovery();
+   SetState(ManagedRuntimeState::kApplying);
+   StopRuntime(previous.runtime);
+ 
+@@ -195,7 +203,25 @@
+ ManagedFirmwareRuntime::CameraStatuses() const {
+   auto snapshot = ReadSnapshot();
+   if (snapshot.runtime) {
+-    return snapshot.runtime->CameraStatuses();
++    auto statuses = snapshot.runtime->CameraStatuses();
++    for (auto& status : statuses) {
++      status.recovery_attempts = snapshot.recovery_attempts;
++      // A status read can beat the next lifecycle poll. Report pending recovery
++      // until that poll has stopped the graph, including after the last attempt.
++      if (snapshot.state == ManagedRuntimeState::kRunning &&
++          (status.capture_error == "E_CAMERA_NO_FRAMES" ||
++           status.capture_error == "E_CAMERA_CAPTURE_STALLED")) {
++        status.state = "recovering";
++      }
++      if (snapshot.state == ManagedRuntimeState::kFailed &&
++          !snapshot.capture_error.empty()) {
++        status.state = snapshot.recovery_attempts < 3U ? "recovering" : "error";
++        status.capture_error = snapshot.capture_error;
++        status.snapshot_available = false;
++        status.capture_fps = status.encoded_fps = 0.0;
++      }
++    }
++    return statuses;
+   }
+ 
+   media::CameraPipelineStatus status;
+@@ -282,7 +308,8 @@
+ ManagedFirmwareRuntime::RuntimeSnapshot ManagedFirmwareRuntime::ReadSnapshot()
+     const {
+   std::lock_guard snapshot_lock(snapshot_mutex_);
+-  return {current_runtime_, active_config_, state_};
++  return {current_runtime_, active_config_, state_, capture_error_,
++          recovery_attempts_};
+ }
+ 
+ common::Result<std::shared_ptr<FirmwareRuntime>>
+@@ -342,6 +369,74 @@
+   return restored;
+ }
+ 
++void ManagedFirmwareRuntime::ResetRecovery() {
++  std::lock_guard lock(snapshot_mutex_);
++  capture_error_.clear();
++  recovery_attempts_ = 0U;
++  healthy_since_.reset();
++}
++
++void ManagedFirmwareRuntime::PollCameraHealth() {
++  std::lock_guard command_lock(command_mutex_);
++  auto snapshot = ReadSnapshot();
++  if (!snapshot.runtime)
++    return;
++  const auto now = clock_();
++  if (snapshot.state == ManagedRuntimeState::kFailed) {
++    if (snapshot.capture_error.empty() || snapshot.recovery_attempts >= 3U ||
++        now < retry_at_)
++      return;
++    {
++      std::lock_guard lock(snapshot_mutex_);
++      ++recovery_attempts_;
++    }
++    common::Logger::instance().log(
++        common::Logger::Level::kWarn,
++        "camera capture recovery attempt " +
++            std::to_string(snapshot.recovery_attempts + 1U));
++    auto started = StartRuntime(snapshot.runtime);
++    if (started.ok()) {
++      SetState(ManagedRuntimeState::kRunning);
++    } else {
++      StopRuntime(snapshot.runtime);
++      retry_at_ = clock_() + std::chrono::seconds(5);
++    }
++    return;
++  }
++  if (snapshot.state != ManagedRuntimeState::kRunning)
++    return;
++  const auto statuses = snapshot.runtime->CameraStatuses();
++  bool healthy = !statuses.empty();
++  for (const auto& status : statuses) {
++    healthy = healthy && status.state == "running";
++    if (status.capture_error != "E_CAMERA_NO_FRAMES" &&
++        status.capture_error != "E_CAMERA_CAPTURE_STALLED")
++      continue;
++    common::Logger::instance().log(
++        common::Logger::Level::kError,
++        "camera capture unhealthy: " + status.capture_error);
++    // No libcamera callback holds this command lock. Stop the entire graph so
++    // AI/RTSP cannot keep claiming readiness with a dead input.
++    StopRuntime(snapshot.runtime);
++    {
++      std::lock_guard lock(snapshot_mutex_);
++      capture_error_ = status.capture_error;
++      state_ = ManagedRuntimeState::kFailed;
++    }
++    healthy_since_.reset();
++    retry_at_ = clock_() + std::chrono::seconds(5);
++    return;
++  }
++  if (!healthy) {
++    healthy_since_.reset();
++  } else if (!healthy_since_) {
++    healthy_since_ = now;
++  } else if (now - *healthy_since_ >= std::chrono::seconds(60)) {
++    ResetRecovery();
++    healthy_since_ = now;
++  }
++}
++
+ void ManagedFirmwareRuntime::SetState(ManagedRuntimeState state) {
+   std::lock_guard snapshot_lock(snapshot_mutex_);
+   state_ = state;
+diff --git a/src/service/ServiceApp.cpp b/src/service/ServiceApp.cpp
+--- a/src/service/ServiceApp.cpp
++++ b/src/service/ServiceApp.cpp
+@@ -1133,6 +1133,9 @@
+   json["capture_error_count"] = Json::UInt64(camera.capture_error_count);
+   json["encode_error_count"] = Json::UInt64(camera.encode_error_count);
+   json["last_encode_ms"] = camera.last_encode_ms;
++  json["capture_error"] = camera.capture_error;
++  json["recovery_attempts"] = camera.recovery_attempts;
++  json["recovery_limit"] = camera.recovery_limit;
+   return json;
+ }
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -220,6 +220,7 @@
+ 
+ add_executable(camera_firmware_media_tests
+     unit/media/CameraPipelineConfigTest.cpp
++    unit/media/CaptureHealthTest.cpp
+     unit/media/CameraTimingTest.cpp
+     unit/media/EncodeMailboxTest.cpp
+     unit/media/EncodedRingTest.cpp
+diff --git a/tests/unit/boot/FirmwareBootCoordinatorTest.cpp b/tests/unit/boot/FirmwareBootCoordinatorTest.cpp
+--- a/tests/unit/boot/FirmwareBootCoordinatorTest.cpp
++++ b/tests/unit/boot/FirmwareBootCoordinatorTest.cpp
+@@ -77,6 +77,26 @@
+     return calls.protection_allows_runtime;
+   };
+   return dependencies;
++}
++
++TEST(FirmwareBootCoordinatorTest,
++     SelfStoppedRuntimeCanBeRetriedButProtectionStillApplies) {
++  Calls calls;
++  bool needs_start = false;
++  auto dependencies =
++      SuccessfulDependencies(calls, security::DeviceState::kOperational);
++  dependencies.runtime_needs_start = [&] { return needs_start; };
++  FirmwareBootCoordinator coordinator({true, true}, std::move(dependencies));
++  ASSERT_TRUE(coordinator.Start().ok());
++  ASSERT_TRUE(calls.runtime_start_callback().ok());
++  EXPECT_EQ(calls.runtime_starts, 1U);
++  needs_start = true;
++  calls.protection_allows_runtime = false;
++  EXPECT_FALSE(calls.runtime_start_callback().ok());
++  EXPECT_EQ(calls.runtime_starts, 1U);
++  calls.protection_allows_runtime = true;
++  ASSERT_TRUE(calls.runtime_start_callback().ok());
++  EXPECT_EQ(calls.runtime_starts, 2U);
+ }
+ 
+ TEST(FirmwareBootCoordinatorTest, DefaultStateStartsOnlyService) {
+diff --git a/tests/unit/media/CaptureHealthTest.cpp b/tests/unit/media/CaptureHealthTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/media/CaptureHealthTest.cpp
+@@ -0,0 +1,39 @@
++#include "camera_firmware/media/CaptureHealth.hpp"
++
++#include <gtest/gtest.h>
++
++namespace camera_firmware::media {
++namespace {
++using namespace std::chrono_literals;
++const CaptureHealth::TimePoint epoch{};
++
++TEST(CaptureHealthTest, NoFirstFrameIsNotRunningAndTimesOutAtDeadline) {
++  CaptureHealth health;
++  health.Start(epoch);
++  EXPECT_EQ(health.State(epoch + 9999ms), "starting");
++  EXPECT_EQ(health.ErrorCode(epoch + 9999ms), "");
++  EXPECT_EQ(health.State(epoch + 10s), "error");
++  EXPECT_EQ(health.ErrorCode(epoch + 10s), "E_CAMERA_NO_FRAMES");
++}
++
++TEST(CaptureHealthTest, RealFramesRefreshDeadlineAndDistinguishLaterStall) {
++  CaptureHealth health;
++  health.Start(epoch);
++  health.Frame(epoch + 1s);
++  EXPECT_EQ(health.State(epoch + 5999ms), "running");
++  EXPECT_EQ(health.ErrorCode(epoch + 6s), "E_CAMERA_CAPTURE_STALLED");
++  health.Frame(epoch + 6s);
++  EXPECT_EQ(health.State(epoch + 10s), "running");
++  EXPECT_EQ(health.State(epoch + 11s), "error");
++}
++
++TEST(CaptureHealthTest, NewRunDoesNotReusePreviousFrameOrTimeout) {
++  CaptureHealth health;
++  health.Start(epoch);
++  health.Frame(epoch + 1s);
++  health.Start(epoch + 30s);
++  EXPECT_EQ(health.State(epoch + 31s), "starting");
++  EXPECT_EQ(health.ErrorCode(epoch + 40s), "E_CAMERA_NO_FRAMES");
++}
++}  // namespace
++}  // namespace camera_firmware::media
+diff --git a/tests/unit/runtime/ManagedFirmwareRuntimeTest.cpp b/tests/unit/runtime/ManagedFirmwareRuntimeTest.cpp
+--- a/tests/unit/runtime/ManagedFirmwareRuntimeTest.cpp
++++ b/tests/unit/runtime/ManagedFirmwareRuntimeTest.cpp
+@@ -175,6 +175,171 @@
+     const config::AppConfig& config,
+     const std::shared_ptr<RuntimeProbe>& probe) {
+   return std::make_shared<FirmwareRuntime>(config, DependenciesFor(probe));
++}
++
++// Use real lifecycle orchestration, replacing only the camera/device
++// dependencies.
++TEST(ManagedCameraRecoveryTest,
++     StopsStalledGraphRetriesThreeTimesThenAllowsManualStart) {
++  auto events = std::make_shared<EventLog>();
++  auto probe = std::make_shared<RuntimeProbe>("camera", events);
++  auto now = std::chrono::steady_clock::time_point{};
++  auto dependencies = DependenciesFor(probe);
++  dependencies.camera_statuses = [] {
++    media::CameraPipelineStatus status;
++    status.state = "error";
++    status.capture_error = "E_CAMERA_NO_FRAMES";
++    return std::vector{status};
++  };
++  config::AppConfig config;
++  ManagedFirmwareRuntime managed(
++      config,
++      [dependencies](const auto& cfg) {
++        return common::Result<std::shared_ptr<FirmwareRuntime>>::Ok(
++            std::make_shared<FirmwareRuntime>(cfg, dependencies));
++      },
++      [&] { return now; });
++  ASSERT_TRUE(managed.Start().ok());
++  // Reading status before the supervisor runs must not claim retries exhausted.
++  EXPECT_EQ(managed.CameraStatuses()[0].state, "recovering");
++  for (unsigned attempt = 0; attempt != 3; ++attempt) {
++    managed.PollCameraHealth();
++    EXPECT_EQ(managed.State(), ManagedRuntimeState::kFailed);
++    EXPECT_EQ(managed.CameraStatuses()[0].state, "recovering");
++    now += 4999ms;
++    managed.PollCameraHealth();
++    EXPECT_EQ(probe->camera_starts, attempt + 1);
++    now += 1ms;
++    managed.PollCameraHealth();
++    EXPECT_EQ(probe->camera_starts, attempt + 2);
++    EXPECT_EQ(managed.CameraStatuses()[0].state, "recovering");
++  }
++  managed.PollCameraHealth();
++  now += 1h;
++  managed.PollCameraHealth();
++  EXPECT_EQ(probe->camera_starts, 4U);
++  const auto status = managed.CameraStatuses()[0];
++  EXPECT_EQ(status.state, "error");
++  EXPECT_EQ(status.capture_error, "E_CAMERA_NO_FRAMES");
++  EXPECT_EQ(status.recovery_attempts, 3U);
++  EXPECT_FALSE(status.snapshot_available);
++  ASSERT_TRUE(managed.Start().ok());
++  EXPECT_EQ(probe->camera_starts, 5U);
++  EXPECT_EQ(managed.CameraStatuses()[0].recovery_attempts, 0U);
++}
++
++TEST(ManagedCameraRecoveryTest, ExplicitStopCancelsPendingRetry) {
++  auto probe =
++      std::make_shared<RuntimeProbe>("camera", std::make_shared<EventLog>());
++  auto now = std::chrono::steady_clock::time_point{};
++  auto dependencies = DependenciesFor(probe);
++  dependencies.camera_statuses = [] {
++    media::CameraPipelineStatus status;
++    status.state = "error";
++    status.capture_error = "E_CAMERA_CAPTURE_STALLED";
++    return std::vector{status};
++  };
++  ManagedFirmwareRuntime managed(
++      {},
++      [dependencies](const auto& cfg) {
++        return common::Result<std::shared_ptr<FirmwareRuntime>>::Ok(
++            std::make_shared<FirmwareRuntime>(cfg, dependencies));
++      },
++      [&] { return now; });
++  ASSERT_TRUE(managed.Start().ok());
++  managed.PollCameraHealth();
++  managed.Stop();
++  now += 1h;
++  managed.PollCameraHealth();
++  EXPECT_EQ(probe->camera_starts, 1U);
++  EXPECT_EQ(managed.State(), ManagedRuntimeState::kStopped);
++  EXPECT_EQ(managed.CameraStatuses()[0].state, "stopped");
++}
++
++TEST(ManagedCameraRecoveryTest,
++     FailedRestartConsumesBudgetAndHealthyCaptureRearmsIt) {
++  auto probe =
++      std::make_shared<RuntimeProbe>("camera", std::make_shared<EventLog>());
++  auto now = std::chrono::steady_clock::time_point{};
++  bool stalled = true;
++  auto dependencies = DependenciesFor(probe);
++  dependencies.camera_statuses = [&] {
++    media::CameraPipelineStatus status;
++    status.state = stalled ? "error" : "running";
++    status.capture_error = stalled ? "E_CAMERA_CAPTURE_STALLED" : "";
++    return std::vector{status};
++  };
++  ManagedFirmwareRuntime managed(
++      {},
++      [dependencies](const auto& cfg) {
++        return common::Result<std::shared_ptr<FirmwareRuntime>>::Ok(
++            std::make_shared<FirmwareRuntime>(cfg, dependencies));
++      },
++      [&] { return now; });
++  ASSERT_TRUE(managed.Start().ok());
++  probe->failure = StartFailure::kCamera;
++  probe->failure_attempt = 2;
++  managed.PollCameraHealth();
++  now += 5s;
++  managed.PollCameraHealth();
++  EXPECT_EQ(managed.State(), ManagedRuntimeState::kFailed);
++  EXPECT_EQ(managed.CameraStatuses()[0].recovery_attempts, 1U);
++  now += 5s;
++  managed.PollCameraHealth();
++  stalled = false;
++  managed.PollCameraHealth();
++  now += 59s;
++  managed.PollCameraHealth();
++  EXPECT_EQ(managed.CameraStatuses()[0].recovery_attempts, 2U);
++  now += 1s;
++  managed.PollCameraHealth();
++  EXPECT_EQ(managed.CameraStatuses()[0].recovery_attempts, 0U);
++  stalled = true;
++  managed.PollCameraHealth();
++  now += 5s;
++  managed.PollCameraHealth();
++  EXPECT_EQ(probe->camera_starts, 4U);
++  EXPECT_EQ(managed.CameraStatuses()[0].recovery_attempts, 1U);
++}
++
++TEST(ManagedCameraRecoveryTest,
++     ApplyingConfigurationCancelsOldRetryAndKeepsCandidate) {
++  auto old_probe =
++      std::make_shared<RuntimeProbe>("old", std::make_shared<EventLog>());
++  auto new_probe =
++      std::make_shared<RuntimeProbe>("new", std::make_shared<EventLog>());
++  auto now = std::chrono::steady_clock::time_point{};
++  auto old_dependencies = DependenciesFor(old_probe);
++  old_dependencies.camera_statuses = [] {
++    media::CameraPipelineStatus status;
++    status.state = "error";
++    status.capture_error = "E_CAMERA_NO_FRAMES";
++    return std::vector{status};
++  };
++  unsigned created = 0;
++  ManagedFirmwareRuntime managed(
++      {},
++      [&](const auto& cfg) {
++        return common::Result<std::shared_ptr<FirmwareRuntime>>::Ok(
++            std::make_shared<FirmwareRuntime>(
++                cfg, ++created == 1 ? old_dependencies
++                                    : DependenciesFor(new_probe)));
++      },
++      [&] { return now; });
++  ASSERT_TRUE(managed.Start().ok());
++  managed.PollCameraHealth();
++  config::AppConfig candidate;
++  candidate.secure_rtsp.enabled = false;
++  candidate.security.enabled = false;
++  const auto replacement =
++      managed.Replace(candidate, [] { return common::Result<void>::Ok(); });
++  ASSERT_EQ(replacement.outcome, RuntimeReplacementResult::Outcome::kApplied);
++  now += 1h;
++  managed.PollCameraHealth();
++  EXPECT_EQ(old_probe->camera_starts, 1U);
++  EXPECT_EQ(new_probe->camera_starts, 1U);
++  EXPECT_EQ(managed.CameraStatuses()[0].id, "new");
++  EXPECT_EQ(managed.CameraStatuses()[0].recovery_attempts, 0U);
+ }
+ 
+ class FactorySequence {
+diff --git a/tests/unit/service/ServiceResponseTest.cpp b/tests/unit/service/ServiceResponseTest.cpp
+--- a/tests/unit/service/ServiceResponseTest.cpp
++++ b/tests/unit/service/ServiceResponseTest.cpp
+@@ -203,6 +203,19 @@
+   EXPECT_EQ(json["capture_error_count"].asUInt64(), 2U);
+   EXPECT_EQ(json["encode_error_count"].asUInt64(), 1U);
+   EXPECT_DOUBLE_EQ(json["last_encode_ms"].asDouble(), 7.25);
++}
++
++TEST(ServiceResponseTest, CameraCaptureFailureAndRetryBudgetReachHttpClients) {
++  camera_firmware::service::CameraStatus status;
++  status.state = "recovering";
++  status.capture_error = "E_CAMERA_NO_FRAMES";
++  status.recovery_attempts = 2;
++  const auto json = camera_firmware::service::BuildCameraStatusJson(status);
++  EXPECT_EQ(json["state"].asString(), "recovering");
++  EXPECT_EQ(json["capture_error"].asString(), "E_CAMERA_NO_FRAMES");
++  EXPECT_EQ(json["recovery_attempts"].asUInt(), 2U);
++  EXPECT_EQ(json["recovery_limit"].asUInt(), 3U);
++  EXPECT_FALSE(json["snapshot_available"].asBool());
+ }
+ 
+ TEST(ServiceResponseTest, StreamJsonUsesConfiguredPublicHost) {
+diff --git a/web/src/api/contracts.ts b/web/src/api/contracts.ts
+--- a/web/src/api/contracts.ts
++++ b/web/src/api/contracts.ts
+@@ -67,13 +67,19 @@
+ 
+ function parseCamera(value: unknown): CameraStatus {
+   if (!isRecord(value) || !isString(value.id) || !isString(value.state) ||
+-      typeof value.snapshot_available !== 'boolean') {
++      typeof value.snapshot_available !== 'boolean' ||
++      (value.capture_error !== undefined && !isString(value.capture_error))) {
+     return invalid('Invalid camera response');
+   }
+   return {
+     id: value.id,
+     state: value.state,
+     snapshot_available: value.snapshot_available,
++    capture_error: value.capture_error as string | undefined,
++    recovery_attempts: optionalNonnegative(
++      value.recovery_attempts, true, 'Invalid camera response'),
++    recovery_limit: optionalNonnegative(
++      value.recovery_limit, true, 'Invalid camera response'),
+     capture_fps: optionalNonnegative(
+       value.capture_fps, false, 'Invalid camera response'),
+     encoded_fps: optionalNonnegative(
+diff --git a/web/src/api/types.ts b/web/src/api/types.ts
+--- a/web/src/api/types.ts
++++ b/web/src/api/types.ts
+@@ -41,6 +41,9 @@
+   capture_fps?: number;
+   encoded_fps?: number;
+   last_encode_ms?: number;
++  capture_error?: string;
++  recovery_attempts?: number;
++  recovery_limit?: number;
+ }
+ 
+ export interface MonitoringCamera extends CameraStatus {
+diff --git a/web/src/components/StatusPanel.test.tsx b/web/src/components/StatusPanel.test.tsx
+--- a/web/src/components/StatusPanel.test.tsx
++++ b/web/src/components/StatusPanel.test.tsx
+@@ -56,6 +56,28 @@
+     expect(screen.queryByText(/capture/i)).not.toBeInTheDocument();
+   });
+ 
++  it('explains capture failure and exhausted retries without blaming credentials', () => {
++    render(<LanguageProvider><StatusPanel health={{ status: 'ok' }}
++      cameras={[{ id: 'cam-a', state: 'error', snapshot_available: false,
++        capture_error: 'E_CAMERA_NO_FRAMES', recovery_attempts: 3, recovery_limit: 3 }]}
++      selectedCameraId="cam-a" onSelectCamera={() => undefined}
++      onRestartRuntime={async () => undefined} /></LanguageProvider>);
++    expect(screen.getByText(/No camera frames received/i)).toBeVisible();
++    expect(screen.getByText(/Automatic recovery stopped/i)).toBeVisible();
++    expect(screen.getByRole('button', { name: 'Restart camera runtime' })).toBeEnabled();
++  });
++
++  it('shows pending recovery without offering a competing manual retry', () => {
++    render(<LanguageProvider><StatusPanel health={{ status: 'ok' }}
++      cameras={[{ id: 'cam-a', state: 'recovering', snapshot_available: false,
++        capture_error: 'E_CAMERA_CAPTURE_STALLED', recovery_attempts: 1, recovery_limit: 3 }]}
++      selectedCameraId="cam-a" onSelectCamera={() => undefined}
++      onRestartRuntime={async () => undefined} /></LanguageProvider>);
++    expect(screen.getByText(/Camera frame delivery stopped/i)).toBeVisible();
++    expect(screen.getByText(/Automatic recovery: 1.*3/i)).toBeVisible();
++    expect(screen.queryByRole('button', { name: 'Restart camera runtime' })).not.toBeInTheDocument();
++  });
++
+   it('offers one bounded runtime retry for an error camera', async () => {
+     const user = userEvent.setup();
+     const restart = vi.fn(() => new Promise<void>(() => {}));
+diff --git a/web/src/components/StatusPanel.tsx b/web/src/components/StatusPanel.tsx
+--- a/web/src/components/StatusPanel.tsx
++++ b/web/src/components/StatusPanel.tsx
+@@ -78,6 +78,22 @@
+             <span className="camera-card-content">
+               <strong>{camera.id}</strong>
+               <span>{camera.state}</span>
++              {camera.capture_error && (
++                <small role="status">
++                  {t(camera.capture_error === 'E_CAMERA_NO_FRAMES'
++                    ? 'status.noCameraFrames'
++                    : camera.capture_error === 'E_CAMERA_CAPTURE_STALLED'
++                      ? 'status.captureStalled' : 'status.captureFailed')}
++                </small>
++              )}
++              {camera.state === 'recovering' && (
++                <small>{t('status.recoveringCapture', {
++                  n: camera.recovery_attempts ?? 0, max: camera.recovery_limit ?? 3,
++                })}</small>
++              )}
++              {camera.state === 'error' && camera.capture_error && (
++                <small>{t('status.captureRecoveryStopped')}</small>
++              )}
+               <small>{camera.snapshot_available
+                 ? t('status.snapshotAvailable') : t('status.snapshotUnavailable')}</small>
+               {camera.capture_fps !== undefined && (
+diff --git a/web/src/i18n/messages/en.ts b/web/src/i18n/messages/en.ts
+--- a/web/src/i18n/messages/en.ts
++++ b/web/src/i18n/messages/en.ts
+@@ -41,6 +41,11 @@
+     managementUnavailable: 'Camera management is unavailable.',
+   },
+   status: {
++    noCameraFrames: 'No camera frames received. Check the camera connection with power disconnected.',
++    captureStalled: 'Camera frame delivery stopped. Video and AI are unavailable.',
++    captureFailed: 'Camera capture failed.',
++    recoveringCapture: 'Automatic recovery: {n}/{max} attempts used. Recovery is in progress.',
++    captureRecoveryStopped: 'Automatic recovery stopped. Check the camera connection, then restart the camera runtime.',
+     deviceOperational: 'Operational',
+     deviceChecking: 'Checking',
+     deviceRestricted: 'Restricted',
+diff --git a/web/src/i18n/messages/ko.ts b/web/src/i18n/messages/ko.ts
+--- a/web/src/i18n/messages/ko.ts
++++ b/web/src/i18n/messages/ko.ts
+@@ -43,6 +43,11 @@
+     managementUnavailable: '카메라 관리를 사용할 수 없습니다.',
+   },
+   status: {
++    noCameraFrames: '카메라 프레임을 받지 못했습니다. 전원을 분리한 상태에서 카메라 연결을 점검하세요.',
++    captureStalled: '카메라 프레임 수신이 멈췄습니다. 영상과 AI를 사용할 수 없습니다.',
++    captureFailed: '카메라 촬영에 실패했습니다.',
++    recoveringCapture: '자동 복구 시도 {n}/{max}회 사용. 복구를 진행하고 있습니다.',
++    captureRecoveryStopped: '자동 복구를 중단했습니다. 카메라 연결을 점검한 뒤 카메라 런타임을 다시 시작하세요.',
+     deviceOperational: '정상',
+     deviceChecking: '확인 중',
+     deviceRestricted: '제한됨',

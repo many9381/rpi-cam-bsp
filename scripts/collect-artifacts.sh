@@ -55,12 +55,14 @@ out="$repo_root/artifacts/$build_id/$profile"
 [[ ! -e "$out/COMPLETE" ]] || rpi5_die "evidence already complete: $out"
 
 cd "$repo_root"
+python3 "$repo_root/scripts/lib/build_provenance.py" verify \
+    --repo "$repo_root" --out "$out/provenance" --profile "$profile"
 build_dir="$repo_root/build/kas-work/build/$profile"
 deploy="$build_dir/tmp/deploy/images/$machine"
 for subtree in images checksums manifests licenses; do
     rm -rf -- "$out/$subtree"
 done
-mkdir -p "$out/images" "$out/checksums" "$out/manifests" "$out/licenses"
+mkdir -p "$out/images" "$out/checksums" "$out/manifests" "$out/licenses" "$out/security"
 
 copy_required() {
     local source_path="$1"
@@ -84,6 +86,32 @@ manifest="$deploy/$image-$machine.rootfs.manifest"
 [[ -e "$manifest" ]] || rpi5_die "package manifest missing: $manifest"
 cp -L "$manifest" "$out/manifests/"
 
+spdx="$deploy/$image-$machine.rootfs.spdx.json"
+[[ -f "$spdx" ]] || rpi5_die "image SPDX missing: $spdx"
+cp -L "$spdx" "$out/manifests/image.spdx.json"
+
+# Record what latest-stable resolution actually installed, without changing it.
+python3 - "$manifest" "$out/manifests/resolved-packages.json" <<'PYCODE'
+import json
+from pathlib import Path
+import sys
+
+resolved = []
+for line in Path(sys.argv[1]).read_text().splitlines():
+    fields = line.split()
+    if fields and fields[0] == "codex-cli":
+        if len(fields) != 3:
+            raise SystemExit("invalid codex-cli package manifest entry")
+        resolved.append({"architecture": fields[1], "version": fields[2]})
+Path(sys.argv[2]).write_text(json.dumps({"codex-cli": resolved}, indent=2, sort_keys=True) + "\n")
+PYCODE
+
+if [[ "$profile" == rpi5-camera* ]]; then
+    public_key="$deploy/camera-firmware-integrity-public.pem"
+    [[ -f "$public_key" ]] || rpi5_die "camera signing public key missing from deployment outputs"
+    install -m 0644 "$public_key" "$out/manifests/camera-integrity-public.pem"
+fi
+
 license_root="$build_dir/tmp/deploy/licenses/$machine"
 license_link="$license_root/$image-$machine.rootfs"
 [[ -L "$license_link" ]] || rpi5_die "license manifest link missing: $license_link"
@@ -103,12 +131,17 @@ uv run --locked kas for-all-repos "$config" \
 
 project_revision="$(git -C "$repo_root" rev-parse HEAD)"
 kas_version="$(uv run --locked kas --version | tr '\n' ' ')"
-printf '{"build_id":"%s","profile":"%s","machine":"%s","image":"%s","project_revision":"%s","kas_version":"%s"}\n' \
-    "$build_id" "$profile" "$machine" "$image" "$project_revision" "$kas_version" \
+uv_version="$(uv --version | tr '\n' ' ')"
+python_version="$(python3 --version | tr '\n' ' ')"
+printf '{"build_id":"%s","profile":"%s","machine":"%s","image":"%s","project_revision":"%s","kas_version":"%s","uv_version":"%s","python_version":"%s"}\n' \
+    "$build_id" "$profile" "$machine" "$image" "$project_revision" "$kas_version" "$uv_version" "$python_version" \
     > "$out/manifests/build-metadata.json"
 
 (
     cd "$out"
-    sha256sum images/* > checksums/SHA256SUMS
+    find images manifests provenance -type f -print0 | LC_ALL=C sort -z \
+        | xargs -0 -r sha256sum > checksums/SHA256SUMS
 )
+python3 "$repo_root/scripts/lib/build_provenance.py" verify \
+    --repo "$repo_root" --out "$out/provenance" --profile "$profile"
 touch "$out/COMPLETE"

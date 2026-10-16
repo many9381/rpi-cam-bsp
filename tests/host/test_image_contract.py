@@ -61,7 +61,8 @@ class ImageContractTest(unittest.TestCase):
         minimal = read("kas/rpi5-minimal.yml")
         qemu = read("kas/qemuarm64-minimal.yml")
 
-        self.assertIn('RASPBERRYPI_CAMERA_V3 = "1"', camera)
+        self.assertIn('RASPBERRYPI_CAMERA_V3 = "0"', camera)
+        self.assertIn('RPI_EXTRA_CONFIG:append = "\\ncamera_auto_detect=1\\n"', camera)
         self.assertIn('PACKAGECONFIG:append:pn-libcamera-apps = " libav"', camera)
         self.assertIn('PACKAGECONFIG:append:pn-rpidistro-ffmpeg = " x264"', camera)
         self.assertIn('LICENSE_FLAGS_ACCEPTED += " commercial"', camera)

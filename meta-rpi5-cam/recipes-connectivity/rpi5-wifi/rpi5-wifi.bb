@@ -2,7 +2,7 @@ SUMMARY = "Raspberry Pi 5 optional Wi-Fi automatic connection"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-SRC_URI = "file://25-wireless.network file://rpi5-wifi.service"
+SRC_URI = "file://25-wireless.network file://rpi5-wifi.service file://rpi5-wifi.conf"
 S = "${UNPACKDIR}"
 COMPATIBLE_MACHINE = "^raspberrypi5$"
 PACKAGE_ARCH = "${MACHINE_ARCH}"
@@ -24,11 +24,13 @@ RDEPENDS:${PN} = " \
 "
 
 do_install() {
-    install -d ${D}${sysconfdir}/systemd/network ${D}${systemd_system_unitdir}
+    install -d ${D}${sysconfdir}/systemd/network ${D}${systemd_system_unitdir} ${D}${sysconfdir}/modprobe.d
+    install -m 0644 ${UNPACKDIR}/rpi5-wifi.conf ${D}${sysconfdir}/modprobe.d/rpi5-wifi.conf
     install -m 0644 ${UNPACKDIR}/25-wireless.network ${D}${sysconfdir}/systemd/network/25-wireless.network
     sed -e 's|@SBINDIR@|${sbindir}|g' -e 's|@SYSCONFDIR@|${sysconfdir}|g' \
         ${UNPACKDIR}/rpi5-wifi.service > ${D}${systemd_system_unitdir}/rpi5-wifi.service
     chmod 0644 ${D}${systemd_system_unitdir}/rpi5-wifi.service
 }
 
-FILES:${PN} = "${sysconfdir}/systemd/network/25-wireless.network ${systemd_system_unitdir}/rpi5-wifi.service"
+FILES:${PN} = "${sysconfdir}/systemd/network/25-wireless.network ${systemd_system_unitdir}/rpi5-wifi.service ${sysconfdir}/modprobe.d/rpi5-wifi.conf"
+CONFFILES:${PN} = "${sysconfdir}/modprobe.d/rpi5-wifi.conf"

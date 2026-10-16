@@ -1,0 +1,32 @@
+[Unit]
+Description=Camera firmware with HTTPS and secure RTSP
+# HTTPS/RTSPS bind to wildcard addresses; no configured uplink is required.
+# Waiting for network-online stalls Wi-Fi-only boot on an unplugged Ethernet port.
+# Use the install-time clock floor before TLS validation, without waiting for NTP.
+After=network.target time-set.target
+RequiresMountsFor=/boot
+ConditionPathExists=@SYSCONFDIR@/camera-firmware/app.yaml
+
+[Service]
+Type=simple
+User=camera-firmware
+Group=camera-firmware
+SupplementaryGroups=video render
+WorkingDirectory=/var/lib/camera-firmware
+StateDirectory=camera-firmware
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=@BINDIR@/camera-firmware @SYSCONFDIR@/camera-firmware/app.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+# Camera/DRM/Hailo devices and the kernel image used by integrity verification
+# must remain accessible. Do not enable PrivateDevices or ProtectKernelModules.
+
+[Install]
+WantedBy=multi-user.target

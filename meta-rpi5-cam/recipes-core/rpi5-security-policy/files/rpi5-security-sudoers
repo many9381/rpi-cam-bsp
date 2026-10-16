@@ -1,0 +1,2 @@
+# Listing only: no general nft, shell, argument or firewall-write permission.
+rpiadmin ALL=(root) NOPASSWD: @LIBEXECDIR@/rpi5-security-status ""

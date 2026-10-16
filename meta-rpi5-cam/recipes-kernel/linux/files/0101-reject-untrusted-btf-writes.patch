@@ -1,0 +1,38 @@
+From: Firmware Security Maintenance <security@local.invalid>
+Subject: [PATCH] bpf: reject untrusted btf writes
+
+Backport the complete relevant verifier correction to the retained Raspberry Pi
+Linux 6.18.55 API. Retain the local ref_obj_id nomenclature; reject untrusted writes before either program callbacks or default BTF access.
+
+CVE: CVE-2026-93144
+Upstream-Status: Backport [https://git.kernel.org/linus/ac65c710cc643cbc52b899627577357867249530]
+Upstream-Commit: ac65c710cc643cbc52b899627577357867249530
+Stable-Commit: 19d5566b84ca1af0256d0d0003e1a081580c3ba3
+Stable-Patch-URL: https://git.kernel.org/stable/c/19d5566b84ca1af0256d0d0003e1a081580c3ba3
+Stable-Downloaded-Patch-SHA256: 795f1d065a6e35f415895325d94072ed6a739f8a292cd3f6cedd11c5adb14d3d
+
+---
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -7395,6 +7395,11 @@
+ 		return -EACCES;
+ 	}
+ 
++	if (atype != BPF_READ && (type_flag(reg->type) & PTR_UNTRUSTED)) {
++		verbose(env, "only read is supported\n");
++		return -EACCES;
++	}
++
+ 	if (env->ops->btf_struct_access && !type_is_alloc(reg->type) && atype == BPF_WRITE) {
+ 		if (!btf_is_kernel(reg->btf)) {
+ 			verifier_bug(env, "reg->btf must be kernel btf");
+@@ -7403,8 +7408,7 @@
+ 		ret = env->ops->btf_struct_access(&env->log, reg, off, size);
+ 	} else {
+ 		/* Writes are permitted with default btf_struct_access for
+-		 * program allocated objects (which always have ref_obj_id > 0),
+-		 * but not for untrusted PTR_TO_BTF_ID | MEM_ALLOC.
++		 * program allocated objects (which always have ref_obj_id > 0).
+ 		 */
+ 		if (atype != BPF_READ && !type_is_ptr_alloc_obj(reg->type)) {
+ 			verbose(env, "only read is supported\n");

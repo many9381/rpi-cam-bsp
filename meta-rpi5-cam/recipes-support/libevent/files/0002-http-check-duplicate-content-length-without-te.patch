@@ -1,0 +1,30 @@
+From: Camera firmware maintainers
+Subject: [PATCH] http: check duplicate Content-Length without Transfer-Encoding
+
+The short-circuit AND skipped evhttp_find_unique_header when there was no
+Transfer-Encoding header. dup_cl therefore remained zero even for conflicting
+Content-Length values, bypassing the existing intended rejection policy.
+Evaluate the uniqueness check first and preserve the existing TE/CL rejection.
+
+Five duplicate-length HTTP regressions return 200 before this correction and
+400 afterward; ordinary length/chunked requests remain accepted. This local
+correction is additional framing hardening, not a claim to close every URI
+decoder condition in CVE-2026-63385. No new CVE identifier is assigned here.
+
+Upstream-Status: Pending [local correction; not submitted upstream]
+Reference: https://github.com/libevent/libevent/security/advisories/GHSA-jcwh-pvf2-73p2
+Reference: https://github.com/libevent/libevent/blob/release-2.1.13-stable/http.c
+
+--- a/http.c
++++ b/http.c
+@@ -2265,8 +2265,8 @@
+ 	int is_chunked = 0;
+ 	int dup_cl = 0;
+ 
+-	if (evhttp_find_header(headers, "Transfer-Encoding") != NULL &&
+-	    evhttp_find_unique_header(headers, "Content-Length", &dup_cl) != NULL) {
++	if (evhttp_find_unique_header(headers, "Content-Length", &dup_cl) != NULL &&
++	    evhttp_find_header(headers, "Transfer-Encoding") != NULL) {
+ 		/* Both TE and CL were present: Not allowed. */
+ 		return -1;
+ 	}

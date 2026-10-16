@@ -1,0 +1,118 @@
+From: Firmware Security Maintenance <security-maintenance@local.invalid>
+Subject: [PATCH] bpf: stabilize arena mappings through the file VMA tree
+
+Arena free holds its mutex while walking raw VMAs without MM lifetime
+protection. Taking mmap_lock there inverts the mmap/close lock order.
+Shared private records also omit legal MADV_DOFORK aliases.
+
+Use the existing mapping interval tree under i_mmap_rwsem, as the retained
+unmap_mapping_pages implementation does. Filter both map and VM operations
+because anonymous-inode files share their mapping. Pin one inode per mapping,
+coalesce records under the arena mutex, and serialize the final decrement
+with lookup. Keep all original page allocation/free locking and references.
+
+This is a compatible implementation-specific correction for CVE-2026-74354;
+it does not import the newer upstream page-detachment implementation.
+Upstream-Status: Inappropriate [retained arena implementation compatibility]
+
+--- a/kernel/bpf/arena.c
++++ b/kernel/bpf/arena.c
+@@ -220,21 +220,33 @@
+ }
+ 
+ struct vma_list {
+-	struct vm_area_struct *vma;
++	struct address_space *mapping;
+ 	struct list_head head;
+ 	refcount_t mmap_count;
+ };
+ 
+ static int remember_vma(struct bpf_arena *arena, struct vm_area_struct *vma)
+ {
++	struct address_space *mapping = vma->vm_file->f_mapping;
+ 	struct vma_list *vml;
++
++	/* File descriptors for a map may share the same address_space. */
++	list_for_each_entry(vml, &arena->vma_list, head) {
++		if (vml->mapping != mapping)
++			continue;
++		refcount_inc(&vml->mmap_count);
++		vma->vm_private_data = vml;
++		return 0;
++	}
+ 
+ 	vml = kmalloc(sizeof(*vml), GFP_KERNEL);
+ 	if (!vml)
+ 		return -ENOMEM;
+ 	refcount_set(&vml->mmap_count, 1);
+ 	vma->vm_private_data = vml;
+-	vml->vma = vma;
++	/* Pin the mapping without a file -> map reference cycle. */
++	ihold(mapping->host);
++	vml->mapping = mapping;
+ 	list_add(&vml->head, &arena->vma_list);
+ 	return 0;
+ }
+@@ -262,12 +274,16 @@
+ 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
+ 	struct vma_list *vml = vma->vm_private_data;
+ 
+-	if (!refcount_dec_and_test(&vml->mmap_count))
++	/* Serialize the last reference with remember_vma()'s lookup. */
++	mutex_lock(&arena->lock);
++	vma->vm_private_data = NULL;
++	if (!refcount_dec_and_test(&vml->mmap_count)) {
++		mutex_unlock(&arena->lock);
+ 		return;
+-	guard(mutex)(&arena->lock);
+-	/* update link list under lock */
++	}
+ 	list_del(&vml->head);
+-	vma->vm_private_data = NULL;
++	mutex_unlock(&arena->lock);
++	iput(vml->mapping->host);
+ 	kfree(vml);
+ }
+ 
+@@ -517,11 +533,38 @@
+  */
+ static void zap_pages(struct bpf_arena *arena, long uaddr, long page_cnt)
+ {
++	pgoff_t first = compute_pgoff(arena, uaddr);
++	pgoff_t last = first + page_cnt - 1;
++	struct vm_area_struct *vma;
+ 	struct vma_list *vml;
+ 
+-	list_for_each_entry(vml, &arena->vma_list, head)
+-		zap_page_range_single(vml->vma, uaddr,
+-				      PAGE_SIZE * page_cnt, NULL);
++	/*
++	 * Like unmap_mapping_pages(), stabilize VMAs with i_mmap_rwsem.
++	 * Taking mmap_lock here would invert arena_vm_close/map_mmap's
++	 * mmap_lock -> arena->lock order. The file interval tree includes
++	 * fork aliases, even after their original VMA has been closed.
++	 *
++	 * BPF map files share the anon inode's mapping with unrelated files.
++	 * Filter both the operations and map identity before touching a VMA.
++	 */
++	list_for_each_entry(vml, &arena->vma_list, head) {
++		struct address_space *mapping = vml->mapping;
++
++		i_mmap_lock_read(mapping);
++		vma_interval_tree_foreach(vma, &mapping->i_mmap, first, last) {
++			pgoff_t start, end;
++
++			if (vma->vm_ops != &arena_vm_ops || !vma->vm_file ||
++			    vma->vm_file->private_data != &arena->map)
++				continue;
++			start = max(first, vma->vm_pgoff);
++			end = min(last, vma->vm_pgoff + vma_pages(vma) - 1);
++			zap_page_range_single(vma,
++				vma->vm_start + ((start - vma->vm_pgoff) << PAGE_SHIFT),
++				(end - start + 1) << PAGE_SHIFT, NULL);
++		}
++		i_mmap_unlock_read(mapping);
++	}
+ }
+ 
+ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt)

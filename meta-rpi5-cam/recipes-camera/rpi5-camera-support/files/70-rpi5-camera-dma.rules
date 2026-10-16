@@ -1,0 +1,3 @@
+# libcamera allocates video buffers through DMA heaps. Both camera-firmware
+# and rpiadmin already belong to video; other users receive no extra access.
+SUBSYSTEM=="dma_heap", GROUP="video", MODE="0660"

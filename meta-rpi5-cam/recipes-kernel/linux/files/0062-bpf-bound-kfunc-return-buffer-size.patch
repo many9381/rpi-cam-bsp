@@ -1,0 +1,22 @@
+From: Firmware Security Follow-up <security@local.invalid>
+Subject: [PATCH] bpf bound kfunc return buffer size
+
+CVE: CVE-2026-93125
+Upstream-Status: Backport [https://git.kernel.org/linus/2aaf67f0516fde29620d0edfc29c01b9ea7ad430]
+
+Use the 6.18 register-number diagnostics API; reg_arg_name/argno are not available in this source. The bound and error semantics match upstream.
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -13421,6 +13421,11 @@
+ 				}
+ 
+ 				meta->r0_size = reg->var_off.value;
++				if (meta->r0_size > U32_MAX) {
++					verbose(env, "R%d rdonly/rdwr_buf_size exceeds u32 max\n",
++						regno);
++					return -EINVAL;
++				}
+ 				ret = mark_chain_precision(env, regno);
+ 				if (ret)
+ 					return ret;
