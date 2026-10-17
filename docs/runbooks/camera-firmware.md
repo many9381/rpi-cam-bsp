@@ -8,17 +8,20 @@ layer, `kas/` profiles and `scripts/` are checked out. Keep the reference
 
 ## Current validated image and dependency records
 
-As of 2026-10-16, Hailo image `20261016T111625Z-e664cb9647e7` has completed
-SSD installation, initial setup and three Wi-Fi reboot cycles, with normal
-video and Hailo inference confirmed in the web UI. See the firmware checkout's
-[image build record](../../rpi-cam-hailo/docs/security/static-warning-image-2026-10-16.md)
-and [deployment record](../../rpi-cam-hailo/docs/security/static-warning-deployment-validation-2026-10-16.md).
-Those reports are maintained in the separate firmware repository; the links
-resolve when it is checked out at `rpi-cam-hailo/` in this workspace.
+As of 2026-10-17, Hailo image `20261017T051814Z-63b1d2587b1b` has completed
+SSD installation and three Wi-Fi reboot cycles, with normal video and Hailo
+inference confirmed in the web UI. Initial setup was already complete when
+inspected and stayed complete. Target compilers and development headers are
+absent; required runtime libraries remain. See the
+[build-tools separation record](local-buildtools.md) and the firmware checkout's
+[deployment record](../../rpi-cam-hailo/docs/security/buildtools-deployment-validation-2026-10-17.md).
+The deployment report is maintained in the separate firmware repository; its
+link resolves when checked out at `rpi-cam-hailo/` in this workspace.
 
 The [October 16 source snapshot](validated-snapshot-2026-10-16.md) preserves
 both repositories under local tag `validated-20261016T111625Z` and explains
-its relationship to this image and the unchanged firmware recipe pin.
+its relationship to the preceding accepted image
+`20261016T111625Z-e664cb9647e7` and the unchanged firmware recipe pin.
 
 Use the selected build's private
 `artifacts/<build-id>/rpi5-camera-hailo/` directory for dependency evidence:
@@ -30,7 +33,7 @@ Use the selected build's private
 | `manifests/layer-revisions.txt` | Upstream layer revisions |
 | `provenance/inputs.json`, `provenance/sources.tar` | Local recipe, patch and script inputs with hashes |
 | `checksums/SHA256SUMS` | Image, manifest and provenance checksums |
-| `security/static-warning-deployment-2026-10-16/` | Installation/device acceptance evidence for the build above |
+| `security/buildtools-deployment-2026-10-17/` | Installation/device acceptance evidence for the build above |
 
 The firmware's September 10 Debian inventory and `sbom/firmware.cdx.json`
 describe the older Debian device, not these Yocto RPM packages. Its web SBOM
@@ -67,8 +70,9 @@ another patch, build or installation.
 | `camera-firmware-web` | Prebuilt React UI under `/usr/share/camera-firmware/web` |
 | `camera-firmware-models` | Hailo-only, checksum-pinned object-detection HEF under `/usr/share/camera-firmware/models` |
 | `rpi-cam-hailo-devrepo` | Optional editable Git repository under `/home/rpiadmin/rpi-cam-hailo` |
-| `packagegroup-camera-firmware` | Application and Codex operator tools, included by `rpi5-camera-image` |
+| `packagegroup-camera-firmware` | Application runtime, included by `rpi5-camera-image`; Codex is selected separately by the development image profile |
 | `packagegroup-camera-firmware-hailo` | Optional HailoRT library/CLI/GStreamer plugin, matching PCIe driver and chip firmware |
+| `packagegroup-rpi5-buildtools` | Optional Pi-side GCC/G++, headers, CMake and Ninja; selected only with `RPI5_LOCAL_BUILDTOOLS=1` |
 
 The recipes reuse `libcamera`, `gstreamer1.0`, `gstreamer1.0-plugins-base`,
 `gstreamer1.0-rtsp-server`, `libsrtp`, `x264`, `rpidistro-ffmpeg`, `openssl`,

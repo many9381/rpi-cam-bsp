@@ -7,4 +7,7 @@ CAMERA_FIRMWARE_SRCREV = "a6364ff4c8161334fdf89b54b8d2eeb4ec55a32c"
 SRC_URI = "${CAMERA_FIRMWARE_GIT_URI};name=firmware"
 SRCREV_firmware = "${CAMERA_FIRMWARE_SRCREV}"
 SRCREV_FORMAT = "firmware"
+# The privacy-cleaned history changes the Git suffix ordering. Keep the app,
+# web assets and development checkout newer than packages from the old history.
+PE = "1"
 PV = "0+git"

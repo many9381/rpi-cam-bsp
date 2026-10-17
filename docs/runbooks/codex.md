@@ -1,10 +1,11 @@
 # Codex CLI on the camera image
 
-Both `rpi5-camera` and `rpi5-camera-hailo` include `codex-cli` through their
-common camera package group. Minimal Raspberry Pi and QEMU images remain
-unchanged. Build the selected camera profile with a valid build ID. Image
-generation does not require runtime PASS records; flashing and hardware
-acceptance are separate stages with their own prerequisites.
+Both `rpi5-camera` and `rpi5-camera-hailo` select `codex-cli` explicitly through
+`IMAGE_INSTALL` in `kas/rpi5-camera.yml` for development and review. It is not
+an `RDEPENDS` entry of the camera firmware package group. Minimal Raspberry Pi
+and QEMU images remain unchanged. Build the selected camera profile with a
+valid build ID. Image generation does not require runtime PASS records;
+flashing and hardware acceptance are separate stages with their own prerequisites.
 
 ## Package boundary
 

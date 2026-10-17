@@ -7,6 +7,9 @@ header:
 machine: raspberrypi5
 target: rpi5-minimal-image
 
+env:
+  RPI5_LOCAL_BUILDTOOLS: null
+
 repos:
   meta-raspberrypi:
     layers:

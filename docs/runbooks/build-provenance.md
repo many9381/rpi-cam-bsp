@@ -19,11 +19,11 @@ The snapshot includes eligible tracked and untracked files from
 `pyproject.toml` and `uv.lock`. Layer files use an explicit extension/resource
 allowlist in `scripts/lib/build_provenance.py`; kas includes `.yml`, scripts
 include `.sh` and `.py`. Known extensionless resources include the administrator
-and camera sudo rules and licenses. The three local compiler validation recipes
-explicitly ignored in `.git/info/exclude` are included with their local-only
-status. They remain ignored and must not be force-added to Git. Unknown ignored
-source files cause a private-path-free error rather than being archived or
-silently omitted. Unknown non-ignored files under the source roots also fail;
+and camera sudo rules and licenses. The optional compiler package group is a
+normal versioned input. The former three ignored compiler-validation recipes
+have been retired from active layer discovery; they no longer receive an
+exception. Ignored source files cause a private-path-free error rather than
+being archived or silently omitted. Unknown non-ignored files under the source roots also fail;
 a new required resource type must be deliberately added to the allowlist before
 building. The layer READMEs are explicitly excluded as documentation.
 
@@ -55,7 +55,18 @@ it does not expose the directory itself. The optional
 `CAMERA_FIRMWARE_GIT_URI` transport override is fingerprinted without recording
 its URL or embedded credentials. `RPI_CAM_HAILO_DEV_REPO` records its default or
 environment origin and effective enabled state (only `0` disables it).
+`RPI5_LOCAL_BUILDTOOLS` records the origin and effective target-buildtools
+selection: default off, enabled by `1` for Raspberry Pi profiles, always off
+for QEMU. Changing this choice requires a fresh build ID. When verifying or
+collecting a development build, supply the same environment selection.
 Do not publish private environment values in build documentation.
+
+The shared firmware source recipe uses package epoch `1` following the
+2026-10-16 Git history privacy cleanup. Rewritten commit hashes are not
+monotonic version numbers: the application, web assets and development
+checkout must all sort after packages from the previous history. Preserve
+this epoch when updating their source pin; do not disable the
+`version-going-backwards` QA check or erase build history to bypass it.
 
 Collection verifies the captured sources, deletions, choices, public identities,
 vendor digests and archive before replacing incomplete output directories and

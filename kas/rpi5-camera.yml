@@ -24,6 +24,8 @@ repos:
 
 local_conf_header:
   rpi5-camera: |
+    # Development/review tool selected by the image, not a firmware dependency.
+    IMAGE_INSTALL:append:pn-rpi5-camera-image = " codex-cli"
     INHERIT += "codex-latest"
     # Preserve recipe CVE/backport annotations for current out-of-build scans.
     SPDX_INCLUDE_VEX = "all"

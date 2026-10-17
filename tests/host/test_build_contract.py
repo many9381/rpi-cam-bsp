@@ -103,6 +103,7 @@ fi
         environment.pop("CAMERA_FIRMWARE_MODEL_DIR", None)
         environment.pop("CAMERA_FIRMWARE_GIT_URI", None)
         environment.pop("RPI_CAM_HAILO_DEV_REPO", None)
+        environment.pop("RPI5_LOCAL_BUILDTOOLS", None)
         environment.update(
             {
                 "PATH": f"{self.fake_bin}:{environment['PATH']}",
@@ -150,6 +151,16 @@ fi
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("is a profile, not a build ID", result.stderr)
                 self.assertIn(f"{profile} build", result.stderr)
+                self.assertEqual(self._calls(), "")
+                self.assertFalse((self.root / "artifacts").exists())
+
+    def test_invalid_buildtools_selection_fails_before_external_work(self) -> None:
+        for value in ("yes", "2"):
+            with self.subTest(value=value):
+                result = self._run("bash", "scripts/build.sh", "--build-id", BUILD_ID,
+                                   "rpi5-camera", "parse", RPI5_LOCAL_BUILDTOOLS=value)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("RPI5_LOCAL_BUILDTOOLS must be 0 or 1", result.stderr)
                 self.assertEqual(self._calls(), "")
                 self.assertFalse((self.root / "artifacts").exists())
 

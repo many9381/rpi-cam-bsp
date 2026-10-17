@@ -20,6 +20,11 @@ IMAGE_FEATURES += "ssh-server-openssh"
 IMAGE_FEATURES:remove = "debug-tweaks allow-empty-password empty-root-password allow-root-login serial-autologin-root"
 IMAGE_LINGUAS = " "
 
+# The camera recipe requires this file, so this covers all Raspberry Pi images.
+# Compilers are opt-in development tools; QEMU never selects this group.
+RPI5_LOCAL_BUILDTOOLS ?= "0"
+IMAGE_INSTALL:append:raspberrypi5 = "${@' packagegroup-rpi5-buildtools' if d.getVar('RPI5_LOCAL_BUILDTOOLS') == '1' else ''}"
+
 IMAGE_ROOTFS_SIZE = "1048576"
 IMAGE_ROOTFS_EXTRA_SPACE = "524288"
 

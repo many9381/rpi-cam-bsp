@@ -18,6 +18,8 @@ Examples:
 Start a new build with BUILD_ID="$(./scripts/new-build-id.sh)" and
 pass --build-id "$BUILD_ID". Continue using that ID for later profiles.
 Image builds do not require QEMU or hardware PASS records.
+Target GCC/C++ headers and build tools are excluded by default. For Pi-side
+development, set RPI5_LOCAL_BUILDTOOLS=1 and use a fresh build ID.
 EOF
 }
 
@@ -77,6 +79,11 @@ case "$profile" in
 esac
 
 case "$action" in checkout|layers|parse|build) ;; *) argument_error "unknown action: $action" ;; esac
+
+case "${RPI5_LOCAL_BUILDTOOLS:-0}" in
+    0|1) ;;
+    *) argument_error "RPI5_LOCAL_BUILDTOOLS must be 0 or 1" ;;
+esac
 
 repo_root="$(rpi5_repo_root)"
 if [[ "$explicit_build_id" == "0" ]]; then

@@ -77,3 +77,9 @@ image hashes are retained unchanged. See the
 [privacy record](../../rpi-cam-hailo/docs/security/privacy-cleanup-2026-10-16.md)
 for audit scope and GitHub cache/clone cleanup limits. A future image build
 must use a fresh build ID and the sanitized source history.
+
+Compiler-selection follow-up: the three local-only inputs described above
+were subsequently retired from active layers and preserved privately. New
+builds omit target compilers by default and can select the versioned build-tools
+group with `RPI5_LOCAL_BUILDTOOLS=1`; see [optional build tools](local-buildtools.md).
+The accepted historical image and its captured inputs are unchanged.

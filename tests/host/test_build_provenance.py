@@ -13,7 +13,7 @@ import unittest
 from support import REPO_ROOT
 
 HELPER = REPO_ROOT / 'scripts/lib/build_provenance.py'
-LOCAL_ONLY = 'meta-rpi5-cam/recipes-core/images/rpi5-camera-image.bbappend'
+BUILD_TOOLS = 'meta-rpi5-cam/recipes-core/packagegroups/packagegroup-rpi5-buildtools.bb'
 
 
 class BuildProvenanceTest(unittest.TestCase):
@@ -41,6 +41,7 @@ class BuildProvenanceTest(unittest.TestCase):
         self.environment.pop('CAMERA_FIRMWARE_MODEL_DIR', None)
         self.environment.pop('RPI_CAM_HAILO_DEV_REPO', None)
         self.environment.pop('CAMERA_FIRMWARE_GIT_URI', None)
+        self.environment.pop('RPI5_LOCAL_BUILDTOOLS', None)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -65,7 +66,7 @@ class BuildProvenanceTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads((self.out / 'inputs.json').read_text())
 
-    def test_archives_dirty_untracked_local_only_content_and_deletions_without_secrets(self):
+    def test_archives_dirty_untracked_development_inputs_and_deletions_without_secrets(self):
         self.put('meta-rpi5-cam/conf/layer.conf', 'dirty layer\n')
         self.put('meta-rpi-cam-hailo/recipes-camera/camera-firmware/files/fix.patch', 'actual patch\n')
         self.put('meta-rpi5-cam/recipes-core/device-config/files/rpi5-admin-sudoers', 'sudo rule\n')
@@ -79,8 +80,7 @@ class BuildProvenanceTest(unittest.TestCase):
             self.put(name, content)
 
         (self.root / 'meta-rpi5-cam/recipes-core/removed.bb').unlink()
-        self.put('.git/info/exclude', '/' + LOCAL_ONLY + '\n')
-        self.put(LOCAL_ONLY, 'local compiler append\n')
+        self.put(BUILD_TOOLS, 'optional compiler group\n')
         for secret in ('keys/private.py', '.state/local.conf', 'build/generated.conf',
                        'rpi-cam-hailo/private.py', 'meta-rpi5-cam/keys/local-credential.json',
                        'meta-rpi5-cam/vendor.deb', 'meta-rpi5-cam/vendor.hef',
@@ -91,7 +91,7 @@ class BuildProvenanceTest(unittest.TestCase):
             names = archive.getnames()
             self.assertEqual(names, sorted(names))
             self.assertEqual(archive.extractfile('meta-rpi5-cam/conf/layer.conf').read(), b'dirty layer\n')
-            self.assertEqual(archive.extractfile(LOCAL_ONLY).read(), b'local compiler append\n')
+            self.assertEqual(archive.extractfile(BUILD_TOOLS).read(), b'optional compiler group\n')
             self.assertIn('meta-rpi-cam-hailo/recipes-camera/camera-firmware/files/fix.patch', names)
             self.assertIn('meta-rpi5-cam/recipes-core/device-config/files/rpi5-admin-sudoers', names)
             self.assertIn('meta-rpi-cam-hailo/LICENSE', names)
@@ -101,7 +101,7 @@ class BuildProvenanceTest(unittest.TestCase):
         self.assertNotIn(b'SENTINEL_PRIVATE_TOKEN', (self.out / 'sources.tar').read_bytes())
         self.assertIn('meta-rpi5-cam/recipes-core/removed.bb', metadata['deleted_tracked'])
         entries = {item['path']: item for item in metadata['sources']}
-        self.assertEqual(entries[LOCAL_ONLY]['status'], 'local-only-ignored')
+        self.assertEqual(entries[BUILD_TOOLS]['status'], 'untracked')
         self.assertEqual(entries['meta-rpi5-cam/conf/layer.conf']['sha256'], hashlib.sha256(b'dirty layer\n').hexdigest())
         self.assertEqual(metadata['git_head'], self.git('rev-parse', 'HEAD').strip())
         self.assertIn('private', metadata['purpose'])
@@ -278,6 +278,39 @@ class BuildProvenanceTest(unittest.TestCase):
         self.snapshot()
         self.assertEqual(self.invoke('verify').returncode, 0)
         self.assertNotIn(b'SENTINEL_PRIVATE_TOKEN', (self.out / 'sources.tar').read_bytes())
+
+    def test_legacy_ignored_compiler_overrides_are_rejected(self):
+        for name in (
+                'meta-rpi5-cam/recipes-core/images/rpi5-minimal-image.bbappend',
+                'meta-rpi5-cam/recipes-core/images/rpi5-camera-image.bbappend',
+                'meta-rpi5-cam/recipes-core/packagegroups/packagegroup-rpi5-local-buildtools.bb'):
+            with self.subTest(name=name):
+                self.out = self.root / 'artifacts/legacy' / Path(name).name / 'provenance'
+                self.put('.git/info/exclude', '/' + name + '\n')
+                path = self.put(name, 'SENTINEL_LEGACY_OVERRIDE')
+                try:
+                    result = self.invoke()
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('ignored source', result.stderr)
+                    self.assertFalse((self.out / 'sources.tar').exists())
+                finally:
+                    path.unlink()
+
+    def test_compiler_selection_is_recorded_and_cannot_change_within_a_build(self):
+        metadata = self.snapshot(profile='rpi5-camera')
+        self.assertEqual(metadata['choices'].get('local_buildtools'),
+                         {'origin': 'default', 'enabled': False})
+        self.environment['RPI5_LOCAL_BUILDTOOLS'] = '1'
+        self.assertNotEqual(self.invoke('verify', profile='rpi5-camera').returncode, 0)
+        self.out = self.root / 'artifacts/development/provenance'
+        metadata = self.snapshot(profile='rpi5-camera')
+        self.assertEqual(metadata['choices']['local_buildtools'],
+                         {'origin': 'environment', 'enabled': True})
+        self.environment['RPI5_LOCAL_BUILDTOOLS'] = '0'
+        self.assertNotEqual(self.invoke('verify', profile='rpi5-camera').returncode, 0)
+        self.environment['RPI5_LOCAL_BUILDTOOLS'] = '1'
+        self.out = self.root / 'artifacts/qemu/provenance'
+        self.assertFalse(self.snapshot()['choices']['local_buildtools']['enabled'])
 
     def test_unknown_ignored_recipe_inputs_fail_without_archiving_or_printing_private_path(self):
         for suffix in ('.bb', '.bbappend', '.inc', '.bbclass', '.conf', '.py', '.patch', '.cfg', ''):

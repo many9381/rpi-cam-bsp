@@ -24,11 +24,6 @@ EXCLUDED_PARTS = {'keys', '.state', 'artifacts', 'build', '.git', '.venv',
                   '__pycache__', 'node_modules', 'rpi-cam-hailo'}
 # Human documentation is explicitly outside build-source capture.
 DOCUMENTATION = {'meta-rpi5-cam/README.md', 'meta-rpi-cam-hailo/README.md'}
-LOCAL_ONLY = {
-    'meta-rpi5-cam/recipes-core/images/rpi5-minimal-image.bbappend',
-    'meta-rpi5-cam/recipes-core/images/rpi5-camera-image.bbappend',
-    'meta-rpi5-cam/recipes-core/packagegroups/packagegroup-rpi5-local-buildtools.bb',
-}
 # The reviewed archives selected by the current Hailo recipes. They never enter tar.
 HAILO_INPUTS = (
     'meta-rpi5-cam/recipes-hailo/hailort/files/hailort_4.24.0_arm64.deb',
@@ -92,7 +87,7 @@ def capture(repo: Path, profile: str) -> dict:
                 and any(part in EXCLUDED_PARTS for part in path.parts[1:])
                 and ((repo / name).exists() or (repo / name).is_symlink())):
             raise ValueError('BitBake metadata in an excluded layer source directory; move reviewed non-secret sources before using a fresh build ID')
-    if any(name not in LOCAL_ONLY and name not in DOCUMENTATION
+    if any(name not in DOCUMENTATION
            and Path(name).suffix not in {'.deb', '.hef'}
            and not any(part in EXCLUDED_PARTS for part in Path(name).parts)
            for name in ignored):
@@ -100,7 +95,7 @@ def capture(repo: Path, profile: str) -> dict:
         # those files or disclose their private path/content in an error.
         raise ValueError('unapproved ignored source detected; review source ignore rules before using a fresh build ID')
     # Reject symlinked directories even when Git reports only the directory itself.
-    for name in tracked | head_files | untracked | ignored | LOCAL_ONLY:
+    for name in tracked | head_files | untracked | ignored:
         path = repo / name
         if eligible(name) or (path.is_symlink() and path.is_dir()):
             reject_symlinks(path, repo)
@@ -111,7 +106,7 @@ def capture(repo: Path, profile: str) -> dict:
                 and (repo / name).exists()):
             raise ValueError(f'unsupported source file: {name}; review and extend the source allowlist before building')
     sources = []
-    for name in sorted(tracked | untracked | LOCAL_ONLY):
+    for name in sorted(tracked | untracked):
         if not eligible(name):
             continue
         path = repo / name
@@ -119,7 +114,7 @@ def capture(repo: Path, profile: str) -> dict:
             continue
         if not path.is_file():
             raise ValueError('build source must be a regular file')
-        status = 'tracked' if name in tracked else ('untracked' if name in untracked else 'local-only-ignored')
+        status = 'tracked' if name in tracked else 'untracked'
         sources.append({'path': name, 'status': status,
                         'executable': bool(path.stat().st_mode & 0o111), **digest_file(path)})
     vendor_inputs = []
@@ -144,6 +139,13 @@ def capture(repo: Path, profile: str) -> dict:
             public_inputs.append({'name': name, **digest_file(path)})
     choices = {'dev_repo': {'origin': 'environment' if os.environ.get('RPI_CAM_HAILO_DEV_REPO') else 'default',
                             'enabled': os.environ.get('RPI_CAM_HAILO_DEV_REPO', '1') != '0'}}
+    buildtools = os.environ.get('RPI5_LOCAL_BUILDTOOLS') or '0'
+    if buildtools not in {'0', '1'}:
+        raise ValueError('RPI5_LOCAL_BUILDTOOLS must be 0 or 1')
+    choices['local_buildtools'] = {
+        'origin': 'environment' if os.environ.get('RPI5_LOCAL_BUILDTOOLS') else 'default',
+        'enabled': profile != 'qemu' and buildtools == '1',
+    }
     transport = os.environ.get('CAMERA_FIRMWARE_GIT_URI')
     choices['firmware_transport'] = {
         'origin': 'environment' if transport else 'recipe-default',

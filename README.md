@@ -63,22 +63,28 @@ markers into a new build or treat them as validation of changed recipes.
 The local single-build SSD launcher remains pinned to that historical build;
 it is not a launcher for newly generated root-checkout images.
 
-Git-excluded local compiler-validation recipes remain local-only. Remove
-those overrides before a release build. Private SSH/Wi-Fi inputs belong in
-the ignored `keys/` directory and must never be staged.
+Target GCC/G++, headers and build tools are excluded by default. Set
+`RPI5_LOCAL_BUILDTOOLS=1` for a development build that needs compilation on the
+Pi; see [optional build tools](docs/runbooks/local-buildtools.md). Runtime
+libraries remain selected by application dependencies. Private SSH/Wi-Fi
+inputs belong in the ignored `keys/` directory and must never be staged.
 
 ## Supported route
 
-Image generation can run independently of runtime acceptance:
+Start a new camera/Hailo image build with one command:
 
 ```bash
-./scripts/build.sh rpi5-camera-hailo build
+./scripts/build-image.sh
 ```
 
-This uses `.state/active-build-id`; for a new run, create an ID with
-`scripts/new-build-id.sh` and pass `--build-id "$BUILD_ID"` explicitly.
-`build.sh` checks the host and builds the selected profile without requiring
-QEMU or hardware PASS records. Flashing and acceptance have separate checks.
+This generates a new build ID and calls `build.sh` for `rpi5-camera-hailo`.
+Target compilers and development tools are excluded unless
+`RPI5_LOCAL_BUILDTOOLS=1` is set. To retry an interrupted build, use
+`./scripts/build.sh --build-id ID rpi5-camera-hailo build` with the printed ID
+and the same environment options. The lower-level `build.sh` also supports
+other profiles; omitting its `--build-id` uses `.state/active-build-id`.
+It checks the host and builds the selected profile without requiring QEMU
+or hardware PASS records. Flashing and acceptance have separate checks.
 
 After building, install the latest completed Hailo camera image onto the
 registered USB SSD with the same command every time:
